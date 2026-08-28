@@ -714,29 +714,38 @@ PagerDutySync.prototype = {
     // so unlike the previous java.time-based version this can't be blocked by Script
     // Include Java-interop sandboxing.
     //
-    // The trick: GlideDateTime.setDisplayValueInternal() takes a plain
-    // 'yyyy-MM-dd HH:mm:ss' string and interprets it in the CURRENT SESSION's time
-    // zone, converting it to the correct UTC instant internally (DST included) --
-    // unlike setDisplayValue(), it isn't sensitive to the session's locale date
-    // format, so it's safe to feed it dateStr/timeStr's fixed internal format
-    // directly. So: temporarily point the session at the rota's own time zone, do the
-    // conversion, then restore the session's original time zone immediately
-    // (try/finally keeps that window synchronous and narrow -- each transaction has
-    // its own GlideSession, so this can't leak into a concurrent request).
+    // GlideDateTime.setDisplayValueInternal() takes a plain 'yyyy-MM-dd HH:mm:ss'
+    // string and interprets it in the CURRENT SESSION's time zone, converting it to
+    // the correct UTC instant internally (DST included) -- confirmed working via
+    // fix_script_verify_assumptions.js Q5's isolated test against a known-good input.
     //
-    // No offset formatting is needed either: PagerDuty's start/rotation_virtual_start
-    // fields just need a correct instant -- a plain UTC 'Z' timestamp is exactly as
-    // valid as an offset-qualified one for that (the schedule's own time_zone field,
-    // set separately, is what governs how the *recurring* rotation is interpreted
-    // going forward).
+    // The actual bug (found via that same Q5 run, against real data): this plugin's
+    // cmn_rota_roster.rotation_start_date/rotation_start_time -- like
+    // cmn_schedule_span's date fields (see _parseScheduleDateTime) -- return a
+    // compact, separator-less internal value ('20260715'/'190000'), not the usual
+    // 'yyyy-MM-dd'/'HH:mm:ss'. Concatenating those raw produced an unparseable string
+    // that setDisplayValueInternal() silently failed on (no throw, just an empty
+    // GlideDateTime), which is why "start"/"rotation_virtual_start" came out as a
+    // bare "Z". _normalizeRosterDate()/_normalizeRosterTime() below convert the
+    // compact form to canonical first; they pass an already-canonical value through
+    // unchanged, in case this varies by instance.
     _localizedIso: function(dateStr, timeStr, tzName) {
         var session = gs.getSession();
         var originalTzName = session.getTimeZoneName();
         try {
             session.setTimeZoneName(tzName);
             var gdt = new GlideDateTime();
-            gdt.setDisplayValueInternal(dateStr + ' ' + timeStr);
-            return gdt.getValue().replace(' ', 'T') + 'Z';
+            var normalizedValue = this._normalizeRosterDate(dateStr) + ' ' + this._normalizeRosterTime(timeStr);
+            gdt.setDisplayValueInternal(normalizedValue);
+            var value = gdt.getValue();
+            if (!value) {
+                gs.error('PagerDutySync: _localizedIso got an empty GlideDateTime after setDisplayValueInternal("' +
+                    normalizedValue + '") in tz "' + tzName + '" (from raw date="' + dateStr + '" time="' + timeStr +
+                    '") -- it did not throw but also did not set a value. Falling back to a bare, offset-less ' +
+                    'string, which PagerDuty will likely reject.');
+                return dateStr + 'T' + timeStr;
+            }
+            return value.replace(' ', 'T') + 'Z';
         } catch (e) {
             gs.error('PagerDutySync: failed to localize ' + dateStr + ' ' + timeStr + ' to ' + tzName +
                 ' (' + e + '); falling back to a bare UTC-offset-less string, which PagerDuty will likely reject');
@@ -744,6 +753,16 @@ PagerDutySync.prototype = {
         } finally {
             session.setTimeZoneName(originalTzName);
         }
+    },
+
+    _normalizeRosterDate: function(raw) {
+        var m = /^(\d{4})(\d{2})(\d{2})$/.exec(raw || '');
+        return m ? (m[1] + '-' + m[2] + '-' + m[3]) : raw;
+    },
+
+    _normalizeRosterTime: function(raw) {
+        var m = /^(\d{2})(\d{2})(\d{2})$/.exec(raw || '');
+        return m ? (m[1] + ':' + m[2] + ':' + m[3]) : raw;
     },
 
     // ------------------------------------------------------------------------------
