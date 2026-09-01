@@ -977,11 +977,10 @@ PagerDutySync.prototype = {
     // CAL CECP (Manila)", confirmed via the fix scripts (../servicenow/) to have the
     // same window and anchor with no repeat_count evidence of alternation. v3's
     // every_member_assignment_strategy is the direct, native representation of
-    // "these people are all on-call together for this shift" -- see ASSUMPTION 2 in
-    // the file header before trusting this over the v2 file's multi-schedule/
-    // multi-target-rule workaround (_partitionUnitsByNonOverlap, kept unchanged in
-    // the v2 file as the fallback if live testing shows v3 events DO have some
-    // collision/priority behavior between overlapping events after all).
+    // "these people are all on-call together for this shift" -- everyone ends up in
+    // ONE event's members list, so this doesn't run into the rotation-can-only-hold-
+    // one-event constraint ASSUMPTION 2 in the file header describes (that's about
+    // SEPARATE events in the same rotation, not multiple members in one event).
     _buildEveryMemberEvent: function(rows, sharedWindow, snow, asOf, emailToId, tzName, eventName) {
         var members = [];
         var names = [];
@@ -1317,42 +1316,93 @@ PagerDutySync.prototype = {
             gs.info('created v3 schedule "' + name + '" -> ' + scheduleId);
         }
 
-        var rotationId = this._findOrCreateRotationV3(scheduleId, rest);
-
-        var existingEvents = existing
-            ? (rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events').data.events || [])
+        // v3 rotations are the analog of v2 schedule LAYERS, not a container that
+        // can hold several independent shift patterns at once. Confirmed live:
+        // creating a second always-on event in a shared rotation was rejected --
+        // "Event with id ... overlaps with this event" (error code 2001) -- even
+        // though the two events' own day/time patterns don't conflict (the two
+        // alternating groups' shapes were already confirmed non-overlapping by
+        // hand). The overlap check is on the event's effective_since/
+        // effective_until window (both open-ended = "forever" = unconditionally
+        // overlapping in PagerDuty's eyes), not on recurrence shape. So this
+        // schedule needs one rotation PER logical event (one per roster row,
+        // alternating group, or every_member group) -- matching v2's
+        // one-layer-per-row structure -- not one shared rotation holding every
+        // event the way this first assumed.
+        //
+        // Rotations have no name/identifying field of their own (confirmed
+        // against the OpenAPI spec -- just {id, type, events}), so matching an
+        // existing rotation to a desired event goes through the event it
+        // contains: this port only ever puts exactly one event in a rotation it
+        // manages, so that event's name is a reliable proxy for the rotation's
+        // identity across syncs.
+        var existingRotations = existing
+            ? (rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations').data.rotations || [])
             : [];
+        var rotationByEventName = {};
+        for (var r = 0; r < existingRotations.length; r++) {
+            var rotationEvents = existingRotations[r].events || [];
+            for (var re = 0; re < rotationEvents.length; re++) {
+                rotationByEventName[rotationEvents[re].name] = {rotationId: existingRotations[r].id, event: rotationEvents[re]};
+            }
+        }
+
+        var desiredNames = {};
+        for (var e = 0; e < events.length; e++) desiredNames[events[e].name] = true;
+
+        // Remove rotations whose event no longer corresponds to anything this
+        // sync produces -- same "replace everything this port manages" semantics
+        // as before.
+        var removedRotations = 0;
+        for (var existingName in rotationByEventName) {
+            if (!rotationByEventName.hasOwnProperty(existingName) || desiredNames.hasOwnProperty(existingName)) continue;
+            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationByEventName[existingName].rotationId, null);
+            removedRotations++;
+        }
+        if (removedRotations) {
+            gs.info('  removed ' + removedRotations + ' rotation(s) from "' + name + '" no longer produced by this sync');
+        }
+
         // PagerDuty rejects DELETE on an event whose effective_until is already in
         // the past -- confirmed live: HTTP 400, error code 2004, "Schedule contains
         // events with effective_until in the past." Such an event is already inert
-        // (it stopped producing shifts once effective_until passed), can't be
-        // removed via this endpoint, and doesn't need to be -- only delete events
-        // that are still live (no effective_until, or one still in the future).
+        // (it stopped producing shifts once effective_until passed) and can't be
+        // removed via this endpoint -- but since it's already ended, its window
+        // doesn't overlap a new one starting now/in the future, so it's safe to
+        // just leave it in place and add the replacement alongside it in the same
+        // rotation.
         var now = new GlideDateTime();
-        var deletedCount = 0, skippedEndedCount = 0;
-        for (var i = 0; i < existingEvents.length; i++) {
-            var existingEvent = existingEvents[i];
-            if (existingEvent.effective_until) {
-                var effectiveUntilGdt = new GlideDateTime(existingEvent.effective_until.replace('T', ' ').replace(/Z$/, ''));
-                if (effectiveUntilGdt.compareTo(now) < 0) {
-                    skippedEndedCount++;
-                    continue;
-                }
-            }
-            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + existingEvent.id, null);
-            deletedCount++;
-        }
-        if (deletedCount) {
-            gs.info('  removed ' + deletedCount + ' existing event(s) from "' + name + '" before recreating');
-        }
-        if (skippedEndedCount) {
-            gs.info('  left ' + skippedEndedCount + ' already-ended event(s) on "' + name + '" alone (PagerDuty ' +
-                'won\'t delete an event whose effective_until has passed, and it\'s inert anyway)');
-        }
-
+        var createdRotationCount = 0, updatedEventCount = 0, skippedEndedCount = 0;
         for (var k = 0; k < events.length; k++) {
-            this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: events[k]});
-            gs.info('  created event "' + events[k].name + '" on schedule "' + name + '"');
+            var desiredEvent = events[k];
+            var match = rotationByEventName[desiredEvent.name];
+            var rotationId;
+            if (match) {
+                rotationId = match.rotationId;
+                var alreadyEnded = false;
+                if (match.event.effective_until) {
+                    var effectiveUntilGdt = new GlideDateTime(match.event.effective_until.replace('T', ' ').replace(/Z$/, ''));
+                    alreadyEnded = effectiveUntilGdt.compareTo(now) < 0;
+                }
+                if (alreadyEnded) {
+                    skippedEndedCount++;
+                } else {
+                    this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + match.event.id, null);
+                }
+                updatedEventCount++;
+            } else {
+                var newRotation = this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations', {}).data;
+                rotationId = newRotation.rotation.id;
+                createdRotationCount++;
+            }
+            this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: desiredEvent});
+            gs.info('  created event "' + desiredEvent.name + '" on schedule "' + name + '"');
+        }
+        if (createdRotationCount) gs.info('  created ' + createdRotationCount + ' new rotation(s) on "' + name + '"');
+        if (updatedEventCount) gs.info('  updated ' + updatedEventCount + ' existing rotation\'s event on "' + name + '"');
+        if (skippedEndedCount) {
+            gs.info('  ' + skippedEndedCount + ' matched event(s) had already ended (left in place, PagerDuty ' +
+                'won\'t delete them) before adding the replacement alongside them in the same rotation');
         }
 
         return scheduleId;
@@ -1380,22 +1430,6 @@ PagerDutySync.prototype = {
         }
         var parsed = response.getBody() ? JSON.parse(response.getBody()) : null;
         return {status: response.getStatusCode(), data: parsed};
-    },
-
-    // Rotations have no fields of their own besides id/type/events (confirmed
-    // against the OpenAPI spec -- POST body is just {}), so "find or create" is the
-    // whole story; nothing to update on the rotation itself.
-    _findOrCreateRotationV3: function(scheduleId, rest) {
-        var existingRotations = rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations').data.rotations || [];
-        if (existingRotations.length > 0) {
-            if (existingRotations.length > 1) {
-                gs.warn('v3 schedule ' + scheduleId + ' has ' + existingRotations.length + ' rotations; this port ' +
-                    'only manages one and will use the first (' + existingRotations[0].id + ')');
-            }
-            return existingRotations[0].id;
-        }
-        var created = this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations', {}).data;
-        return created.rotation.id;
     },
 
     // Escalation policies are unchanged from the v2 file -- still the classic v2
@@ -1663,13 +1697,14 @@ PagerDutySync.prototype = {
     //    (_buildAlternatingEvent) if so. Remaining rows are then checked for an
     //    identical-window-and-anchor match (_detectIdenticalGroups) and built as one
     //    every_member event (_buildEveryMemberEvent) if so -- the v3 native
-    //    representation of "these people page together," and the reason this file
-    //    no longer needs the v2 file's multi-schedule/multi-target-rule
-    //    partitioning (_partitionUnitsByNonOverlap) at all: v3 events don't have
-    //    PagerDuty's v2 layer-priority collision problem in the first place (see
-    //    ASSUMPTION 2 in the file header -- this is the one part of this
-    //    simplification that most needs live verification before trusting it).
-    //    Everything else becomes its own ordinary event in the same schedule.
+    //    representation of "these people page together," all in one event's members
+    //    list. This file doesn't need the v2 file's multi-schedule/multi-target-rule
+    //    partitioning (_partitionUnitsByNonOverlap) for THIS purpose -- but each
+    //    resulting event still gets its own rotation, one per event, since a
+    //    rotation can only hold one (see ASSUMPTION 2 in the file header, and
+    //    _upsertScheduleV3, which is where that actually gets handled -- not here).
+    //    Everything else becomes its own ordinary event, each on its own rotation,
+    //    in the same schedule.
     _buildBestEffortEscalationPolicy: function(groupName, snow, coverageWindows, asOf, dryRun, collected) {
         var emailToId = this._emailToIdCache || (this._emailToIdCache = this._pdGetAllUsers());
         gs.info('NOTE: "' + groupName + '" classified needs_review -- this escalation policy is a best-effort approximation.');
@@ -1748,10 +1783,10 @@ PagerDutySync.prototype = {
     },
 
     // Builds one escalation rule for a single order level: a direct user target if
-    // every row is single-incumbent, otherwise ONE v3 schedule whose rotation holds
-    // one event per row (or per detected alternating/identical group) -- no more
-    // multi-schedule bucketing (see the class comment above
-    // _buildBestEffortEscalationPolicy and ASSUMPTION 2 in the file header).
+    // every row is single-incumbent, otherwise ONE v3 schedule with one rotation
+    // per row (or per detected alternating/identical group), each rotation holding
+    // exactly one event -- no more multi-schedule bucketing (see the class comment
+    // above _buildBestEffortEscalationPolicy and ASSUMPTION 2 in the file header).
     _buildRuleForLevel: function(scheduleNamePrefix, orderValue, rowsAtLevel, snow, coverageWindows, asOf, emailToId, dryRun, collected) {
         var allSingleIncumbent = true;
         for (var r = 0; r < rowsAtLevel.length; r++) {
