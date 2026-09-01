@@ -1207,10 +1207,18 @@ PagerDutySync.prototype = {
     // response shape (see that function's comment).
     _findByName: function(endpoint, name) {
         var rest = new x_pd_integration.PagerDuty_REST();
-        // PagerDuty's ?query= is a substring match, not exact -- getAllItemsThrowable
-        // pages through everything it returns and we filter to an exact name match
-        // below, same as the old hand-rolled pagination did.
-        var found = rest.getAllItemsThrowable(endpoint + '?query=' + gs.urlEncode(name), function(item) { return item; });
+        // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
+        // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter silently
+        // fails to match names containing the '[' ']' this port's
+        // SYNCED_NAME_PREFIX always adds, even though the object is genuinely
+        // present. Untested here specifically (this is the classic v2 API, a
+        // different, more established surface than v3's schedules endpoint), but
+        // the same bracketed naming convention applies to every name this port
+        // creates -- including escalation policy names via this function -- so
+        // this pages through everything unfiltered instead and relies entirely on
+        // the exact-match check below, sidestepping the question rather than
+        // risking the same silent-empty-match failure here too.
+        var found = rest.getAllItemsThrowable(endpoint, function(item) { return item; });
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].name === name) matches.push(found[i]);
@@ -1249,8 +1257,19 @@ PagerDutySync.prototype = {
     // v3/schedules list items are V3ScheduleReference objects -- {id, type, summary,
     // self, html_url} -- with the display name in `summary`, not `name` (confirmed
     // against the OpenAPI spec).
+    //
+    // Does NOT use v3's ?query= parameter -- confirmed live it doesn't work for
+    // names this port actually uses: a schedule named "[ServiceNow Sync v3] Global
+    // Wintel CEC Operations - level 100" was confirmed present (visible in an
+    // unfiltered list) while ?query=<that exact name> came back with an empty
+    // "schedules":[] result. Not a timing issue (the schedule had existed for
+    // minutes, confirmed by directly re-testing) -- most likely the `[`/`]` in
+    // every name this port creates (see SYNCED_NAME_PREFIX) are being interpreted
+    // as search syntax rather than literal characters, though the exact mechanism
+    // doesn't matter: this pages through the FULL list instead and relies on the
+    // exact-match check below, sidestepping whatever's wrong with ?query= entirely.
     _findScheduleV3ByName: function(name) {
-        var found = this._pdListAllV3('v3/schedules?query=' + gs.urlEncode(name), 'schedules');
+        var found = this._pdListAllV3('v3/schedules', 'schedules');
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].summary === name) matches.push(found[i]);
@@ -1420,9 +1439,31 @@ PagerDutySync.prototype = {
     // app, not this port), so this calls the non-throwing REST method directly and
     // logs the full raw response body via gs.error before throwing, for every v3
     // write call -- so a v3 failure's actual reason always ends up in the logs.
-    _v3WriteOrThrow: function(rest, verb, endpoint, body) {
+    // attempt is 1-based and only used internally for the retry below -- omit it
+    // when calling this.
+    _v3WriteOrThrow: function(rest, verb, endpoint, body, attempt) {
+        attempt = attempt || 1;
         var response = rest[verb + 'REST'](endpoint, body);
         if (response.haveError()) {
+            // Immediately using an id a schedule/rotation CREATE just returned
+            // occasionally 404s -- confirmed live: a rotation POST against a
+            // schedule id returned moments earlier by a successful schedule
+            // CREATE got "Schedule Not Found." The id is definitely right (it's
+            // the exact one just returned); this looks like backend replication
+            // lag between the write and whatever the child-resource endpoints
+            // read from, not a logic error here. Retries a few times with a
+            // short pause for any 404 before giving up -- gs.sleep() is
+            // disallowed in this scoped app (confirmed via function fencing,
+            // same family as gs.dateDiff/session.setTimeZoneName; its documented
+            // workaround needs a separate GLOBAL-scope Script Include this port
+            // doesn't have), so the pause is a bounded busy-wait instead (see
+            // _busyWaitMs).
+            if (response.getStatusCode() === 404 && attempt < 5) {
+                gs.warn('PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' got 404 (attempt ' +
+                    attempt + '/5) -- likely a just-created resource not visible yet; retrying shortly');
+                this._busyWaitMs(400);
+                return this._v3WriteOrThrow(rest, verb, endpoint, body, attempt + 1);
+            }
             gs.error('PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed -- status ' +
                 response.getStatusCode() + ', body: ' + response.getBody());
             throw new Error('v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed (status ' +
@@ -1430,6 +1471,14 @@ PagerDutySync.prototype = {
         }
         var parsed = response.getBody() ? JSON.parse(response.getBody()) : null;
         return {status: response.getStatusCode(), data: parsed};
+    },
+
+    _busyWaitMs: function(ms) {
+        var start = new GlideDateTime().getNumericValue();
+        while ((new GlideDateTime().getNumericValue() - start) < ms) {
+            // deliberately busy -- see _v3WriteOrThrow's comment for why there's
+            // no real sleep available in this scoped app.
+        }
     },
 
     // Escalation policies are unchanged from the v2 file -- still the classic v2
