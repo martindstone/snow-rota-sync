@@ -1,25 +1,8 @@
-// Script Include: PagerDutySync
-// Client callable: false | Access from: All application scopes (adjust to your scope policy)
-//
-// CHOOSING GROUPS TO MANAGE: Add rows to the u_pagerduty_sync_group table (one
-// sys_user_group per row) to enroll them in this sync. Presence in that table
-// means this port will overwrite that group's PagerDuty schedules/escalation policies
-// on every sync; absence means it's never touched. See isEnrolled() /
-// _enrolledGroupNames() below and README.md for how to create the table.
-//
-// ASSUMPTIONS -- verify these against your instance before trusting this:
-//   - Field names on cmn_rota / cmn_rota_roster / cmn_rota_member / cmn_schedule_span
-//     match what the original CSV exports used (schedule, schedule.time_zone,
-//     group, group.manager.email, catch_all, rota, roster, days_of_week, repeat_type,
-//     start_date_time, end_date_time, etc.)
-//   - cmn_rota_member.from / cmn_rota_member.to are Date fields (no time component),
-//     matching the "DD-MM-YYYY" format seen in the CSV exports.
-
 var PagerDutySync = Class.create();
 PagerDutySync.prototype = {
     initialize: function() {
         // Which groups this port manages is data now, not code -- see isEnrolled()
-        // and _enrolledGroupNames() below, which read the u_pagerduty_sync_group
+        // and _enrolledGroupNames() below, which read the x_pd_integration_pagerduty_sync_group
         // table (one row per enrolled sys_user_group). Presence = this group's
         // on-call comes from ServiceNow and gets overwritten in PagerDuty on every
         // sync; absence = untouched. See README.md for how to create the table.
@@ -29,9 +12,9 @@ PagerDutySync.prototype = {
         // prefix, so anyone scanning PagerDuty's UI can immediately tell which
         // objects are ServiceNow-managed (and, since PD sorts lists alphabetically,
         // they cluster together instead of being scattered through the full list).
-        this.SYNCED_NAME_PREFIX = '[ServiceNow Sync] ';
-        this.SYNCED_DESCRIPTION = 'Managed by ServiceNow on-call sync (PagerDutySync). ' +
-            'Changes made directly in PagerDuty will be overwritten on the next sync.';
+        this.SYNCED_NAME_PREFIX = '[ServiceNow Sync v3] ';
+        this.SYNCED_DESCRIPTION = 'Managed by ServiceNow on-call sync (PagerDutySync, v3 shift-based ' +
+            'schedules exploration). Changes made directly in PagerDuty will be overwritten on the next sync.';
 
         // Reuses the app's own "Default PagerDuty User ID to use if auto-provisioning
         // is disabled" property instead of a separate one-off property for this port
@@ -40,12 +23,11 @@ PagerDutySync.prototype = {
         // already configured on this instance, no second ID to keep in sync.
         this.FALLBACK_USER_ID = gs.getProperty('x_pd_integration.default_user');
         if (!this.FALLBACK_USER_ID) {
-            gs.warn('PagerDutySync: x_pd_integration.default_user is not set; escalation ' +
-                'rules/layers with no active or resolvable member will be built with a blank ' +
-                'user id, which PagerDuty will reject');
+            gs.warn('PagerDutySync: x_pd_integration.default_user is not set; events with no active or ' +
+                'resolvable member will be built with a blank user id, which PagerDuty will reject');
         }
 
-        // Cosmetic only 
+        // Cosmetic only
         this.ROLE_CANONICALIZATION = {
             'Primary': 'Primary',
             'Secondary': 'Secondary',
@@ -74,11 +56,51 @@ PagerDutySync.prototype = {
             'Asia/Manila': 'Asia/Singapore'
         };
 
+        // Standard-time (non-DST) UTC offsets, in seconds, for the canonical zones
+        // above -- see _localizedIso for why this exists and its DST limitation.
+        this.STANDARD_UTC_OFFSET_SECONDS = {
+            'America/New_York': -5 * 3600,
+            'America/Chicago': -6 * 3600,
+            'America/Denver': -7 * 3600,
+            'America/Los_Angeles': -8 * 3600,
+            'America/Phoenix': -7 * 3600,   // no DST
+            'America/Anchorage': -9 * 3600,
+            'Pacific/Honolulu': -10 * 3600, // no DST
+            'America/Mexico_City': -6 * 3600,
+            'America/Toronto': -5 * 3600,
+            'Asia/Singapore': 8 * 3600,     // no DST
+            'UTC': 0
+        };
+
         this.NUM_LOOPS = 2;
         this.CATCH_ALL_DELAY_MINUTES = 30;
         this.HANDLED_CATCH_ALL_TYPES = {'Notify Group Manager': true};
         this.ROTATION_ORDER_SENTINEL_THRESHOLD = 1000;
-        this.MAX_RESTRICTED_WINDOW_HOURS = 20;
+        // A sanity ceiling on a single cmn_schedule_span's computed duration, meant
+        // to catch a genuine data problem (e.g. start/end misordered across days,
+        // producing a nonsensical multi-day "duration"). Was 20 -- too strict:
+        // confirmed live on real data that a legitimate all-day rotation
+        // (days_of_week=1234567, 00:00:00-23:59:59, ServiceNow's own way of
+        // representing "all day") computes to 86399 seconds = 23.9997h, which is
+        // >= 20 and was being silently filtered out, leaving zero usable windows
+        // and _computeCoverageWindow returning null for an entirely valid rota.
+        // 24 lets a real all-day span through while still rejecting anything
+        // that's actually too long to be a single day's window.
+        this.MAX_RESTRICTED_WINDOW_HOURS = 24;
+
+        // Monday=1 .. Sunday=7, matching _decodeDaysOfWeek's convention -- confirmed
+        // against real data (Wintel's "Su-We-Th-Fr" rota has days_of_week digits
+        // that decode to {3,4,5,7} under this mapping, i.e. Wed/Thu/Fri/Sun).
+        this.RRULE_DAY_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+
+        // Arbitrary, fixed, stable reference instant used only when a roster has
+        // neither a real rotation_start_date/rotation_start_time NOR a coverage
+        // window to anchor its rotation phase to (see _rotationPhaseAnchorIso) --
+        // confirmed this happens on real data (a "Daily Rotation" roster with both
+        // fields blank produced an invalid "0002-11-30" effective_since before this
+        // existed). Deliberately not "now" (asOf) -- using the sync time as the
+        // phase anchor would reset which member looks "current" on every re-sync.
+        this.FIXED_FALLBACK_ANCHOR_ISO = '2020-01-06T00:00:00Z'; // arbitrary Monday
 
         this._placeholderCounter = {schedule: 0, escalation_policy: 0};
     },
@@ -87,7 +109,7 @@ PagerDutySync.prototype = {
     // PUBLIC ENTRY POINTS
     // ------------------------------------------------------------------------------
 
-    // Sync every enrolled group (see u_pagerduty_sync_group). dryRun defaults to true
+    // Sync every enrolled group (see x_pd_integration_pagerduty_sync_group). dryRun defaults to true
     // for safety when called programmatically (e.g. from a Background Script); UI
     // Actions should pass false explicitly once they've been tested.
     syncAll: function(dryRun) {
@@ -105,7 +127,7 @@ PagerDutySync.prototype = {
         return collected;
     },
 
-    // Sync a single group by its exact name (must be enrolled in u_pagerduty_sync_group).
+    // Sync a single group by its exact name (must be enrolled in x_pd_integration_pagerduty_sync_group).
     syncGroup: function(groupName, dryRun) {
         dryRun = (dryRun === false) ? false : true;
         if (!this.isEnrolled(groupName)) {
@@ -121,7 +143,7 @@ PagerDutySync.prototype = {
         return collected;
     },
 
-    // Returns true if `groupName` is enrolled in u_pagerduty_sync_group. This is the
+    // Returns true if `groupName` is enrolled in x_pd_integration_pagerduty_sync_group. This is the
     // one place that knows what "enrolled" means -- the Business Rule and contextual
     // UI Action condition scripts call this directly instead of each keeping their
     // own copy of the check.
@@ -147,7 +169,7 @@ PagerDutySync.prototype = {
     // whole group that rota belongs to, since our escalation policies are built per
     // GROUP, not per region -- there's no such thing as "just sync one region" for a
     // follow_the_sun group) or a sys_user_group row (syncs it directly if it's
-    // enrolled in u_pagerduty_sync_group). Used by the contextual UI Action and the
+    // enrolled in x_pd_integration_pagerduty_sync_group). Used by the contextual UI Action and the
     // Business Rule so both can share one resolution path regardless of which table
     // they fire from.
     syncForRecord: function(tableName, sysId, dryRun) {
@@ -328,6 +350,21 @@ PagerDutySync.prototype = {
         return parseInt(String(orderStr).replace(/,/g, ''), 10);
     },
 
+    // cmn_rota_roster.rotation_interval_type is a choice field -- like
+    // cmn_schedule_span.repeat_type (see _computeCoverageWindow's NOTE), its real
+    // internal values are lowercase ('weekly', 'daily'), not the capitalized
+    // 'Weekly' this code originally assumed. Confirmed live: a real roster's
+    // rotation_interval_type came back as "daily" and hit the "unhandled ...
+    // treating as weekly anyway" fallback -- meaning a roster meant to hand off
+    // daily among its members was instead treated as a weekly handoff (7x too
+    // slow), AND any 'weekly' roster was silently mismatching the same
+    // capitalized-only check and hitting that warning path too (just with the
+    // right behavior by coincidence, since the fallback IS "weekly"). Every
+    // comparison against this field goes through this helper now.
+    _normalizeIntervalType: function(raw) {
+        return (raw || '').replace(/^\s+|\s+$/g, '').toLowerCase();
+    },
+
     // ------------------------------------------------------------------------------
     // COVERAGE WINDOWS (from cmn_schedule_span). Reads every span row for a
     // schedule and merges them, instead of assuming exactly one Weekly row exists
@@ -341,6 +378,12 @@ PagerDutySync.prototype = {
     // policies.py's load_coverage_windows() for why this mattered in the CSV/
     // majority-vote version this replaces -- that mechanism is gone now because each
     // rota's coverage is computed correctly on its own, not inferred from siblings.
+    //
+    // Unchanged from the v2 file -- this whole section is ServiceNow-side parsing,
+    // independent of which PagerDuty schedule API consumes the result. window.
+    // anchorUtcIso (the earliest include span's real start instant, already UTC) is
+    // what this v3 file uses directly as an event's start_time/effective_since --
+    // see _buildEvent/_buildAlternatingEvent below.
     // ------------------------------------------------------------------------------
 
     // Returns {rota_sys_id: {days: [1-7,...], startTimeOfDay: 'HH:MM:SS', durationSeconds: N}}
@@ -358,10 +401,7 @@ PagerDutySync.prototype = {
 
     // Reads and merges every recurring cmn_schedule_span row for one schedule into a
     // single {days, startTimeOfDay, durationSeconds} window, or returns null if
-    // there's nothing usable. Only Weekly/Daily repeat_type rows are considered --
-    // that's the only shape PagerDuty's own schedule restrictions (daily_restriction/
-    // weekly_restriction) can express, so a Monthly/Yearly/one-time span isn't a gap
-    // here, it's just out of scope for "the steady-state weekly coverage window."
+    // there's nothing usable. Only Weekly/Daily repeat_type rows are considered.
     //
     // NOTE on start_date_time/end_date_time: these use an undocumented "Schedule
     // Date/Time" field type whose raw getValue() is NOT the usual GlideDateTime
@@ -381,12 +421,14 @@ PagerDutySync.prototype = {
 
         var includeWindows = [];
         var excludeWindows = [];
+        var repeatCountsSeen = {};
+        var earliestAnchor = null;
         while (spanGr.next()) {
             var startNormalized = this._parseScheduleDateTime(spanGr.getValue('start_date_time'));
             var endNormalized = this._parseScheduleDateTime(spanGr.getValue('end_date_time'));
             if (!startNormalized || !endNormalized) continue;
 
-            var durationSeconds = gs.dateDiff(startNormalized, endNormalized, true);
+            var durationSeconds = this._dateDiffSeconds(startNormalized, endNormalized);
             if (durationSeconds === null || durationSeconds <= 0 || (durationSeconds / 3600) >= this.MAX_RESTRICTED_WINDOW_HOURS) {
                 continue;
             }
@@ -398,18 +440,46 @@ PagerDutySync.prototype = {
                 startTimeOfDay: this._timeOfDayFromGlideDateTime(new GlideDateTime(startNormalized)),
                 durationSeconds: durationSeconds
             };
+            var repeatCount = parseInt(spanGr.getValue('repeat_count'), 10);
+            if (isNaN(repeatCount) || repeatCount < 1) repeatCount = 1;
+            repeatCountsSeen[repeatCount] = true;
+
             if ((spanGr.getValue('type') || '').toLowerCase() === 'exclude') {
                 excludeWindows.push(window);
             } else {
                 includeWindows.push(window);
+                if (earliestAnchor === null || startNormalized < earliestAnchor) earliestAnchor = startNormalized;
             }
         }
 
         if (includeWindows.length === 0) return null;
-        if (includeWindows.length === 1 && excludeWindows.length === 0) {
-            return includeWindows[0]; // common case -- same result as the old single-row logic
+
+        var repeatCountValues = [];
+        for (var rc in repeatCountsSeen) { if (repeatCountsSeen.hasOwnProperty(rc)) repeatCountValues.push(parseInt(rc, 10)); }
+        if (repeatCountValues.length > 1) {
+            gs.warn('"' + rotaLabel + '" has cmn_schedule_span rows with different repeat_count values (' +
+                repeatCountValues.join(', ') + '); using the largest for alternating-cycle detection');
         }
-        return this._mergeSpanWindows(rotaLabel, includeWindows, excludeWindows);
+        var repeatCount = repeatCountValues.length ? Math.max.apply(null, repeatCountValues) : 1;
+
+        var result;
+        if (includeWindows.length === 1 && excludeWindows.length === 0) {
+            result = includeWindows[0]; // common case -- same result as the old single-row logic
+        } else {
+            result = this._mergeSpanWindows(rotaLabel, includeWindows, excludeWindows);
+        }
+        if (!result) return null;
+
+        // repeat_count > 1 ("Repeat every N weeks") means this rota is only active
+        // every Nth week, not every week -- cyclePhase/anchorUtcIso let
+        // _detectAlternatingGroups() recognize two rotas with an identical shape
+        // (e.g. Wintel's "1a"/"1b") as alternating partners on disjoint weeks of
+        // the same cycle, rather than a same-week conflict. Confirmed via
+        // fix_script_q6_q7.txt Q7 (in ../servicenow/) -- see _detectAlternatingGroups.
+        result.repeatCount = repeatCount;
+        result.cyclePhase = (repeatCount > 1 && earliestAnchor) ? this._weekPhase(earliestAnchor) : null;
+        result.anchorUtcIso = earliestAnchor ? (earliestAnchor.replace(' ', 'T') + 'Z') : null;
+        return result;
     },
 
     // Normalizes cmn_schedule_span's compact-ISO8601 date value ('yyyyMMdd'T'HHmmss'Z')
@@ -425,14 +495,41 @@ PagerDutySync.prototype = {
         return m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6];
     },
 
+    // gs.dateDiff() is disallowed under function fencing in a scoped app -- confirmed
+    // live: "Function dateDiff is not allowed in scope x_pd_integration. Use
+    // GlideDateTime.subtract() instead." The suggested GlideDateTime.subtract(
+    // otherGdt) replacement turned out NOT to take a second GlideDateTime the way
+    // gs.dateDiff() does -- confirmed live, it threw "Cannot convert <date string> to
+    // java.lang.Long," meaning that overload expects something duration/Long-shaped,
+    // not another GlideDateTime, and Rhino tried (and failed) to coerce one into that.
+    // This instead uses GlideDateTime.getNumericValue() (epoch milliseconds as a
+    // plain JS number, no interop overload ambiguity) on each side and subtracts
+    // directly -- date2 minus date1, in seconds, matching gs.dateDiff(date1Str,
+    // date2Str, true)'s exact semantics everywhere it was used in this file.
+    _dateDiffSeconds: function(date1Str, date2Str) {
+        var gdt1 = new GlideDateTime(date1Str);
+        var gdt2 = new GlideDateTime(date2Str);
+        return (gdt2.getNumericValue() - gdt1.getNumericValue()) / 1000;
+    },
+
+    // Integer week index of a normalized 'yyyy-MM-dd HH:mm:ss' instant relative to
+    // an arbitrary fixed reference. Only meaningful as a DIFFERENCE between two
+    // calls (mod a shared repeat_count) -- used to tell whether two rotas' anchors
+    // fall on the same or a different week of an N-week repeat cycle.
+    _weekPhase: function(normalizedDateTime) {
+        var REFERENCE = '2001-01-01 00:00:00';
+        var seconds = this._dateDiffSeconds(REFERENCE, normalizedDateTime);
+        return Math.floor(seconds / (7 * 24 * 3600));
+    },
+
     // Merges multiple coverage-contributing spans and subtracts any Excluded spans,
     // per day of week, using real interval union/subtraction. Only returns a result
     // if it collapses to ONE time-of-day window shared by every covered day -- that's
-    // the only shape _buildRestrictions() can turn into a PagerDuty restriction. A
-    // genuinely more complex shape (different hours on different days, or a gap left
-    // by an exclusion) isn't something to guess through -- it logs why and returns
-    // null, same "no usable window" fallback as the old code had for unexpected data,
-    // just with a clearer reason attached.
+    // the only shape this file's RRULE-per-day-shape approach can represent (same
+    // constraint the v2 file's restrictions had). A genuinely more complex shape
+    // (different hours on different days, or a gap left by an exclusion) isn't
+    // something to guess through -- it logs why and returns null, same "no usable
+    // window" fallback as before, just with a clearer reason attached.
     _mergeSpanWindows: function(rotaLabel, includeWindows, excludeWindows) {
         var includeIntervalsByDay = {};
         var excludeIntervalsByDay = {};
@@ -453,8 +550,8 @@ PagerDutySync.prototype = {
             if (merged.length === 0) continue;
             if (merged.length > 1) {
                 gs.warn('"' + rotaLabel + '" has a non-contiguous coverage window on day ' + day + ' after ' +
-                    'merging cmn_schedule_span rows; this shape can\'t be represented as a single PagerDuty ' +
-                    'restriction -- skipping, treat as needs review');
+                    'merging cmn_schedule_span rows; this shape can\'t be represented as a single RRULE-based ' +
+                    'event -- skipping, treat as needs review');
                 return null;
             }
             var start = merged[0][0], duration = merged[0][1] - merged[0][0];
@@ -464,7 +561,7 @@ PagerDutySync.prototype = {
             } else if (start !== commonStart || duration !== commonDuration) {
                 gs.warn('"' + rotaLabel + '" has a different time-of-day coverage window on different days ' +
                     'after merging cmn_schedule_span rows; this shape can\'t be represented as a single ' +
-                    'PagerDuty restriction -- skipping, treat as needs review');
+                    'RRULE-based event -- skipping, treat as needs review');
                 return null;
             }
             resultDays.push(day);
@@ -564,24 +661,89 @@ PagerDutySync.prototype = {
         return parts.length > 1 ? parts[1] : '00:00:00';
     },
 
-    _buildRestrictions: function(window) {
+    // v2 could represent "no restriction" by simply omitting .restrictions from a
+    // layer (always active). v3 has no such concept -- every event needs a real
+    // start_time anchor -- so this fallback anchors to today's midnight IN THE
+    // SCHEDULE'S OWN ZONE (via the same GlideScheduleDateTime mechanism
+    // _localizedIso uses) and covers every day, all day (RRULE:FREQ=DAILY, no
+    // BYDAY needed).
+    //
+    // An earlier version of this anchored to midnight UTC instead, regardless of
+    // tzName -- confirmed live on a real sync: a schedule in America/New_York
+    // (EDT, UTC-4) got its daily handoffs at 8:00 PM local, since 00:00 UTC is
+    // 20:00 EDT the PREVIOUS day. The window's specific anchor time doesn't affect
+    // 24/7 coverage itself (it's always-on regardless), but it does set where the
+    // daily occurrence boundary -- and so the handoff moment -- falls.
+    _defaultAlwaysOnWindow: function(tzName) {
+        var gdt = new GlideDateTime();
+        var datePart = gdt.getValue().split(' ')[0];
+        var midnightLocalIso = this._localizedIso(datePart, '00:00:00', tzName);
+        return {
+            days: [1, 2, 3, 4, 5, 6, 7],
+            startTimeOfDay: '00:00:00',
+            durationSeconds: 86400,
+            repeatCount: 1,
+            cyclePhase: null,
+            anchorUtcIso: midnightLocalIso
+        };
+    },
+
+    // ------------------------------------------------------------------------------
+    // RRULE / SHIFT-TIMING HELPERS (v3-specific)
+    // ------------------------------------------------------------------------------
+
+    // FREQ=DAILY for a 24/7 window (no BYDAY needed -- every day matches); otherwise
+    // FREQ=WEEKLY with an explicit BYDAY list built from window.days via
+    // RRULE_DAY_CODES. INTERVAL is deliberately not used here even for alternating
+    // groups -- see _buildAlternatingEvent, which expresses the alternation through
+    // assignment_strategy/shifts_per_member instead, since that's demonstrated in
+    // the OpenAPI spec's own examples and doesn't depend on how PagerDuty's RRULE
+    // parser handles INTERVAL (untested).
+    _rruleForWindow: function(window) {
         if (this._daysAreEveryDay(window.days)) {
-            return [{
-                type: 'daily_restriction',
-                start_time_of_day: window.startTimeOfDay,
-                duration_seconds: window.durationSeconds
-            }];
+            return 'RRULE:FREQ=DAILY';
         }
-        var restrictions = [];
+        var codes = [];
         for (var i = 0; i < window.days.length; i++) {
-            restrictions.push({
-                type: 'weekly_restriction',
-                start_day_of_week: window.days[i],
-                start_time_of_day: window.startTimeOfDay,
-                duration_seconds: window.durationSeconds
-            });
+            codes.push(this.RRULE_DAY_CODES[window.days[i] - 1]);
         }
-        return restrictions;
+        return 'RRULE:FREQ=WEEKLY;BYDAY=' + codes.join(',');
+    },
+
+    // How many consecutive RRULE-generated occurrences one member covers before the
+    // assignment strategy hands off to the next -- confirmed from the OpenAPI spec:
+    // "Number of consecutive shift occurrences each member covers before the next
+    // member takes over," with an explicit note that for FREQ=WEEKLY this must be
+    // evenly divisible by the BYDAY day count. One full intervalCount-week rotation
+    // period = intervalCount * (occurrences generated per week) -- 7 for FREQ=DAILY,
+    // window.days.length for FREQ=WEEKLY.
+    // intervalType 'daily' (cmn_rota_roster.rotation_interval_type, see
+    // _normalizeIntervalType): N days = N discrete occurrences, 1:1, regardless of
+    // how many of those occurrences fall in a calendar week. Anything else (the
+    // 'weekly' default, and _buildAlternatingEvent's fixed one-side-per-week
+    // cadence): N weeks = N * however many occurrences one week's worth of this
+    // shape produces.
+    _shiftsPerMember: function(window, intervalType, intervalCount) {
+        var count = Math.max(1, intervalCount || 1);
+        if (intervalType === 'daily') return count;
+        var occurrencesPerWeek = this._daysAreEveryDay(window.days) ? 7 : window.days.length;
+        return count * occurrencesPerWeek;
+    },
+
+    _zonedDateTime: function(isoUtc, tzName) {
+        return {date_time: isoUtc, time_zone: tzName};
+    },
+
+    // Adds `seconds` to a UTC ISO8601 instant ('yyyy-MM-ddTHH:mm:ssZ'), returning the
+    // same format. GlideDateTime's plain constructor accepts the internal
+    // 'yyyy-MM-dd HH:mm:ss' form directly as UTC (already relied on elsewhere in this
+    // file, e.g. _computeCoverageWindow's `new GlideDateTime(startNormalized)`), so
+    // this doesn't need the session-timezone dance _localizedIso uses below.
+    _addSecondsToUtcIso: function(isoUtc, seconds) {
+        var normalized = isoUtc.replace('T', ' ').replace(/Z$/, '');
+        var gdt = new GlideDateTime(normalized);
+        gdt.addSeconds(seconds);
+        return gdt.getValue().replace(' ', 'T') + 'Z';
     },
 
     // ------------------------------------------------------------------------------
@@ -621,7 +783,7 @@ PagerDutySync.prototype = {
     },
 
     // ------------------------------------------------------------------------------
-    // SCHEDULE LAYER / USER RESOLUTION
+    // MEMBER RESOLUTION
     // ------------------------------------------------------------------------------
 
     _resolveUser: function(email, emailToId) {
@@ -665,94 +827,286 @@ PagerDutySync.prototype = {
         return this._resolveUser(active[0].member_email, emailToId).id;
     },
 
-    _buildScheduleLayer: function(rosterRow, rotaRow, memberRows, asOf, emailToId) {
-        var tzName = rotaRow.schedule_time_zone;
+    // ------------------------------------------------------------------------------
+    // EVENT BUILDERS (v3) -- replace the v2 file's schedule-layer builders. A v3
+    // "event" is the analog of a v2 "layer": one roster row's rotation, scoped to one
+    // coverage window. Where the v2 file wrote {days, startTimeOfDay, duration} into
+    // a `restrictions` array evaluated fresh every week, this file writes it into an
+    // RFC 5545 `recurrence` rule anchored at the window's real first occurrence
+    // (window.anchorUtcIso) -- see ASSUMPTION 1 in the file header for the one real
+    // open question in this translation.
+    // ------------------------------------------------------------------------------
 
-        var intervalType = rosterRow.rotation_interval_type;
+    // One roster row -> one event, with its own members rotating among themselves
+    // (rotating_member_assignment_strategy). Mirrors the v2 file's
+    // _buildScheduleLayer, translated to the event/assignment_strategy shape.
+    _buildEvent: function(rosterRow, rotaRow, memberRows, window, asOf, emailToId, tzName) {
+        var intervalType = this._normalizeIntervalType(rosterRow.rotation_interval_type);
         var intervalCount = parseInt(rosterRow.rotation_interval_count, 10);
         if (isNaN(intervalCount) || intervalCount < 1) intervalCount = 1;
-        if (intervalType !== 'Weekly') {
-            gs.warn('unhandled rotation_interval_type "' + intervalType + '" on roster ' + rosterRow.sys_id + '; treating as weekly anyway');
+        if (intervalType !== 'daily' && intervalType !== 'weekly') {
+            gs.warn('unrecognized rotation_interval_type "' + rosterRow.rotation_interval_type + '" on roster ' +
+                rosterRow.sys_id + '; treating as weekly anyway');
+            intervalType = 'weekly';
         }
-        var rotationTurnLengthSeconds = intervalCount * 7 * 24 * 3600;
 
-        // rotation_start_date is a plain Date field ("yyyy-MM-dd" internal value);
-        // rotation_start_time is a plain Time field ("HH:mm:ss"). Combine and localize
-        // to the rota's own schedule time zone for the ISO8601 string PagerDuty needs.
-        var startIso = this._localizedIso(rosterRow.rotation_start_date, rosterRow.rotation_start_time, tzName);
+        // rotation_start_date/rotation_start_time anchor WHICH member's turn is
+        // "current" (effective_since) -- kept separate from window.anchorUtcIso
+        // (which anchors the shift's time-of-day shape/recurrence), since they can
+        // legitimately differ: a coverage window can be old while a roster's current
+        // membership rotation started more recently. See _rotationPhaseAnchorIso for
+        // the fallback when rotation_start_date/rotation_start_time are blank
+        // (confirmed happens on real data) and _localizedIso for the compact-date
+        // parsing this depends on otherwise (same fix as the v2 file).
+        var effectiveSince = this._rotationPhaseAnchorIso(rosterRow, tzName, window.anchorUtcIso);
 
         var active = this._activeMemberRows(memberRows, asOf);
-        var users = [];
+        var members = [];
         var fallbackCount = 0;
         for (var i = 0; i < active.length; i++) {
             var resolved = this._resolveUser(active[i].member_email, emailToId);
             if (!resolved.matched) fallbackCount++;
-            users.push({user: {id: resolved.id, type: 'user_reference'}});
+            members.push({type: 'user_member', user_id: resolved.id});
         }
-        if (users.length === 0) {
+        if (members.length === 0) {
             gs.warn('roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no currently-active ' +
-                'members (no member rows at all, or none currently active); using fallback user for the whole layer');
-            users = [{user: {id: this.FALLBACK_USER_ID, type: 'user_reference'}}];
+                'members (no member rows at all, or none currently active); using fallback user for the whole event');
+            members = [{type: 'user_member', user_id: this.FALLBACK_USER_ID}];
             fallbackCount = 1;
         }
         if (fallbackCount) {
-            gs.info('  note: ' + fallbackCount + '/' + users.length + ' slot(s) in "' + rosterRow.name +
+            gs.info('  note: ' + fallbackCount + '/' + members.length + ' slot(s) in "' + rosterRow.name +
                 '" (' + rotaRow.name + ') filled with the fallback user');
         }
 
         return {
             name: rotaRow.name + ' - ' + rosterRow.name,
-            start: startIso,
-            rotation_virtual_start: startIso,
-            rotation_turn_length_seconds: rotationTurnLengthSeconds,
-            users: users
+            start_time: this._zonedDateTime(window.anchorUtcIso, tzName),
+            end_time: this._zonedDateTime(this._addSecondsToUtcIso(window.anchorUtcIso, window.durationSeconds), tzName),
+            effective_since: effectiveSince,
+            recurrence: [this._rruleForWindow(window)],
+            assignment_strategy: {
+                type: 'rotating_member_assignment_strategy',
+                shifts_per_member: this._shiftsPerMember(window, intervalType, intervalCount),
+                members: members
+            }
+        };
+    },
+
+    // Builds ONE rotating v3 event from a detected alternating group of roster rows
+    // (see _detectAlternatingGroups) whose rotas share an identical coverage shape
+    // but sit on disjoint weeks of a shared repeat_count cycle -- e.g. Wintel's "On
+    // shift 1a"/"On shift 1b", confirmed via fix_script_q6_q7.txt Q7 (repeat_count=2
+    // on both, anchors one week apart, in ../servicenow/).
+    //
+    // This is the payoff for the v3 rewrite: the v2 file needed a hand-rolled
+    // interleaved-users/rotation_turn_length_seconds hack (_buildAlternatingLayer,
+    // _interleaveAlternatingUsers) to fake "week on/week off" on top of a schedule
+    // model with no such native concept. Here it's just
+    // rotating_member_assignment_strategy with shifts_per_member set to one full
+    // week's worth of occurrences (see _shiftsPerMember) and each side's members
+    // interleaved into the rotation order -- the SAME interleaving algorithm as the
+    // v2 file (_interleaveAlternatingUsers, kept, operating on plain user id strings
+    // now rather than pre-wrapped {user:{id,type}} objects), just fed into a
+    // members list PagerDuty rotates through natively instead of a synthetic
+    // multi-week rotation_turn_length_seconds.
+    //
+    // orderedRows must already be in phase order (index 0 = whichever side's own
+    // span anchors first) -- _detectAlternatingGroups guarantees this.
+    _buildAlternatingEvent: function(orderedRows, sharedWindow, snow, asOf, emailToId, tzName) {
+        var sideUserIdLists = [];
+        var names = [];
+        for (var i = 0; i < orderedRows.length; i++) {
+            var row = orderedRows[i];
+            var memberRows = snow.membersByRosterSysId[row.sys_id] || [];
+            var active = this._activeMemberRows(memberRows, asOf);
+            var sideIds = [];
+            for (var a = 0; a < active.length; a++) {
+                sideIds.push(this._resolveUser(active[a].member_email, emailToId).id);
+            }
+            if (sideIds.length === 0) sideIds = [this.FALLBACK_USER_ID];
+            sideUserIdLists.push(sideIds);
+            names.push(row.name);
+        }
+
+        var interleavedIds = this._interleaveAlternatingUsers(sideUserIdLists);
+        var members = [];
+        for (var m = 0; m < interleavedIds.length; m++) {
+            members.push({type: 'user_member', user_id: interleavedIds[m]});
+        }
+
+        return {
+            name: names.join(' / alternating with / '),
+            start_time: this._zonedDateTime(sharedWindow.anchorUtcIso, tzName),
+            end_time: this._zonedDateTime(this._addSecondsToUtcIso(sharedWindow.anchorUtcIso, sharedWindow.durationSeconds), tzName),
+            // Alternation phase comes from the coverage window's own anchor, not any
+            // one side's rotation_start_date -- there's no single "right" side to
+            // pick that from, and the window anchor is what _detectAlternatingGroups
+            // already validated as the real signal.
+            effective_since: sharedWindow.anchorUtcIso,
+            recurrence: [this._rruleForWindow(sharedWindow)],
+            assignment_strategy: {
+                type: 'rotating_member_assignment_strategy',
+                shifts_per_member: this._shiftsPerMember(sharedWindow, 'weekly', 1),
+                members: members
+            }
+        };
+    },
+
+    // Round-robins N side-lists of PagerDuty user IDs into one flat rotation array:
+    // [A1,B1,A2,B2,...]. A side shorter than the longest cycles back to its own start
+    // (list[round % list.length]) instead of running out, so its members still get
+    // equal turns over the full period. Same algorithm as the v2 file's version --
+    // only the element shape changed (plain ID strings here; v3's ShiftMember
+    // wrapping happens at the call site instead of being baked into this list).
+    _interleaveAlternatingUsers: function(sideUserIdLists) {
+        var maxLen = 1;
+        for (var s = 0; s < sideUserIdLists.length; s++) maxLen = Math.max(maxLen, sideUserIdLists[s].length);
+        var merged = [];
+        for (var round = 0; round < maxLen; round++) {
+            for (var side = 0; side < sideUserIdLists.length; side++) {
+                var list = sideUserIdLists[side];
+                merged.push(list[round % list.length]);
+            }
+        }
+        return merged;
+    },
+
+    // For rows that share an IDENTICAL coverage window AND anchor (not just an
+    // overlapping one) -- e.g. Wintel's "Management Escalation APAC" and "Escalation
+    // CAL CECP (Manila)", confirmed via the fix scripts (../servicenow/) to have the
+    // same window and anchor with no repeat_count evidence of alternation. v3's
+    // every_member_assignment_strategy is the direct, native representation of
+    // "these people are all on-call together for this shift" -- see ASSUMPTION 2 in
+    // the file header before trusting this over the v2 file's multi-schedule/
+    // multi-target-rule workaround (_partitionUnitsByNonOverlap, kept unchanged in
+    // the v2 file as the fallback if live testing shows v3 events DO have some
+    // collision/priority behavior between overlapping events after all).
+    _buildEveryMemberEvent: function(rows, sharedWindow, snow, asOf, emailToId, tzName, eventName) {
+        var members = [];
+        var names = [];
+        for (var i = 0; i < rows.length; i++) {
+            var memberRows = snow.membersByRosterSysId[rows[i].sys_id] || [];
+            var active = this._activeMemberRows(memberRows, asOf);
+            if (active.length === 0) {
+                members.push({type: 'user_member', user_id: this.FALLBACK_USER_ID});
+            } else {
+                for (var a = 0; a < active.length; a++) {
+                    members.push({type: 'user_member', user_id: this._resolveUser(active[a].member_email, emailToId).id});
+                }
+            }
+            names.push(rows[i].name);
+        }
+
+        return {
+            name: eventName || names.join(' + '),
+            start_time: this._zonedDateTime(sharedWindow.anchorUtcIso, tzName),
+            end_time: this._zonedDateTime(this._addSecondsToUtcIso(sharedWindow.anchorUtcIso, sharedWindow.durationSeconds), tzName),
+            effective_since: sharedWindow.anchorUtcIso,
+            recurrence: [this._rruleForWindow(sharedWindow)],
+            assignment_strategy: {
+                type: 'every_member_assignment_strategy',
+                members: members
+            }
         };
     },
 
     // Converts a wall-clock date+time in an arbitrary IANA time zone to a UTC ISO8601
-    // string, using only supported Glide server APIs -- no Packages.java.* interop,
-    // so unlike the previous java.time-based version this can't be blocked by Script
-    // Include Java-interop sandboxing.
+    // string.
     //
-    // GlideDateTime.setDisplayValueInternal() takes a plain 'yyyy-MM-dd HH:mm:ss'
-    // string and interprets it in the CURRENT SESSION's time zone, converting it to
-    // the correct UTC instant internally (DST included) -- confirmed working via
-    // fix_script_verify_assumptions.js Q5's isolated test against a known-good input.
+    // Earlier version of this function used session.setTimeZoneName(tzName) +
+    // GlideDateTime.setDisplayValueInternal() to get a proper, DST-aware conversion.
+    // That's blocked in this scoped app -- confirmed live: "Cannot find function
+    // setTimeZoneName in object com.glide.script.fencing.ScopedGlideSession." A
+    // follow-up attempt with a hardcoded STANDARD_UTC_OFFSET_SECONDS table worked but
+    // was standard-time only (wrong by an hour for DST-observing zones roughly half
+    // the year).
     //
-    // The actual bug (found via that same Q5 run, against real data): this plugin's
-    // cmn_rota_roster.rotation_start_date/rotation_start_time -- like
-    // cmn_schedule_span's date fields (see _parseScheduleDateTime) -- return a
-    // compact, separator-less internal value ('20260715'/'190000'), not the usual
-    // 'yyyy-MM-dd'/'HH:mm:ss'. Concatenating those raw produced an unparseable string
-    // that setDisplayValueInternal() silently failed on (no throw, just an empty
-    // GlideDateTime), which is why "start"/"rotation_virtual_start" came out as a
-    // bare "Z". _normalizeRosterDate()/_normalizeRosterTime() below convert the
-    // compact form to canonical first; they pass an already-canonical value through
-    // unchanged, in case this varies by instance.
+    // GlideScheduleDateTime -- an undocumented class (not on ServiceNow's official
+    // scoped GlideDateTime API reference, current Australia release included, checked
+    // directly) but reported working by multiple independent developers, and now
+    // confirmed live in this exact scoped app -- fixes this properly. Its
+    // 'TZID=<IANA zone>;<yyyy-MM-dd HH:mm:ss>' constructor form interprets the
+    // datetime as wall-clock time IN that zone and converts to UTC, DST included:
+    // confirmed against real data (TZID=America/New_York;2026-07-15 19:00:00 ->
+    // 2026-07-15 23:00:00, the correct EDT/UTC-4 answer for a July date -- the
+    // hardcoded table would have used standard-time UTC-5 and gotten 00:00:00, an
+    // hour off). String(gsdt) returns that UTC result as a plain 'yyyy-MM-dd
+    // HH:mm:ss' value, same format GlideDateTime.getValue() uses.
+    //
+    // Given the "undocumented, mixed reliability" reports about this class
+    // elsewhere, STANDARD_UTC_OFFSET_SECONDS is kept as a fallback (standard-time
+    // only, same limitation as before) if GlideScheduleDateTime throws or returns
+    // something unexpected -- so a construction that isn't recognized degrades to
+    // "less accurate" rather than "crashes the sync."
+    //
+    // The compact-date parsing this still depends on: cmn_rota_roster.
+    // rotation_start_date/rotation_start_time -- like cmn_schedule_span's date fields
+    // (see _parseScheduleDateTime) -- return a compact, separator-less internal value
+    // ('20260715'/'190000'), not the usual 'yyyy-MM-dd'/'HH:mm:ss'.
+    // _normalizeRosterDate()/_normalizeRosterTime() below convert the compact form to
+    // canonical first; they pass an already-canonical value through unchanged, in
+    // case this varies by instance.
     _localizedIso: function(dateStr, timeStr, tzName) {
-        var session = gs.getSession();
-        var originalTzName = session.getTimeZoneName();
+        var canonicalTz = this._canonicalizeTimeZone(tzName);
+        var normalizedValue = this._normalizeRosterDate(dateStr) + ' ' + this._normalizeRosterTime(timeStr);
         try {
-            session.setTimeZoneName(tzName);
-            var gdt = new GlideDateTime();
-            var normalizedValue = this._normalizeRosterDate(dateStr) + ' ' + this._normalizeRosterTime(timeStr);
-            gdt.setDisplayValueInternal(normalizedValue);
-            var value = gdt.getValue();
-            if (!value) {
-                gs.error('PagerDutySync: _localizedIso got an empty GlideDateTime after setDisplayValueInternal("' +
-                    normalizedValue + '") in tz "' + tzName + '" (from raw date="' + dateStr + '" time="' + timeStr +
-                    '") -- it did not throw but also did not set a value. Falling back to a bare, offset-less ' +
-                    'string, which PagerDuty will likely reject.');
-                return dateStr + 'T' + timeStr;
+            var gsdt = new GlideScheduleDateTime('TZID=' + canonicalTz + ';' + normalizedValue);
+            var utcValue = String(gsdt);
+            if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(utcValue)) {
+                return utcValue.replace(' ', 'T') + 'Z';
             }
-            return value.replace(' ', 'T') + 'Z';
+            gs.warn('PagerDutySync: GlideScheduleDateTime("TZID=' + canonicalTz + ';' + normalizedValue + '") ' +
+                'produced an unexpected value ("' + utcValue + '"); falling back to the standard-time-only offset table');
         } catch (e) {
-            gs.error('PagerDutySync: failed to localize ' + dateStr + ' ' + timeStr + ' to ' + tzName +
-                ' (' + e + '); falling back to a bare UTC-offset-less string, which PagerDuty will likely reject');
-            return dateStr + 'T' + timeStr;
-        } finally {
-            session.setTimeZoneName(originalTzName);
+            gs.warn('PagerDutySync: GlideScheduleDateTime threw for "' + canonicalTz + '" (' + e +
+                '); falling back to the standard-time-only offset table');
         }
+        return this._localizedIsoViaOffsetTable(normalizedValue, canonicalTz, dateStr, timeStr);
+    },
+
+    // Fallback for _localizedIso -- see that function's comment.
+    _localizedIsoViaOffsetTable: function(normalizedValue, canonicalTz, dateStr, timeStr) {
+        var gdt = new GlideDateTime(normalizedValue);
+        var offsetSeconds = this.STANDARD_UTC_OFFSET_SECONDS.hasOwnProperty(canonicalTz)
+            ? this.STANDARD_UTC_OFFSET_SECONDS[canonicalTz] : null;
+        if (offsetSeconds === null) {
+            gs.warn('PagerDutySync: no known UTC offset for "' + canonicalTz + '" either; treating ' + dateStr + ' ' +
+                timeStr + ' as literal UTC (no conversion applied) -- add it to STANDARD_UTC_OFFSET_SECONDS ' +
+                'if this zone is really in use');
+        } else {
+            gdt.addSeconds(-offsetSeconds); // local wall-clock + offset = UTC, so UTC = local - offset
+        }
+        return gdt.getValue().replace(' ', 'T') + 'Z';
+    },
+
+    // Resolves the UTC instant a roster's own member-rotation phase should anchor
+    // to (an event's effective_since). Prefers the roster's own recorded
+    // rotation_start_date/rotation_start_time (localized via _localizedIso); if
+    // either is blank -- confirmed happens on real data, see README "Known gaps"
+    // -- falls back to fallbackAnchorUtcIso (the roster's own coverage window
+    // anchor, always available here since _buildEvent always has a window -- see
+    // _defaultAlwaysOnWindow for the single_region/no-coverage-window case) or,
+    // failing that, FIXED_FALLBACK_ANCHOR_ISO. Never falls back to "now" -- see
+    // that constant's comment for why.
+    _rotationPhaseAnchorIso: function(rosterRow, tzName, fallbackAnchorUtcIso) {
+        if (!this._isBlankRosterValue(rosterRow.rotation_start_date) && !this._isBlankRosterValue(rosterRow.rotation_start_time)) {
+            return this._localizedIso(rosterRow.rotation_start_date, rosterRow.rotation_start_time, tzName);
+        }
+        gs.warn('PagerDutySync: roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no ' +
+            'rotation_start_date/rotation_start_time; using a fallback anchor for its rotation phase instead ' +
+            '-- which member appears "current" here is not derived from real ServiceNow data');
+        return fallbackAnchorUtcIso || this.FIXED_FALLBACK_ANCHOR_ISO;
+    },
+
+    // Confirmed live on real data: a blank cmn_rota_roster.rotation_start_date/
+    // rotation_start_time doesn't always mean an empty string -- ServiceNow's own
+    // "unset" sentinel for these fields is all zeros ("00000000"/"000000"), which
+    // is truthy and would otherwise slip past a plain `if (value)` check straight
+    // into _localizedIso, producing the same kind of invalid-date garbage a truly
+    // blank value did before that fallback existed (0000-00-00 isn't a real date).
+    _isBlankRosterValue: function(raw) {
+        return !raw || /^0+$/.test(raw);
     },
 
     _normalizeRosterDate: function(raw) {
@@ -763,6 +1117,23 @@ PagerDutySync.prototype = {
     _normalizeRosterTime: function(raw) {
         var m = /^(\d{2})(\d{2})(\d{2})$/.exec(raw || '');
         return m ? (m[1] + ':' + m[2] + ':' + m[3]) : raw;
+    },
+
+    // time_before_escalation is a glide_duration field: getValue() returns a full
+    // datetime string ("1970-01-01 00:15:00") whose HH:MM:SS is the actual duration,
+    // not a plain seconds count. A bare parseInt() on that string reads only the
+    // leading "1970" (stops at the first "-"), which is where a uniform, bogus
+    // "33 minute" delay came from on every row -- 1970/60 rounded. Confirmed via
+    // fix_script_q6_q7.txt Q6 (../servicenow/); real values are 15/30 minutes
+    // depending on role.
+    _parseDelayMinutes: function(raw) {
+        var m = /^\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})$/.exec(raw || '');
+        if (!m) {
+            gs.error('PagerDutySync: unrecognized time_before_escalation format "' + raw + '"; defaulting delay to 1 minute');
+            return 1;
+        }
+        var totalMinutes = (parseInt(m[1], 10) * 60) + parseInt(m[2], 10) + (parseInt(m[3], 10) / 60);
+        return Math.max(1, Math.round(totalMinutes));
     },
 
     // ------------------------------------------------------------------------------
@@ -828,6 +1199,13 @@ PagerDutySync.prototype = {
         return emailToId;
     },
 
+    // Escalation policies stay on the classic v2 API (only the schedules they
+    // target move to v3 -- see ASSUMPTION 5 in the file header: schedule_v3_
+    // reference is accepted as an escalation rule target type right alongside the
+    // classic schedule_reference). _findByName here is unchanged from the v2 file
+    // and is only used for escalation_policies lookups in this file; schedules use
+    // _findScheduleV3ByName below instead, since v3's list endpoint has a different
+    // response shape (see that function's comment).
     _findByName: function(endpoint, name) {
         var rest = new x_pd_integration.PagerDuty_REST();
         // PagerDuty's ?query= is a substring match, not exact -- getAllItemsThrowable
@@ -845,69 +1223,160 @@ PagerDutySync.prototype = {
         return matches.length ? matches[0] : null;
     },
 
+    // PagerDuty_REST.getAllItemsThrowable() resolves the response's array key from
+    // pathString.split('?')[0] -- fine for a plain v2 path like 'schedules', but
+    // wrong for 'v3/schedules' (it would look for responseBody['v3/schedules']
+    // instead of the real key, responseBody['schedules'] -- confirmed against the
+    // OpenAPI spec's actual response shape). Same offset/limit/more pagination v2
+    // uses, just resolving the correct array key explicitly instead of guessing it
+    // from the path.
+    _pdListAllV3: function(pathString, arrayKey) {
+        var rest = new x_pd_integration.PagerDuty_REST();
+        var junction = pathString.indexOf('?') === -1 ? '?' : '&';
+        var items = [];
+        var offset = 0;
+        var limit = 100;
+        var maxPages = 500;
+        for (var page = 0; page < maxPages; page++) {
+            var body = rest.getRESTThrowable(pathString + junction + 'limit=' + limit + '&offset=' + offset).data;
+            var pageItems = (body && body[arrayKey]) || [];
+            items = items.concat(pageItems);
+            if (!body || !body.more) break;
+            offset = body.offset + body.limit;
+        }
+        return items;
+    },
+
+    // v3/schedules list items are V3ScheduleReference objects -- {id, type, summary,
+    // self, html_url} -- with the display name in `summary`, not `name` (confirmed
+    // against the OpenAPI spec).
+    _findScheduleV3ByName: function(name) {
+        var found = this._pdListAllV3('v3/schedules?query=' + gs.urlEncode(name), 'schedules');
+        var matches = [];
+        for (var i = 0; i < found.length; i++) {
+            if (found[i].summary === name) matches.push(found[i]);
+        }
+        if (matches.length > 1) {
+            gs.warn('found ' + matches.length + ' existing v3 schedules named "' + name + '"; using the first (' +
+                matches[0].id + ') and leaving the others as-is');
+        }
+        return matches.length ? matches[0] : null;
+    },
+
     _nextPlaceholderId: function(kind) {
         this._placeholderCounter[kind] = (this._placeholderCounter[kind] || 0) + 1;
         return kind + '-' + this._placeholderCounter[kind];
     },
 
     // Applied to every top-level schedule/escalation_policy name this port writes
-    // (not to schedule LAYER names, which aren't top-level PagerDuty objects and
-    // aren't what someone scanning PagerDuty's schedule/EP list is looking at) --
-    // see SYNCED_NAME_PREFIX in initialize().
+    // (not to event names, which aren't top-level PagerDuty objects and aren't what
+    // someone scanning PagerDuty's schedule/EP list is looking at) -- see
+    // SYNCED_NAME_PREFIX in initialize().
     _syncedName: function(name) {
         return this.SYNCED_NAME_PREFIX + name;
     },
 
-    _upsertSchedule: function(payload, dryRun, collected) {
-        var name = payload.schedule.name;
-        var existing = this._findByName('schedules', name);
+    // Upserts one v3 schedule by name, with a single rotation holding `events`
+    // (already-built Event request objects). Every sync deletes and recreates every
+    // event this schedule's rotation holds, rather than diffing and PUTting existing
+    // ones in place -- see ASSUMPTION 3 in the file header for why (in short: v3
+    // only allows changing effective_until on an already-"active" event via PUT, so
+    // a plain update can't reliably apply roster/shape changes once an event has
+    // started). This is the v3 analog of the v2 file's _upsertSchedule, which instead
+    // did one PUT replacing the whole schedule_layers array in place (preserving
+    // layer ids by name-matching) -- not possible here since schedule/rotation/event
+    // are separate resources with their own endpoints, not one atomic replace.
+    _upsertScheduleV3: function(name, tzName, description, events, dryRun, collected) {
+        var existing = this._findScheduleV3ByName(name);
         var action = existing ? 'update' : 'create';
-
-        if (existing) {
-            var rest = new x_pd_integration.PagerDuty_REST();
-            var current = rest.getRESTThrowable('schedules/' + existing.id).data;
-            var currentLayersByName = {};
-            var currentLayers = current.schedule.schedule_layers;
-            for (var i = 0; i < currentLayers.length; i++) {
-                currentLayersByName[currentLayers[i].name] = currentLayers[i].id;
-            }
-            var matched = 0;
-            for (var j = 0; j < payload.schedule.schedule_layers.length; j++) {
-                var layer = payload.schedule.schedule_layers[j];
-                if (currentLayersByName.hasOwnProperty(layer.name)) {
-                    layer.id = currentLayersByName[layer.name];
-                    matched++;
-                }
-            }
-            if (matched < currentLayers.length) {
-                gs.info('  note: "' + name + '" currently has ' + currentLayers.length + ' layer(s) on PagerDuty but ' +
-                    'only ' + matched + ' matched by name to the new payload; the rest will be removed by this update');
-            }
-        }
-
-        collected.schedules.push({action: action, id: existing ? existing.id : null, payload: payload});
+        collected.schedules.push({
+            action: action,
+            id: existing ? existing.id : null,
+            payload: {schedule: {name: name, time_zone: tzName, description: description}, events: events}
+        });
 
         if (dryRun) {
             if (existing) {
-                gs.info('  [dry run] would UPDATE schedule "' + name + '" (' + existing.id + ')');
+                gs.info('  [dry run] would UPDATE v3 schedule "' + name + '" (' + existing.id + ') with ' + events.length + ' event(s)');
                 return existing.id;
             }
-            gs.info('  [dry run] would CREATE schedule "' + name + '"');
+            gs.info('  [dry run] would CREATE v3 schedule "' + name + '" with ' + events.length + ' event(s)');
             return this._nextPlaceholderId('schedule');
         }
 
-        var rest2 = new x_pd_integration.PagerDuty_REST();
-        var result;
+        var rest = new x_pd_integration.PagerDuty_REST();
+        var scheduleId;
         if (existing) {
-            result = rest2.putRESTThrowable('schedules/' + existing.id, payload).data;
-            gs.info('updated schedule "' + name + '" -> ' + result.schedule.id);
+            scheduleId = existing.id;
+            gs.info('updating v3 schedule "' + name + '" -> ' + scheduleId);
         } else {
-            result = rest2.postRESTThrowable('schedules', payload).data;
-            gs.info('created schedule "' + name + '" -> ' + result.schedule.id);
+            var createResult = rest.postRESTThrowable('v3/schedules', {
+                schedule: {name: name, time_zone: tzName, description: description}
+            }).data;
+            scheduleId = createResult.schedule.id;
+            gs.info('created v3 schedule "' + name + '" -> ' + scheduleId);
         }
-        return result.schedule.id;
+
+        var rotationId = this._findOrCreateRotationV3(scheduleId, rest);
+
+        var existingEvents = existing
+            ? (rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events').data.events || [])
+            : [];
+        // PagerDuty rejects DELETE on an event whose effective_until is already in
+        // the past -- confirmed live: HTTP 400, error code 2004, "Schedule contains
+        // events with effective_until in the past." Such an event is already inert
+        // (it stopped producing shifts once effective_until passed), can't be
+        // removed via this endpoint, and doesn't need to be -- only delete events
+        // that are still live (no effective_until, or one still in the future).
+        var now = new GlideDateTime();
+        var deletedCount = 0, skippedEndedCount = 0;
+        for (var i = 0; i < existingEvents.length; i++) {
+            var existingEvent = existingEvents[i];
+            if (existingEvent.effective_until) {
+                var effectiveUntilGdt = new GlideDateTime(existingEvent.effective_until.replace('T', ' ').replace(/Z$/, ''));
+                if (effectiveUntilGdt.compareTo(now) < 0) {
+                    skippedEndedCount++;
+                    continue;
+                }
+            }
+            rest.deleteRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + existingEvent.id);
+            deletedCount++;
+        }
+        if (deletedCount) {
+            gs.info('  removed ' + deletedCount + ' existing event(s) from "' + name + '" before recreating');
+        }
+        if (skippedEndedCount) {
+            gs.info('  left ' + skippedEndedCount + ' already-ended event(s) on "' + name + '" alone (PagerDuty ' +
+                'won\'t delete an event whose effective_until has passed, and it\'s inert anyway)');
+        }
+
+        for (var k = 0; k < events.length; k++) {
+            rest.postRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: events[k]});
+            gs.info('  created event "' + events[k].name + '" on schedule "' + name + '"');
+        }
+
+        return scheduleId;
     },
 
+    // Rotations have no fields of their own besides id/type/events (confirmed
+    // against the OpenAPI spec -- POST body is just {}), so "find or create" is the
+    // whole story; nothing to update on the rotation itself.
+    _findOrCreateRotationV3: function(scheduleId, rest) {
+        var existingRotations = rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations').data.rotations || [];
+        if (existingRotations.length > 0) {
+            if (existingRotations.length > 1) {
+                gs.warn('v3 schedule ' + scheduleId + ' has ' + existingRotations.length + ' rotations; this port ' +
+                    'only manages one and will use the first (' + existingRotations[0].id + ')');
+            }
+            return existingRotations[0].id;
+        }
+        var created = rest.postRESTThrowable('v3/schedules/' + scheduleId + '/rotations', {}).data;
+        return created.rotation.id;
+    },
+
+    // Escalation policies are unchanged from the v2 file -- still the classic v2
+    // API. Only the `type` on schedule targets differs (schedule_v3_reference vs
+    // schedule_reference), which callers set when they build a rule's targets.
     _upsertEscalationPolicy: function(payload, dryRun, collected) {
         var name = payload.escalation_policy.name;
         var existing = this._findByName('escalation_policies', name);
@@ -941,27 +1410,23 @@ PagerDutySync.prototype = {
 
     _buildEscalationRule: function(rosterRow, rotaRow, snow, asOf, emailToId, dryRun, collected) {
         var memberRows = snow.membersByRosterSysId[rosterRow.sys_id] || [];
-        var delayMinutes = Math.max(1, Math.round(parseInt(rosterRow.time_before_escalation, 10) / 60));
+        var delayMinutes = this._parseDelayMinutes(rosterRow.time_before_escalation);
 
-        var target;
         if (this._isSingleIncumbent(memberRows)) {
-            target = {id: this._pickDirectUser(memberRows, asOf, emailToId), type: 'user_reference'};
-        } else {
-            var layer = this._buildScheduleLayer(rosterRow, rotaRow, memberRows, asOf, emailToId);
-            var namePrefix = (rotaRow.name.indexOf(rotaRow.group) === 0) ? rotaRow.name : (rotaRow.group + ' - ' + rotaRow.name);
-            var schedulePayload = {
-                schedule: {
-                    type: 'schedule',
-                    name: this._syncedName(namePrefix + ' - ' + rosterRow.name),
-                    description: this.SYNCED_DESCRIPTION,
-                    time_zone: this._canonicalizeTimeZone(rotaRow.schedule_time_zone),
-                    schedule_layers: [layer]
-                }
-            };
-            var scheduleId = this._upsertSchedule(schedulePayload, dryRun, collected);
-            target = {id: scheduleId, type: 'schedule_reference'};
+            var userId = this._pickDirectUser(memberRows, asOf, emailToId);
+            return {escalation_delay_in_minutes: delayMinutes, targets: [{id: userId, type: 'user_reference'}]};
         }
-        return {escalation_delay_in_minutes: delayMinutes, targets: [target]};
+
+        // single_region groups don't have a coverage window computed at all (there's
+        // only one region, so there's nothing to restrict WHEN this schedule
+        // applies -- it's whoever's turn it is, all the time), same as the v2 file's
+        // behavior of never setting .restrictions here.
+        var tzName = this._canonicalizeTimeZone(rotaRow.schedule_time_zone);
+        var namePrefix = (rotaRow.name.indexOf(rotaRow.group) === 0) ? rotaRow.name : (rotaRow.group + ' - ' + rotaRow.name);
+        var event = this._buildEvent(rosterRow, rotaRow, memberRows, this._defaultAlwaysOnWindow(tzName), asOf, emailToId, tzName);
+        var scheduleName = this._syncedName(namePrefix + ' - ' + rosterRow.name);
+        var scheduleId = this._upsertScheduleV3(scheduleName, tzName, this.SYNCED_DESCRIPTION, [event], dryRun, collected);
+        return {escalation_delay_in_minutes: delayMinutes, targets: [{id: scheduleId, type: 'schedule_v3_reference'}]};
     },
 
     // single_region: one EP per (region, group) -- trivial since there's only one region.
@@ -999,18 +1464,17 @@ PagerDutySync.prototype = {
         }
     },
 
-    // follow_the_sun: one EP per GROUP, each level a single schedule made of one
-    // time-restricted layer per region. Levels are grouped and sequenced by
-    // rosterRow.order -- the field ServiceNow itself uses for escalation
-    // sequencing -- rather than by matching each region's roster role name against
-    // a hardcoded label list (_buildBestEffortEscalationPolicy already proves this
-    // technique works for the other shape). This generalizes to any team's naming
-    // convention for free, but it does assume `order` is assigned consistently
-    // across regions for the same logical tier (e.g. every region's "first
-    // responder" roster row really does carry the same order value) -- worth
-    // confirming against real data; see README.md "Known gaps". The canonicalized
-    // role name is still used, but only for the schedule's display name -- that's
-    // cosmetic, not load-bearing for correctness.
+    // follow_the_sun: one EP per GROUP, each level a single v3 schedule made of one
+    // event per region (was: one schedule made of one restricted layer per region).
+    // Levels are grouped and sequenced by rosterRow.order -- the field ServiceNow
+    // itself uses for escalation sequencing -- rather than by matching each region's
+    // roster role name against a hardcoded label list. This generalizes to any
+    // team's naming convention for free, but it does assume `order` is assigned
+    // consistently across regions for the same logical tier (e.g. every region's
+    // "first responder" roster row really does carry the same order value) --
+    // worth confirming against real data; see README.md "Known gaps". The
+    // canonicalized role name is still used, but only for the schedule's display
+    // name -- that's cosmetic, not load-bearing for correctness.
     _buildFollowTheSunEscalationPolicy: function(groupName, snow, coverageWindows, asOf, dryRun, collected) {
         var emailToId = this._emailToIdCache || (this._emailToIdCache = this._pdGetAllUsers());
         var rotas = snow.rotasForGroup();
@@ -1037,38 +1501,29 @@ PagerDutySync.prototype = {
         for (var k = 0; k < orderKeys.length; k++) {
             var entries = levels[orderKeys[k]];
             var levelLabel = this._pickLevelLabel(entries);
-            var layers = [];
+            var targetTz = this._canonicalizeTimeZone(entries[0].rotaRow.schedule_time_zone);
+            var events = [];
             var maxDelay = 1;
             for (var e = 0; e < entries.length; e++) {
                 var rosterRow = entries[e].rosterRow;
                 var rotaRow2 = entries[e].rotaRow;
                 var memberRows = snow.membersByRosterSysId[rosterRow.sys_id] || [];
-                var layer = this._buildScheduleLayer(rosterRow, rotaRow2, memberRows, asOf, emailToId);
 
                 var window = coverageWindows[rotaRow2.sys_id];
                 if (!window) {
                     gs.warn('no coverage window for "' + rotaRow2.name + '" (' + groupName + ' / ' + levelLabel +
-                        ') despite this group being classified follow_the_sun; building this layer as 24/7 unrestricted -- treat as a bug');
-                } else {
-                    layer.restrictions = this._buildRestrictions(window);
+                        ') despite this group being classified follow_the_sun; building this event as always-on -- treat as a bug');
+                    window = this._defaultAlwaysOnWindow(targetTz);
                 }
-                layers.push(layer);
-                maxDelay = Math.max(maxDelay, Math.round(parseInt(rosterRow.time_before_escalation, 10) / 60));
+                events.push(this._buildEvent(rosterRow, rotaRow2, memberRows, window, asOf, emailToId, targetTz));
+                maxDelay = Math.max(maxDelay, this._parseDelayMinutes(rosterRow.time_before_escalation));
             }
 
-            var schedulePayload = {
-                schedule: {
-                    type: 'schedule',
-                    name: this._syncedName(groupName + ' - ' + levelLabel),
-                    description: this.SYNCED_DESCRIPTION,
-                    time_zone: this._canonicalizeTimeZone(entries[0].rotaRow.schedule_time_zone),
-                    schedule_layers: layers
-                }
-            };
-            var scheduleId = this._upsertSchedule(schedulePayload, dryRun, collected);
+            var scheduleName = this._syncedName(groupName + ' - ' + levelLabel);
+            var scheduleId = this._upsertScheduleV3(scheduleName, targetTz, this.SYNCED_DESCRIPTION, events, dryRun, collected);
             rules.push({
                 escalation_delay_in_minutes: maxDelay,
-                targets: [{id: scheduleId, type: 'schedule_reference'}]
+                targets: [{id: scheduleId, type: 'schedule_v3_reference'}]
             });
         }
 
@@ -1170,7 +1625,27 @@ PagerDutySync.prototype = {
 
     // needs_review: one best-effort combined EP for a group that doesn't fit either
     // clean shape. See build_best_effort_escalation_policy() in the Python reference
-    // for the full reasoning (order-value grouping, alternating-sibling detection).
+    // for the original order-value-grouping approach this is built on, and the v2
+    // file (../servicenow/PagerDutySync.js) for the fuller history of the two
+    // refinements below (both found by inspecting real output against a real Wintel
+    // sync, not guessed):
+    //
+    // 1. Rotas with exactly one roster row whose name contains "escalation" are
+    //    pulled out and built as their own, later rule(s) -- not blended into the
+    //    same tier as multi-row "on shift" rotas just because they happen to share
+    //    an order value. Same heuristic as the v2 file, unchanged.
+    // 2. Within a tier, rows are first checked for a clean alternating pattern (see
+    //    _detectAlternatingGroups) and built as one rotating event
+    //    (_buildAlternatingEvent) if so. Remaining rows are then checked for an
+    //    identical-window-and-anchor match (_detectIdenticalGroups) and built as one
+    //    every_member event (_buildEveryMemberEvent) if so -- the v3 native
+    //    representation of "these people page together," and the reason this file
+    //    no longer needs the v2 file's multi-schedule/multi-target-rule
+    //    partitioning (_partitionUnitsByNonOverlap) at all: v3 events don't have
+    //    PagerDuty's v2 layer-priority collision problem in the first place (see
+    //    ASSUMPTION 2 in the file header -- this is the one part of this
+    //    simplification that most needs live verification before trusting it).
+    //    Everything else becomes its own ordinary event in the same schedule.
     _buildBestEffortEscalationPolicy: function(groupName, snow, coverageWindows, asOf, dryRun, collected) {
         var emailToId = this._emailToIdCache || (this._emailToIdCache = this._pdGetAllUsers());
         gs.info('NOTE: "' + groupName + '" classified needs_review -- this escalation policy is a best-effort approximation.');
@@ -1181,68 +1656,33 @@ PagerDutySync.prototype = {
             return null;
         }
 
-        var byOrder = {};
-        var orderKeys = [];
+        var rotaRosterCounts = {};
+        for (var c = 0; c < rosterRows.length; c++) {
+            rotaRosterCounts[rosterRows[c].rota_sys_id] = (rotaRosterCounts[rosterRows[c].rota_sys_id] || 0) + 1;
+        }
+        var primaryRows = [];
+        var escalationOnlyRows = [];
         for (var i = 0; i < rosterRows.length; i++) {
-            var orderNum = this._parseOrder(rosterRows[i].order);
-            if (!byOrder.hasOwnProperty(orderNum)) { byOrder[orderNum] = []; orderKeys.push(orderNum); }
-            byOrder[orderNum].push(rosterRows[i]);
-        }
-        orderKeys.sort(function(a, b) { return a - b; });
-
-        var rules = [];
-        for (var k = 0; k < orderKeys.length; k++) {
-            var orderValue = orderKeys[k];
-            var rowsAtLevel = byOrder[orderValue];
-
-            var allSingleIncumbent = true;
-            for (var r = 0; r < rowsAtLevel.length; r++) {
-                var memberRowsAtLevel = snow.membersByRosterSysId[rowsAtLevel[r].sys_id] || [];
-                if (!this._isSingleIncumbent(memberRowsAtLevel)) allSingleIncumbent = false;
-            }
-
-            this._warnAboutPossibleAlternatingSiblings(groupName, orderValue, rowsAtLevel, coverageWindows);
-
-            var delayMinutes = 1;
-            for (var d = 0; d < rowsAtLevel.length; d++) {
-                delayMinutes = Math.max(delayMinutes, Math.round(parseInt(rowsAtLevel[d].time_before_escalation, 10) / 60));
-            }
-
-            var target;
-            if (allSingleIncumbent) {
-                var userId = this.FALLBACK_USER_ID;
-                for (var s = 0; s < rowsAtLevel.length; s++) {
-                    var memberRows = snow.membersByRosterSysId[rowsAtLevel[s].sys_id] || [];
-                    var candidate = this._pickDirectUser(memberRows, asOf, emailToId);
-                    if (candidate !== this.FALLBACK_USER_ID) { userId = candidate; break; }
-                }
-                target = {id: userId, type: 'user_reference'};
+            var row = rosterRows[i];
+            var isEscalationOnly = rotaRosterCounts[row.rota_sys_id] === 1 && /escalation/i.test(row.name);
+            if (isEscalationOnly) {
+                escalationOnlyRows.push(row);
             } else {
-                var layers = [];
-                for (var l = 0; l < rowsAtLevel.length; l++) {
-                    var row = rowsAtLevel[l];
-                    var rotaRow = snow.rotaBySysId[row.rota_sys_id];
-                    var memberRows2 = snow.membersByRosterSysId[row.sys_id] || [];
-                    var layer = this._buildScheduleLayer(row, rotaRow, memberRows2, asOf, emailToId);
-                    var window = coverageWindows[rotaRow.sys_id];
-                    if (window) layer.restrictions = this._buildRestrictions(window);
-                    layers.push(layer);
-                }
-                var firstRota = snow.rotaBySysId[rowsAtLevel[0].rota_sys_id];
-                var schedulePayload = {
-                    schedule: {
-                        type: 'schedule',
-                        name: this._syncedName(groupName + ' - level ' + orderValue),
-                        description: this.SYNCED_DESCRIPTION,
-                        time_zone: this._canonicalizeTimeZone(firstRota.schedule_time_zone),
-                        schedule_layers: layers
-                    }
-                };
-                var scheduleId = this._upsertSchedule(schedulePayload, dryRun, collected);
-                target = {id: scheduleId, type: 'schedule_reference'};
+                primaryRows.push(row);
             }
-            rules.push({escalation_delay_in_minutes: delayMinutes, targets: [target]});
         }
+        if (escalationOnlyRows.length > 0) {
+            var escalationOnlyNames = [];
+            for (var n = 0; n < escalationOnlyRows.length; n++) escalationOnlyNames.push(escalationOnlyRows[n].name);
+            gs.info('NOTE: ' + groupName + ': treating single-tier roster(s) named like an escalation contact as a ' +
+                'later escalation rule, not the same tier as multi-tier "on shift" rosters: [' +
+                escalationOnlyNames.join(', ') + ']');
+        }
+
+        var rules = this._buildOrderedRulesForRows(groupName, primaryRows, snow, coverageWindows, asOf, emailToId, dryRun, collected);
+        rules = rules.concat(
+            this._buildOrderedRulesForRows(groupName + ' - escalation', escalationOnlyRows, snow, coverageWindows, asOf, emailToId, dryRun, collected)
+        );
 
         var catchAll = this._buildCatchAllRule(snow.rotasForGroup(), emailToId);
         if (catchAll) rules.push(catchAll);
@@ -1259,27 +1699,207 @@ PagerDutySync.prototype = {
         this._upsertEscalationPolicy(epPayload, dryRun, collected);
     },
 
-    _warnAboutPossibleAlternatingSiblings: function(groupName, orderValue, rowsAtLevel, coverageWindows) {
-        var byWindowKey = {};
-        var self = this;
-        var keyFor = function(w) { return w.days.join(',') + '|' + w.startTimeOfDay + '|' + w.durationSeconds; };
-        for (var i = 0; i < rowsAtLevel.length; i++) {
-            var window = coverageWindows[rowsAtLevel[i].rota_sys_id];
-            if (!window) continue;
-            var key = keyFor(window);
-            byWindowKey[key] = byWindowKey[key] || [];
-            byWindowKey[key].push(rowsAtLevel[i]);
+    // Groups rosterRows by order (ascending) and builds one escalation rule per
+    // order value, via _buildRuleForLevel. Returns [] for an empty rosterRows list,
+    // so callers can freely concat the result (e.g. an empty escalation-only split).
+    _buildOrderedRulesForRows: function(scheduleNamePrefix, rosterRows, snow, coverageWindows, asOf, emailToId, dryRun, collected) {
+        if (rosterRows.length === 0) return [];
+
+        var byOrder = {};
+        var orderKeys = [];
+        for (var i = 0; i < rosterRows.length; i++) {
+            var orderNum = this._parseOrder(rosterRows[i].order);
+            if (!byOrder.hasOwnProperty(orderNum)) { byOrder[orderNum] = []; orderKeys.push(orderNum); }
+            byOrder[orderNum].push(rosterRows[i]);
         }
-        for (var k in byWindowKey) {
-            if (!byWindowKey.hasOwnProperty(k)) continue;
-            var rows = byWindowKey[k];
-            if (rows.length < 2) continue;
-            var names = [];
-            for (var n = 0; n < rows.length; n++) names.push(rows[n].name);
-            gs.info('NOTE: ' + groupName + ' order=' + orderValue + ': [' + names.join(', ') + '] share an identical ' +
-                'coverage window -- could be alternating-week crews for the same slot, or independently-configured ' +
-                'rotas that happen to use the same hours. Built here as separate, overlapping restricted layers.');
+        orderKeys.sort(function(a, b) { return a - b; });
+
+        var rules = [];
+        for (var k = 0; k < orderKeys.length; k++) {
+            rules.push(this._buildRuleForLevel(
+                scheduleNamePrefix, orderKeys[k], byOrder[orderKeys[k]], snow, coverageWindows, asOf, emailToId, dryRun, collected
+            ));
         }
+        return rules;
+    },
+
+    // Builds one escalation rule for a single order level: a direct user target if
+    // every row is single-incumbent, otherwise ONE v3 schedule whose rotation holds
+    // one event per row (or per detected alternating/identical group) -- no more
+    // multi-schedule bucketing (see the class comment above
+    // _buildBestEffortEscalationPolicy and ASSUMPTION 2 in the file header).
+    _buildRuleForLevel: function(scheduleNamePrefix, orderValue, rowsAtLevel, snow, coverageWindows, asOf, emailToId, dryRun, collected) {
+        var allSingleIncumbent = true;
+        for (var r = 0; r < rowsAtLevel.length; r++) {
+            var memberRowsAtLevel = snow.membersByRosterSysId[rowsAtLevel[r].sys_id] || [];
+            if (!this._isSingleIncumbent(memberRowsAtLevel)) allSingleIncumbent = false;
+        }
+
+        var delayMinutes = 1;
+        for (var d = 0; d < rowsAtLevel.length; d++) {
+            delayMinutes = Math.max(delayMinutes, this._parseDelayMinutes(rowsAtLevel[d].time_before_escalation));
+        }
+
+        if (allSingleIncumbent) {
+            var userId = this.FALLBACK_USER_ID;
+            for (var s = 0; s < rowsAtLevel.length; s++) {
+                var memberRows = snow.membersByRosterSysId[rowsAtLevel[s].sys_id] || [];
+                var candidate = this._pickDirectUser(memberRows, asOf, emailToId);
+                if (candidate !== this.FALLBACK_USER_ID) { userId = candidate; break; }
+            }
+            return {escalation_delay_in_minutes: delayMinutes, targets: [{id: userId, type: 'user_reference'}]};
+        }
+
+        var firstRota = snow.rotaBySysId[rowsAtLevel[0].rota_sys_id];
+        var targetTz = this._canonicalizeTimeZone(firstRota.schedule_time_zone);
+
+        var alt = this._detectAlternatingGroups(rowsAtLevel, coverageWindows);
+        var events = [];
+        for (var g = 0; g < alt.alternatingGroups.length; g++) {
+            var group = alt.alternatingGroups[g];
+            var sharedWindow = coverageWindows[group[0].rota_sys_id];
+            var groupNames = [];
+            for (var gi = 0; gi < group.length; gi++) groupNames.push(group[gi].name);
+            gs.info('NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': detected an alternating group ' +
+                '(repeat_count=' + sharedWindow.repeatCount + ') -- built as one rotating v3 event: [' +
+                groupNames.join(', ') + ']');
+            events.push(this._buildAlternatingEvent(group, sharedWindow, snow, asOf, emailToId, targetTz));
+        }
+
+        var ident = this._detectIdenticalGroups(alt.remainingRows, coverageWindows);
+        for (var ig = 0; ig < ident.identicalGroups.length; ig++) {
+            var identGroup = ident.identicalGroups[ig];
+            var identWindow = coverageWindows[identGroup[0].rota_sys_id];
+            var identNames = [];
+            for (var ii = 0; ii < identGroup.length; ii++) identNames.push(identGroup[ii].name);
+            gs.info('NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': rows share an identical coverage ' +
+                'window and anchor -- built as one simultaneous (every_member) v3 event: [' + identNames.join(', ') + ']');
+            events.push(this._buildEveryMemberEvent(identGroup, identWindow, snow, asOf, emailToId, targetTz, identNames.join(' + ')));
+        }
+
+        for (var rr = 0; rr < ident.remaining.length; rr++) {
+            var row = ident.remaining[rr];
+            var rotaRow = snow.rotaBySysId[row.rota_sys_id];
+            var memberRows2 = snow.membersByRosterSysId[row.sys_id] || [];
+            var window = coverageWindows[row.rota_sys_id] || this._defaultAlwaysOnWindow(targetTz);
+            events.push(this._buildEvent(row, rotaRow, memberRows2, window, asOf, emailToId, targetTz));
+        }
+
+        var scheduleName = this._syncedName(scheduleNamePrefix + ' - level ' + orderValue);
+        var scheduleId = this._upsertScheduleV3(scheduleName, targetTz, this.SYNCED_DESCRIPTION, events, dryRun, collected);
+
+        return {escalation_delay_in_minutes: delayMinutes, targets: [{id: scheduleId, type: 'schedule_v3_reference'}]};
+    },
+
+    _shapeKey: function(window) {
+        if (!window) return null;
+        return window.days.join(',') + '|' + window.startTimeOfDay + '|' + window.durationSeconds;
+    },
+
+    // Groups same-order-level roster rows by their rota's coverage SHAPE (days +
+    // time-of-day + duration). A shape shared by exactly N rows, all with
+    // repeat_count=N and N distinct phases within that cycle (see
+    // _computeCoverageWindow's cyclePhase/repeatCount), is a clean N-way
+    // alternation -- e.g. Wintel's "On shift 1a"/"On shift 1b" pair, confirmed via
+    // fix_script_q6_q7.txt Q7 (repeat_count=2 on both, anchors one week apart, in
+    // ../servicenow/). Anything less clean (uneven phase coverage, mismatched
+    // repeat_count, more/fewer rows than the cycle length) is left in remainingRows
+    // rather than guessed at.
+    //
+    // Also requires each row's OWN rotation to be a plain weekly handoff
+    // (rotation_interval_type=Weekly, rotation_interval_count=1) among its active
+    // members -- that's what makes it valid to compress a side's own hand-off
+    // rotation into consecutive turns of the shared cycle
+    // (_buildAlternatingEvent/_interleaveAlternatingUsers). A side with a longer
+    // or non-weekly internal cadence would interact with the alternation in a way
+    // that isn't verified to be correct, so it's excluded instead of guessed at.
+    //
+    // Unchanged from the v2 file -- this detection is ServiceNow-side and PagerDuty-
+    // API-agnostic; only what CONSUMES its output differs (_buildAlternatingEvent
+    // here vs. _buildAlternatingLayer in the v2 file).
+    _detectAlternatingGroups: function(rows, coverageWindows) {
+        var byShape = {};
+        var shapeOrder = [];
+        for (var i = 0; i < rows.length; i++) {
+            var window = coverageWindows[rows[i].rota_sys_id];
+            var key = this._shapeKey(window);
+            if (key === null) continue;
+            if (!byShape.hasOwnProperty(key)) { byShape[key] = []; shapeOrder.push(key); }
+            byShape[key].push({row: rows[i], window: window});
+        }
+
+        var alternatingGroups = [];
+        var usedRotaIds = {};
+        for (var k = 0; k < shapeOrder.length; k++) {
+            var entries = byShape[shapeOrder[k]];
+            if (entries.length < 2) continue;
+
+            var repeatCount = entries[0].window.repeatCount || 1;
+            var clean = repeatCount > 1 && entries.length === repeatCount;
+            var phasesSeen = {};
+            for (var e = 0; clean && e < entries.length; e++) {
+                var w = entries[e].window;
+                var row = entries[e].row;
+                if ((w.repeatCount || 1) !== repeatCount || w.cyclePhase === null || !w.anchorUtcIso) { clean = false; break; }
+                if (this._normalizeIntervalType(row.rotation_interval_type) !== 'weekly' || (parseInt(row.rotation_interval_count, 10) || 1) !== 1) { clean = false; break; }
+                var residue = ((w.cyclePhase % repeatCount) + repeatCount) % repeatCount;
+                if (phasesSeen.hasOwnProperty(residue)) { clean = false; break; }
+                phasesSeen[residue] = entries[e];
+            }
+            if (!clean) continue;
+
+            var ordered = [];
+            for (var p = 0; p < repeatCount; p++) ordered.push(phasesSeen[p].row);
+            alternatingGroups.push(ordered);
+            for (var u = 0; u < ordered.length; u++) usedRotaIds[ordered[u].rota_sys_id] = true;
+        }
+
+        var remainingRows = [];
+        for (var r = 0; r < rows.length; r++) {
+            if (!usedRotaIds.hasOwnProperty(rows[r].rota_sys_id)) remainingRows.push(rows[r]);
+        }
+        return {alternatingGroups: alternatingGroups, remainingRows: remainingRows};
+    },
+
+    // Among rows NOT part of a clean alternating group (see _detectAlternatingGroups),
+    // groups any that share the EXACT same coverage window AND anchor instant -- a
+    // stronger condition than just sharing a shape, and the real signal for "these
+    // are genuinely meant to page together" (as opposed to "happen to be on the same
+    // days/time but are unrelated," which shouldn't be merged just because it's
+    // convenient). Two rows with the same shape but a DIFFERENT anchor are left
+    // separate -- under repeat_count=1 a different anchor means nothing about timing
+    // beyond the first occurrence, so merging them would be guessing.
+    //
+    // New in this v3 file -- the v2 file didn't need this distinction, since its
+    // overlap-partitioning treated "same shape" and "same shape + same anchor" as
+    // equally conflicting (both just went through the same bucket-splitting logic).
+    // Here it matters because merging into one every_member_assignment_strategy
+    // event is a stronger claim ("these people are meant to page together") than
+    // just "these two events happen not to collide," so it's reserved for the
+    // stronger signal.
+    _detectIdenticalGroups: function(rows, coverageWindows) {
+        var byKey = {};
+        var order = [];
+        for (var i = 0; i < rows.length; i++) {
+            var window = coverageWindows[rows[i].rota_sys_id];
+            if (!window || !window.anchorUtcIso) continue;
+            var key = this._shapeKey(window) + '|' + window.anchorUtcIso;
+            if (!byKey.hasOwnProperty(key)) { byKey[key] = []; order.push(key); }
+            byKey[key].push(rows[i]);
+        }
+        var identicalGroups = [];
+        var used = {};
+        for (var k = 0; k < order.length; k++) {
+            var group = byKey[order[k]];
+            if (group.length < 2) continue;
+            identicalGroups.push(group);
+            for (var g = 0; g < group.length; g++) used[group[g].rota_sys_id] = true;
+        }
+        var remaining = [];
+        for (var r = 0; r < rows.length; r++) {
+            if (!used.hasOwnProperty(rows[r].rota_sys_id)) remaining.push(rows[r]);
+        }
+        return {identicalGroups: identicalGroups, remaining: remaining};
     },
 
     type: 'PagerDutySync'
