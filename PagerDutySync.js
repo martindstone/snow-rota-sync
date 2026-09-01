@@ -1310,7 +1310,7 @@ PagerDutySync.prototype = {
             scheduleId = existing.id;
             gs.info('updating v3 schedule "' + name + '" -> ' + scheduleId);
         } else {
-            var createResult = rest.postRESTThrowable('v3/schedules', {
+            var createResult = this._v3WriteOrThrow(rest, 'post', 'v3/schedules', {
                 schedule: {name: name, time_zone: tzName, description: description}
             }).data;
             scheduleId = createResult.schedule.id;
@@ -1339,7 +1339,7 @@ PagerDutySync.prototype = {
                     continue;
                 }
             }
-            rest.deleteRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + existingEvent.id);
+            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + existingEvent.id, null);
             deletedCount++;
         }
         if (deletedCount) {
@@ -1351,11 +1351,35 @@ PagerDutySync.prototype = {
         }
 
         for (var k = 0; k < events.length; k++) {
-            rest.postRESTThrowable('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: events[k]});
+            this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: events[k]});
             gs.info('  created event "' + events[k].name + '" on schedule "' + name + '"');
         }
 
         return scheduleId;
+    },
+
+    // PagerDuty_REST's own *RESTThrowable() methods extract error detail via
+    // extractPagerDutyErrorResponse(), which assumes error.errors is always an
+    // ARRAY (matching the v2 API's error shape, {"error":{"errors":["msg"],...}}).
+    // Confirmed live this breaks for v3's error shape, where error.errors is an
+    // OBJECT keyed by field name (e.g. {"error":{"errors":{"effective_until":
+    // ["..."]},...}}) -- errors.length is undefined on a plain object, so that
+    // branch never fires, and the real reason is silently dropped in favor of the
+    // generic "Method failed: (...) with code: N" wrapper message. Can't fix
+    // extractPagerDutyErrorResponse itself (it's part of the officially-installed
+    // app, not this port), so this calls the non-throwing REST method directly and
+    // logs the full raw response body via gs.error before throwing, for every v3
+    // write call -- so a v3 failure's actual reason always ends up in the logs.
+    _v3WriteOrThrow: function(rest, verb, endpoint, body) {
+        var response = rest[verb + 'REST'](endpoint, body);
+        if (response.haveError()) {
+            gs.error('PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed -- status ' +
+                response.getStatusCode() + ', body: ' + response.getBody());
+            throw new Error('v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed (status ' +
+                response.getStatusCode() + '): ' + response.getBody());
+        }
+        var parsed = response.getBody() ? JSON.parse(response.getBody()) : null;
+        return {status: response.getStatusCode(), data: parsed};
     },
 
     // Rotations have no fields of their own besides id/type/events (confirmed
@@ -1370,7 +1394,7 @@ PagerDutySync.prototype = {
             }
             return existingRotations[0].id;
         }
-        var created = rest.postRESTThrowable('v3/schedules/' + scheduleId + '/rotations', {}).data;
+        var created = this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations', {}).data;
         return created.rotation.id;
     },
 
