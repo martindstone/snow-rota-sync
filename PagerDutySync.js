@@ -1849,13 +1849,34 @@ PagerDutySync.prototype = {
         }
 
         if (allSingleIncumbent) {
-            var userId = this.FALLBACK_USER_ID;
+            // Every row at this level names its own person -- e.g. Wintel's
+            // "escalation only" tier is 5 single-incumbent rows, one real named
+            // contact per region (LATAM, Manila, NA, APAC, EMEA). Confirmed live:
+            // picking just the first non-fallback candidate silently dropped 4 of
+            // those 5 regions' contacts from the built policy -- only the target
+            // list's FIRST match ever made it in. Every distinct resolved person
+            // is a target now, matching PagerDuty's native "multiple targets in
+            // one rule = notify all simultaneously" -- no schedule/event needed
+            // for this, since these are static individuals, not a rotation.
+            // Falls back to a single fallback-user target only if literally none
+            // of the rows resolved to a real person.
+            var targets = [];
+            var seenUserIds = {};
             for (var s = 0; s < rowsAtLevel.length; s++) {
                 var memberRows = snow.membersByRosterSysId[rowsAtLevel[s].sys_id] || [];
                 var candidate = this._pickDirectUser(memberRows, asOf, emailToId);
-                if (candidate !== this.FALLBACK_USER_ID) { userId = candidate; break; }
+                if (candidate === this.FALLBACK_USER_ID || seenUserIds.hasOwnProperty(candidate)) continue;
+                seenUserIds[candidate] = true;
+                targets.push({id: candidate, type: 'user_reference'});
             }
-            return {escalation_delay_in_minutes: delayMinutes, targets: [{id: userId, type: 'user_reference'}]};
+            if (targets.length === 0) targets = [{id: this.FALLBACK_USER_ID, type: 'user_reference'}];
+            if (targets.length > 10) {
+                gs.warn('PagerDutySync: ' + scheduleNamePrefix + ' order=' + orderValue + ' has ' + targets.length +
+                    ' distinct single-incumbent people -- PagerDuty escalation rules cap targets at 10; keeping ' +
+                    'the first 10 and dropping the rest (' + (targets.length - 10) + ' person(s) not represented)');
+                targets = targets.slice(0, 10);
+            }
+            return {escalation_delay_in_minutes: delayMinutes, targets: targets};
         }
 
         var firstRota = snow.rotaBySysId[rowsAtLevel[0].rota_sys_id];
