@@ -74,7 +74,19 @@ PagerDutySync.prototype = {
 
         this.NUM_LOOPS = 2;
         this.CATCH_ALL_DELAY_MINUTES = 30;
-        this.HANDLED_CATCH_ALL_TYPES = {'Notify Group Manager': true};
+        // cmn_rota.catch_all is a choice field -- like repeat_type and
+        // rotation_interval_type before it, its real internal values don't match
+        // the capitalized display labels ('Notify Group Manager' etc.) this was
+        // originally written against. Confirmed live via sys_choice: the actual
+        // values are 'group_manager', 'all', 'individual'. Only 'group_manager'
+        // is handled -- with the wrong string, this matched NOTHING in real data,
+        // meaning the catch-all feature silently built no rule for any of the 16
+        // rotas (across several groups, not just Wintel) actually configured with
+        // it. 'all' ("Notify All" -- presumably every member of the assignment
+        // group) and 'individual' ("Notify Individual" -- unclear which
+        // individual without more investigation) are still unhandled; a rota
+        // using either still logs a warning instead of silently doing nothing.
+        this.HANDLED_CATCH_ALL_TYPES = {'group_manager': true};
         this.ROTATION_ORDER_SENTINEL_THRESHOLD = 1000;
         // A sanity ceiling on a single cmn_schedule_span's computed duration, meant
         // to catch a genuine data problem (e.g. start/end misordered across days,
@@ -1156,7 +1168,7 @@ PagerDutySync.prototype = {
         if (unhandled.length > 0) {
             gs.warn('catch_all type(s) [' + unhandled.join(', ') + '] found but not handled; no rule added for these');
         }
-        if (!catchAllTypes.hasOwnProperty('Notify Group Manager')) return null;
+        if (!catchAllTypes.hasOwnProperty('group_manager')) return null;
 
         var managerEmails = {};
         for (var j = 0; j < rotaRows.length; j++) {
@@ -1169,7 +1181,7 @@ PagerDutySync.prototype = {
 
         var userId;
         if (emailList.length === 0) {
-            gs.warn("catch_all is 'Notify Group Manager' but group.manager.email is blank on every rota; using the fallback user");
+            gs.warn("catch_all is 'group_manager' but group.manager.email is blank on every rota; using the fallback user");
             userId = this.FALLBACK_USER_ID;
         } else {
             if (emailList.length > 1) {
