@@ -2,10 +2,10 @@ var PagerDutySync = Class.create();
 PagerDutySync.prototype = {
     initialize: function() {
         // Which groups this port manages is data now, not code -- see isEnrolled()
-        // and _enrolledGroupNames() below, which read the x_pd_integration_pagerduty_sync_group
-        // table (one row per enrolled sys_user_group). Presence = this group's
-        // on-call comes from ServiceNow and gets overwritten in PagerDuty on every
-        // sync; absence = untouched. See README.md for how to create the table.
+        // and _enrolledGroupNames() below, which read the u_pagerduty_sync_group
+        // table (Global scope, one row per enrolled sys_user_group). Presence = this
+        // group's on-call comes from ServiceNow and gets overwritten in PagerDuty on
+        // every sync; absence = untouched. See README.md for how to create the table.
         this.SYNC_GROUP_TABLE = 'u_pagerduty_sync_group';
 
         // Every schedule/escalation policy this port creates or updates gets this
@@ -121,7 +121,7 @@ PagerDutySync.prototype = {
     // PUBLIC ENTRY POINTS
     // ------------------------------------------------------------------------------
 
-    // Sync every enrolled group (see x_pd_integration_pagerduty_sync_group). dryRun defaults to true
+    // Sync every enrolled group (see u_pagerduty_sync_group). dryRun defaults to true
     // for safety when called programmatically (e.g. from a Background Script); UI
     // Actions should pass false explicitly once they've been tested.
     syncAll: function(dryRun) {
@@ -139,7 +139,7 @@ PagerDutySync.prototype = {
         return collected;
     },
 
-    // Sync a single group by its exact name (must be enrolled in x_pd_integration_pagerduty_sync_group).
+    // Sync a single group by its exact name (must be enrolled in u_pagerduty_sync_group).
     syncGroup: function(groupName, dryRun) {
         dryRun = (dryRun === false) ? false : true;
         if (!this.isEnrolled(groupName)) {
@@ -155,7 +155,7 @@ PagerDutySync.prototype = {
         return collected;
     },
 
-    // Returns true if `groupName` is enrolled in x_pd_integration_pagerduty_sync_group. This is the
+    // Returns true if `groupName` is enrolled in u_pagerduty_sync_group. This is the
     // one place that knows what "enrolled" means -- the Business Rule and contextual
     // UI Action condition scripts call this directly instead of each keeping their
     // own copy of the check.
@@ -181,7 +181,7 @@ PagerDutySync.prototype = {
     // whole group that rota belongs to, since our escalation policies are built per
     // GROUP, not per region -- there's no such thing as "just sync one region" for a
     // follow_the_sun group) or a sys_user_group row (syncs it directly if it's
-    // enrolled in x_pd_integration_pagerduty_sync_group). Used by the contextual UI Action and the
+    // enrolled in u_pagerduty_sync_group). Used by the contextual UI Action and the
     // Business Rule so both can share one resolution path regardless of which table
     // they fire from.
     syncForRecord: function(tableName, sysId, dryRun) {
