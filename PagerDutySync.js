@@ -227,6 +227,13 @@ PagerDutySync.prototype = {
         var rotaBySysId = {};
         var rotaGr = new GlideRecord('cmn_rota');
         rotaGr.addQuery('group.name', groupName);
+        // Confirmed live: a rota removed from a group's real on-call config (e.g.
+        // Global SQLDBA ADMIN's LATAM/NA regions, replaced by a combined "Americas")
+        // was deactivated in ServiceNow rather than hard-deleted -- without this
+        // filter it was still loaded here, still treated as "desired," and its
+        // PagerDuty rotation/event kept getting recreated forever even though the
+        // group's real current data no longer includes it.
+        rotaGr.addActiveQuery();
         rotaGr.query();
         while (rotaGr.next()) {
             rotaBySysId[rotaGr.getUniqueValue()] = {
@@ -244,6 +251,7 @@ PagerDutySync.prototype = {
         var rosterByRotaSysId = {};
         var rosterGr = new GlideRecord('cmn_rota_roster');
         rosterGr.addQuery('rota.group.name', groupName);
+        rosterGr.addActiveQuery(); // same reasoning as cmn_rota above; no-ops harmlessly if this table has no active field
         rosterGr.query();
         while (rosterGr.next()) {
             var rotaSysId = rosterGr.rota.toString();
@@ -686,18 +694,59 @@ PagerDutySync.prototype = {
     // 20:00 EDT the PREVIOUS day. The window's specific anchor time doesn't affect
     // 24/7 coverage itself (it's always-on regardless), but it does set where the
     // daily occurrence boundary -- and so the handoff moment -- falls.
-    _defaultAlwaysOnWindow: function(tzName) {
-        var gdt = new GlideDateTime();
-        var datePart = gdt.getValue().split(' ')[0];
-        var midnightLocalIso = this._localizedIso(datePart, '00:00:00', tzName);
+    // Always-on (00:00-23:59 every day) window used when there's no
+    // cmn_schedule_span coverage window to compute from -- single_region groups
+    // (nothing to restrict WHEN coverage applies) and the needs_review/best-effort
+    // fallback paths. window.anchorUtcIso feeds two different things downstream:
+    // the event's start_time/end_time (cosmetic for a FREQ=DAILY rule, since every
+    // day matches regardless of which specific date is used as the reference
+    // occurrence) and, via _rotationPhaseAnchorIso's fallback, effective_since when
+    // the roster's own rotation_start_date/rotation_start_time are blank (confirmed
+    // happens on real data). That second use is NOT cosmetic -- it's what
+    // determines which day of the week the shifts_per_member handoff boundary
+    // falls on.
+    //
+    // Originally anchored to "now" (today's midnight) -- confirmed live this was
+    // wrong: a live sync run on a Tuesday produced Tuesday handoffs in PagerDuty
+    // for CHB MAINFRAME SUPPORT's Primary/Secondary rotation, while that group's
+    // own real ServiceNow on-call calendar showed a steady weekly Friday handoff.
+    // Since "now" is whatever day the sync happens to run, every re-sync would
+    // silently move the handoff day again. Prefers the earliest
+    // cmn_rota_member.from date across this roster's members instead -- real data
+    // about when the rotation's members actually started, stable across re-syncs
+    // -- falling back to FIXED_FALLBACK_ANCHOR_ISO (never "now") only if no member
+    // has a usable from date either.
+    _defaultAlwaysOnWindow: function(tzName, memberRows) {
+        var anchorUtcIso = this._earliestMemberFromAnchorIso(memberRows || [], tzName);
+        if (!anchorUtcIso) {
+            gs.warn('PagerDutySync: no cmn_rota_member.from date available to anchor an always-on rotation\'s ' +
+                'handoff day; using a fixed fallback anchor instead of "now" so it at least stays stable across ' +
+                'syncs -- which day of the week handoffs land on is not derived from real ServiceNow data here');
+            anchorUtcIso = this.FIXED_FALLBACK_ANCHOR_ISO;
+        }
         return {
             days: [1, 2, 3, 4, 5, 6, 7],
             startTimeOfDay: '00:00:00',
             durationSeconds: 86400,
             repeatCount: 1,
             cyclePhase: null,
-            anchorUtcIso: midnightLocalIso
+            anchorUtcIso: anchorUtcIso
         };
+    },
+
+    // Earliest cmn_rota_member.from across all of a roster's members (active or
+    // not -- even a not-yet-started or already-ended member's from is real
+    // ServiceNow data about the rotation's real cadence, a better signal than
+    // "now"), localized the same way rotation_start_date/rotation_start_time are.
+    // Returns null if no member row has a usable from value at all.
+    _earliestMemberFromAnchorIso: function(memberRows, tzName) {
+        var earliest = null;
+        for (var i = 0; i < memberRows.length; i++) {
+            var from = memberRows[i].from;
+            if (!from) continue;
+            if (earliest === null || from < earliest) earliest = from;
+        }
+        return earliest ? this._localizedIso(earliest, '00:00:00', tzName) : null;
     },
 
     // ------------------------------------------------------------------------------
@@ -1217,20 +1266,33 @@ PagerDutySync.prototype = {
     // and is only used for escalation_policies lookups in this file; schedules use
     // _findScheduleV3ByName below instead, since v3's list endpoint has a different
     // response shape (see that function's comment).
+    // Caches the full list per endpoint (this._byNameListCache), fetched once per
+    // PagerDutySync instance and reused for every lookup against that endpoint --
+    // confirmed live this was the dominant cost in a syncAll() run: with no cache,
+    // every single escalation-policy lookup re-fetched and fully paginated the
+    // ENTIRE escalation_policies list from scratch (once per group), the same
+    // page-1 data over and over. _upsertEscalationPolicy keeps a freshly-created
+    // policy in this cache too (see below) so a same-run re-lookup of the same
+    // name (not currently possible given how this file calls it, but cheap
+    // insurance) doesn't wrongly report "not found."
     _findByName: function(endpoint, name) {
-        var rest = new x_pd_integration.PagerDuty_REST();
-        // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
-        // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter silently
-        // fails to match names containing the '[' ']' this port's
-        // SYNCED_NAME_PREFIX always adds, even though the object is genuinely
-        // present. Untested here specifically (this is the classic v2 API, a
-        // different, more established surface than v3's schedules endpoint), but
-        // the same bracketed naming convention applies to every name this port
-        // creates -- including escalation policy names via this function -- so
-        // this pages through everything unfiltered instead and relies entirely on
-        // the exact-match check below, sidestepping the question rather than
-        // risking the same silent-empty-match failure here too.
-        var found = rest.getAllItemsThrowable(endpoint, function(item) { return item; });
+        this._byNameListCache = this._byNameListCache || {};
+        if (!this._byNameListCache.hasOwnProperty(endpoint)) {
+            var rest = new x_pd_integration.PagerDuty_REST();
+            // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
+            // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter
+            // silently fails to match names containing the '[' ']' this port's
+            // SYNCED_NAME_PREFIX always adds, even though the object is genuinely
+            // present. Untested here specifically (this is the classic v2 API, a
+            // different, more established surface than v3's schedules endpoint),
+            // but the same bracketed naming convention applies to every name this
+            // port creates -- including escalation policy names via this function
+            // -- so this pages through everything unfiltered instead and relies
+            // entirely on the exact-match check below, sidestepping the question
+            // rather than risking the same silent-empty-match failure here too.
+            this._byNameListCache[endpoint] = rest.getAllItemsThrowable(endpoint, function(item) { return item; });
+        }
+        var found = this._byNameListCache[endpoint];
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].name === name) matches.push(found[i]);
@@ -1280,8 +1342,17 @@ PagerDutySync.prototype = {
     // as search syntax rather than literal characters, though the exact mechanism
     // doesn't matter: this pages through the FULL list instead and relies on the
     // exact-match check below, sidestepping whatever's wrong with ?query= entirely.
+    // Cached the same way _findByName caches its endpoints (this._scheduleV3ListCache,
+    // fetched once per PagerDutySync instance) -- confirmed live this was the
+    // dominant cost in a syncAll() run: with no cache, every one of the ~20+
+    // schedule lookups in a full run re-fetched and fully paginated the entire
+    // v3/schedules list from scratch. _upsertScheduleV3 keeps a freshly-created
+    // schedule in this cache too (see below).
     _findScheduleV3ByName: function(name) {
-        var found = this._pdListAllV3('v3/schedules', 'schedules');
+        if (!this._scheduleV3ListCache) {
+            this._scheduleV3ListCache = this._pdListAllV3('v3/schedules', 'schedules');
+        }
+        var found = this._scheduleV3ListCache;
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].summary === name) matches.push(found[i]);
@@ -1345,6 +1416,11 @@ PagerDutySync.prototype = {
             }).data;
             scheduleId = createResult.schedule.id;
             gs.info('created v3 schedule "' + name + '" -> ' + scheduleId);
+            // Keep _findScheduleV3ByName's cache in sync -- same reasoning as
+            // _upsertEscalationPolicy's cache update above.
+            if (this._scheduleV3ListCache) {
+                this._scheduleV3ListCache.push({id: scheduleId, type: 'schedule_v3', summary: name});
+            }
         }
 
         // v3 rotations are the analog of v2 schedule LAYERS, not a container that
@@ -1367,8 +1443,14 @@ PagerDutySync.prototype = {
         // contains: this port only ever puts exactly one event in a rotation it
         // manages, so that event's name is a reliable proxy for the rotation's
         // identity across syncs.
+        //
+        // Fetches the schedule by id rather than the separate .../rotations
+        // endpoint -- confirmed against the OpenAPI spec that GET v3/schedules/{id}
+        // already returns the schedule "including rotations and events" in one
+        // call (ScheduleResponse.schedule.rotations), so there's no need for a
+        // second round trip just to list them.
         var existingRotations = existing
-            ? (rest.getRESTThrowable('v3/schedules/' + scheduleId + '/rotations').data.rotations || [])
+            ? (rest.getRESTThrowable('v3/schedules/' + scheduleId).data.schedule.rotations || [])
             : [];
         var rotationByEventName = {};
         for (var r = 0; r < existingRotations.length; r++) {
@@ -1519,6 +1601,13 @@ PagerDutySync.prototype = {
         } else {
             result = rest.postRESTThrowable('escalation_policies', payload).data;
             gs.info('created escalation policy "' + name + '" -> ' + result.escalation_policy.id);
+            // Keep _findByName's cache in sync with what this run has actually
+            // created, so a same-run re-lookup of this exact name (not currently
+            // possible given how this file calls _upsertEscalationPolicy, but
+            // cheap insurance against future callers) sees it as existing.
+            if (this._byNameListCache && this._byNameListCache.hasOwnProperty('escalation_policies')) {
+                this._byNameListCache.escalation_policies.push(result.escalation_policy);
+            }
         }
         return result.escalation_policy.id;
     },
@@ -1542,7 +1631,7 @@ PagerDutySync.prototype = {
         // behavior of never setting .restrictions here.
         var tzName = this._canonicalizeTimeZone(rotaRow.schedule_time_zone);
         var namePrefix = (rotaRow.name.indexOf(rotaRow.group) === 0) ? rotaRow.name : (rotaRow.group + ' - ' + rotaRow.name);
-        var event = this._buildEvent(rosterRow, rotaRow, memberRows, this._defaultAlwaysOnWindow(tzName), asOf, emailToId, tzName);
+        var event = this._buildEvent(rosterRow, rotaRow, memberRows, this._defaultAlwaysOnWindow(tzName, memberRows), asOf, emailToId, tzName);
         var scheduleName = this._syncedName(namePrefix + ' - ' + rosterRow.name);
         var scheduleId = this._upsertScheduleV3(scheduleName, tzName, this.SYNCED_DESCRIPTION, [event], dryRun, collected);
         return {escalation_delay_in_minutes: delayMinutes, targets: [{id: scheduleId, type: 'schedule_v3_reference'}]};
@@ -1632,7 +1721,7 @@ PagerDutySync.prototype = {
                 if (!window) {
                     gs.warn('no coverage window for "' + rotaRow2.name + '" (' + groupName + ' / ' + levelLabel +
                         ') despite this group being classified follow_the_sun; building this event as always-on -- treat as a bug');
-                    window = this._defaultAlwaysOnWindow(targetTz);
+                    window = this._defaultAlwaysOnWindow(targetTz, memberRows);
                 }
                 events.push(this._buildEvent(rosterRow, rotaRow2, memberRows, window, asOf, emailToId, targetTz));
                 maxDelay = Math.max(maxDelay, this._parseDelayMinutes(rosterRow.time_before_escalation));
@@ -1922,7 +2011,7 @@ PagerDutySync.prototype = {
             var row = ident.remaining[rr];
             var rotaRow = snow.rotaBySysId[row.rota_sys_id];
             var memberRows2 = snow.membersByRosterSysId[row.sys_id] || [];
-            var window = coverageWindows[row.rota_sys_id] || this._defaultAlwaysOnWindow(targetTz);
+            var window = coverageWindows[row.rota_sys_id] || this._defaultAlwaysOnWindow(targetTz, memberRows2);
             events.push(this._buildEvent(row, rotaRow, memberRows2, window, asOf, emailToId, targetTz));
         }
 
