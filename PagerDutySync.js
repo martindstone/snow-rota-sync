@@ -1266,33 +1266,25 @@ PagerDutySync.prototype = {
     // and is only used for escalation_policies lookups in this file; schedules use
     // _findScheduleV3ByName below instead, since v3's list endpoint has a different
     // response shape (see that function's comment).
-    // Caches the full list per endpoint (this._byNameListCache), fetched once per
-    // PagerDutySync instance and reused for every lookup against that endpoint --
-    // confirmed live this was the dominant cost in a syncAll() run: with no cache,
-    // every single escalation-policy lookup re-fetched and fully paginated the
-    // ENTIRE escalation_policies list from scratch (once per group), the same
-    // page-1 data over and over. _upsertEscalationPolicy keeps a freshly-created
-    // policy in this cache too (see below) so a same-run re-lookup of the same
-    // name (not currently possible given how this file calls it, but cheap
-    // insurance) doesn't wrongly report "not found."
     _findByName: function(endpoint, name) {
-        this._byNameListCache = this._byNameListCache || {};
-        if (!this._byNameListCache.hasOwnProperty(endpoint)) {
-            var rest = new x_pd_integration.PagerDuty_REST();
-            // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
-            // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter
-            // silently fails to match names containing the '[' ']' this port's
-            // SYNCED_NAME_PREFIX always adds, even though the object is genuinely
-            // present. Untested here specifically (this is the classic v2 API, a
-            // different, more established surface than v3's schedules endpoint),
-            // but the same bracketed naming convention applies to every name this
-            // port creates -- including escalation policy names via this function
-            // -- so this pages through everything unfiltered instead and relies
-            // entirely on the exact-match check below, sidestepping the question
-            // rather than risking the same silent-empty-match failure here too.
-            this._byNameListCache[endpoint] = rest.getAllItemsThrowable(endpoint, function(item) { return item; });
-        }
-        var found = this._byNameListCache[endpoint];
+        var rest = new x_pd_integration.PagerDuty_REST();
+        // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
+        // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter silently
+        // fails to match names containing the '[' ']' this port's
+        // SYNCED_NAME_PREFIX always adds, even though the object is genuinely
+        // present. Untested here specifically (this is the classic v2 API, a
+        // different, more established surface than v3's schedules endpoint), but
+        // the same bracketed naming convention applies to every name this port
+        // creates -- including escalation policy names via this function -- so
+        // this pages through everything unfiltered instead and relies entirely on
+        // the exact-match check below, sidestepping the question rather than
+        // risking the same silent-empty-match failure here too.
+        //
+        // NOTE: previously cached this endpoint's full list across the whole
+        // PagerDutySync instance to avoid re-paginating on every lookup -- pulled
+        // live 2026-09-22 after it caused a live run to hang. Back to a fresh
+        // fetch per call until the caching approach is revisited.
+        var found = rest.getAllItemsThrowable(endpoint, function(item) { return item; });
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].name === name) matches.push(found[i]);
@@ -1342,17 +1334,12 @@ PagerDutySync.prototype = {
     // as search syntax rather than literal characters, though the exact mechanism
     // doesn't matter: this pages through the FULL list instead and relies on the
     // exact-match check below, sidestepping whatever's wrong with ?query= entirely.
-    // Cached the same way _findByName caches its endpoints (this._scheduleV3ListCache,
-    // fetched once per PagerDutySync instance) -- confirmed live this was the
-    // dominant cost in a syncAll() run: with no cache, every one of the ~20+
-    // schedule lookups in a full run re-fetched and fully paginated the entire
-    // v3/schedules list from scratch. _upsertScheduleV3 keeps a freshly-created
-    // schedule in this cache too (see below).
+    // NOTE: previously cached this list across the whole PagerDutySync instance
+    // to avoid re-paginating v3/schedules on every lookup -- pulled live
+    // 2026-09-22 after it caused a live run to hang. Back to a fresh fetch per
+    // call until the caching approach is revisited.
     _findScheduleV3ByName: function(name) {
-        if (!this._scheduleV3ListCache) {
-            this._scheduleV3ListCache = this._pdListAllV3('v3/schedules', 'schedules');
-        }
-        var found = this._scheduleV3ListCache;
+        var found = this._pdListAllV3('v3/schedules', 'schedules');
         var matches = [];
         for (var i = 0; i < found.length; i++) {
             if (found[i].summary === name) matches.push(found[i]);
@@ -1416,11 +1403,6 @@ PagerDutySync.prototype = {
             }).data;
             scheduleId = createResult.schedule.id;
             gs.info('created v3 schedule "' + name + '" -> ' + scheduleId);
-            // Keep _findScheduleV3ByName's cache in sync -- same reasoning as
-            // _upsertEscalationPolicy's cache update above.
-            if (this._scheduleV3ListCache) {
-                this._scheduleV3ListCache.push({id: scheduleId, type: 'schedule_v3', summary: name});
-            }
         }
 
         // v3 rotations are the analog of v2 schedule LAYERS, not a container that
@@ -1601,13 +1583,6 @@ PagerDutySync.prototype = {
         } else {
             result = rest.postRESTThrowable('escalation_policies', payload).data;
             gs.info('created escalation policy "' + name + '" -> ' + result.escalation_policy.id);
-            // Keep _findByName's cache in sync with what this run has actually
-            // created, so a same-run re-lookup of this exact name (not currently
-            // possible given how this file calls _upsertEscalationPolicy, but
-            // cheap insurance against future callers) sees it as existing.
-            if (this._byNameListCache && this._byNameListCache.hasOwnProperty('escalation_policies')) {
-                this._byNameListCache.escalation_policies.push(result.escalation_policy);
-            }
         }
         return result.escalation_policy.id;
     },
