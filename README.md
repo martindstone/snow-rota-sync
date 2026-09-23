@@ -16,7 +16,6 @@ on an instance that already has that app installed and configured.
 | `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
 | `business_rule_sync_on_change.js` | Business Rule | System Definition > Business Rules, on `cmn_rota`. **Ships inactive.** |
-| `fix_script_verify_assumptions.txt`, `fix_script_q6_q7.txt` | Background Script | Read-only diagnostics used during development, not part of the sync path. Safe to ignore/delete. |
 
 None of these files are meant to be uploaded/imported directly (there's no Update Set
 here) -- copy each script body into the corresponding record type, using the settings
@@ -106,6 +105,75 @@ can't collide if a group is ever under both. Defined once as
    create vs. update, and the rotations/events/escalation rules inside them.
 4. Once a dry run looks right for every group you've enrolled (`sync.syncAll(true)`),
    test the UI Actions end-to-end.
+
+## Coverage window repeat types
+
+`cmn_schedule_span.repeat_type` is a choice field with 10 real values; only some are
+readable by `_computeCoverageWindow`'s `days_of_week`/weekly-BYDAY translation, since
+that translation only has a representation for a plain "N specific days of the week,
+one time-of-day window" shape.
+
+| value | label | supported? |
+|---|---|---|
+| `daily` | Daily | yes |
+| `weekly` | Weekly | yes |
+| `weekdays` | Every Weekday (Mon-Fri) | yes |
+| `weekends` | Every Weekend (Sat, Sun) | yes |
+| `weekMWF` | Every Mon, Wed, Fri | yes |
+| `weekTT` | Every Tue, Thu | yes |
+| `NULL_OVERRIDE` | Does not repeat | no |
+| `monthly` | Monthly | no |
+| `yearly` | Yearly | no |
+| `specific` | Specific | no |
+
+The "yes" rows are all the same day-of-week-bitmask shape (`_decodeDaysOfWeek` on
+`days_of_week`, regardless of which of these six values got the row there -- the
+label just reflects which UI preset was clicked, not a different underlying
+representation), so they're accepted together in `_computeCoverageWindow`'s
+`repeat_type IN (...)` query. **A span whose `repeat_type` isn't in that query is
+silently invisible** -- not skipped-with-a-warning, just never read at all -- and
+every caller then treats the rota as having no coverage window and substitutes
+`_defaultAlwaysOnWindow`'s 24/7-every-day default. Confirmed live: this is exactly
+what happened to Hardware (US) (`weekdays`) and, via a second bug
+(`MAX_RESTRICTED_WINDOW_HOURS`, see below), Hardware (Weekend) (`weekly` but a
+~48.5h span) before both were fixed -- an 8.5h/day window and a weekly Friday
+handoff both silently became "on call 24/7, rotating daily," with nothing in the
+sync log calling it out.
+
+The "no" rows are a genuinely different shape (month-of-year, day-of-month, or an
+explicit date list, not a day-of-week set) that `_decodeDaysOfWeek` and the
+weekly-BYDAY RRULE builder (`_rruleForWindow`) have no representation for --
+supporting them isn't a one-line query change like the six "yes" values were,
+it needs real design work on how a monthly/yearly/one-off pattern maps to a v3
+rotation's `recurrence` RRULE. As of this writing, no real on-call rota's schedule
+in this instance actually uses `monthly`/`yearly`/`specific`/`NULL_OVERRIDE` --
+those three values *do* have real rows in `cmn_schedule_span` elsewhere (20
+`yearly`, 1 `monthly`), but only on schedules unrelated to any `cmn_rota` (SLA/
+maintenance-window schedules, not on-call), which this sync never reads regardless.
+
+Also worth knowing: `MAX_RESTRICTED_WINDOW_HOURS` (currently 72) caps how long a
+single span's computed duration can be before `_computeCoverageWindow` discards it
+as probable bad data (misordered start/end producing a nonsensical multi-day
+span). A genuinely longer intentional window -- a long-weekend block spanning more
+than 3 days, say -- would hit this same silent-discard-to-24/7 failure mode again.
+
+## Custom escalation
+
+`cmn_rota.use_custom_escalation` is read and honored (skip that rota's `catch_all`
+entirely when computing `_buildCatchAllRule`), but there is no additional data
+behind it to sync. Confirmed via the `cmn_rota` form's UI Policies rather than
+guessed: the "Custom Escalation Hide Fields" policy (`use_custom_escalation=true`)
+only hides the `catch_all` field -- it's presented as an *alternative* to
+`catch_all`, not an additional structured ruleset. The likely-sounding
+`cmn_rota_escalation` table is a red herring: it's part of ServiceNow's generic
+event-notification framework (fields like `event_name`/`script_name`/`trigger`),
+unrelated to on-call rotas, not referenced by `cmn_rota` anywhere, and empty in
+this instance. So when a rota has `use_custom_escalation=true`, its real escalation
+logic -- whatever it is -- lives entirely outside ServiceNow (a manual process, an
+external system, tribal knowledge) and this sync has no data to read for it; the
+best it can do, and now does, is not apply a stale/irrelevant `catch_all` value
+that ServiceNow's own form no longer surfaces as active configuration once that
+checkbox is on.
 
 ## Known limitations
 

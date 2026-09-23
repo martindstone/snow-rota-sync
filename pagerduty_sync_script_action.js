@@ -30,8 +30,15 @@
 // going through the event at all.
 
 (function() {
-    var groupScope = event.parm1;
-    var mode = event.parm2;
+    // event.parm1/parm2 are GlideElement objects, not plain JS strings -- confirmed
+    // live: posting parm2='live' via the event queue still produced a dry run,
+    // because `mode !== 'live'` (strict inequality) never coerces a GlideElement to
+    // a string for comparison, so a GlideElement is never === a string literal no
+    // matter its content. That made `dryRun = (mode !== 'live')` unconditionally
+    // true -- the event-driven path could never actually go live. String(...) forces
+    // the coercion before comparing. Same trap applies to groupScope === 'all' below.
+    var groupScope = String(event.parm1 || '');
+    var mode = String(event.parm2 || '');
     var dryRun = (mode !== 'live');
 
     var sync = new PagerDutySync();

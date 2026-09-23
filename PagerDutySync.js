@@ -98,7 +98,19 @@ PagerDutySync.prototype = {
         // and _computeCoverageWindow returning null for an entirely valid rota.
         // 24 lets a real all-day span through while still rejecting anything
         // that's actually too long to be a single day's window.
-        this.MAX_RESTRICTED_WINDOW_HOURS = 24;
+        //
+        // Raised to 72 -- 24 was too strict in the other direction: confirmed live
+        // that Hardware (Weekend)'s span is a legitimate ~48.5h block (Fri
+        // afternoon through Sun afternoon Pacific, repeat_type='weekly',
+        // days_of_week naming a single weekday), not bad data. At 24h that got
+        // filtered out the same way the 20h ceiling used to filter out real
+        // all-day spans -- includeWindows ended up empty, _computeCoverageWindow
+        // returned null, and the caller substituted _defaultAlwaysOnWindow's 24/7-
+        // every-day default, turning a weekly ~2-day weekend block into a daily
+        // rotation through every member. 72h covers a Fri-Sun style block with
+        // headroom; a span longer than that is still almost certainly misordered
+        // start/end data rather than an intentional shift.
+        this.MAX_RESTRICTED_WINDOW_HOURS = 72;
 
         // Monday=1 .. Sunday=7, matching _decodeDaysOfWeek's convention -- confirmed
         // against real data (Wintel's "Su-We-Th-Fr" rota has days_of_week digits
@@ -243,6 +255,7 @@ PagerDutySync.prototype = {
                 schedule_sys_id: rotaGr.schedule.toString(),
                 schedule_time_zone: rotaGr.schedule.time_zone ? rotaGr.schedule.time_zone.toString() : '',
                 catch_all: rotaGr.getValue('catch_all') || '',
+                use_custom_escalation: rotaGr.getValue('use_custom_escalation') === 'true',
                 group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : ''
             };
         }
@@ -436,7 +449,33 @@ PagerDutySync.prototype = {
     _computeCoverageWindow: function(scheduleSysId, rotaLabel) {
         var spanGr = new GlideRecord('cmn_schedule_span');
         spanGr.addQuery('schedule', scheduleSysId);
-        spanGr.addQuery('repeat_type', 'IN', 'weekly,daily');
+        // 'weekdays' is a distinct real repeat_type value from 'daily' (confirmed
+        // live: Hardware (US)'s span is repeat_type='weekdays' with days_of_week=
+        // '1234567', not 'daily') -- it still carries its real day set in
+        // days_of_week same as 'weekly' does, so omitting it here doesn't just
+        // mis-decode the days, it drops the row from this query entirely. That
+        // silently emptied includeWindows for the whole rota, which
+        // _loadCoverageWindows' callers then treated as "no coverage window" and
+        // replaced with _defaultAlwaysOnWindow's 24/7-every-day default -- turning
+        // an 8.5h/day window into round-the-clock coverage.
+        //
+        // 'weekends'/'weekMWF'/'weekTT' are the same shape as 'weekdays' -- real,
+        // independently selectable cmn_schedule_span.repeat_type choice-list values
+        // ("Every Weekend (Sat, Sun)" / "Every Mon, Wed, Fri" / "Every Tue, Thu"),
+        // still carrying their real day set in days_of_week, so they hit the exact
+        // same silent-drop failure 'weekdays' did until it's included here too. Not
+        // observed on any real on-call rota's schedule in this instance yet (only
+        // 'daily'/'weekly'/'weekdays' are, as of this writing) -- added proactively
+        // since 'weekends' in particular is the literal preset ServiceNow's own UI
+        // offers for a rota named like Hardware's "Weekend" one, and hitting it once
+        // already (silently) is enough reason not to wait for a second occurrence.
+        // 'monthly'/'yearly'/'specific' are NOT included -- those aren't a day-of-
+        // week shape at all (month/day-of-month or explicit dates), so days_of_week
+        // decoding and the weekly-BYDAY RRULE builder below have no representation
+        // for them; adding them to this query alone would just let them fall through
+        // to _mergeSpanWindows/_rruleForWindow and misbehave differently, not fix
+        // anything. See README's "Coverage window repeat types" section.
+        spanGr.addQuery('repeat_type', 'IN', 'weekly,daily,weekdays,weekends,weekMWF,weekTT');
         spanGr.query();
 
         var includeWindows = [];
@@ -1201,8 +1240,25 @@ PagerDutySync.prototype = {
     // ------------------------------------------------------------------------------
 
     _buildCatchAllRule: function(rotaRows, emailToId) {
+        // cmn_rota.use_custom_escalation=true hides the catch_all field on the
+        // ServiceNow form entirely (confirmed via the "Custom Escalation Hide
+        // Fields" sys_ui_policy on cmn_rota: condition use_custom_escalation=true,
+        // action catch_all visible=false) -- it's presented as an alternative to
+        // catch_all, not an addition to it. A UI Policy only controls visibility,
+        // not the underlying data, so a rota flipped to custom escalation after
+        // already having a catch_all value would still have that stale value
+        // sitting in the field -- reading it here would apply escalation logic
+        // ServiceNow's own form no longer treats as active. There is nothing else
+        // to read in its place: ServiceNow doesn't model "custom escalation" as
+        // structured data anywhere (the likely-sounding cmn_rota_escalation table
+        // is unrelated -- part of the generic event-notification framework, empty
+        // in this instance, not referenced by cmn_rota at all) -- so a rota with
+        // use_custom_escalation=true contributes no catch-all rule, and whatever
+        // its real custom escalation is lives entirely outside ServiceNow, outside
+        // this sync's reach. See README's "Custom escalation" section.
         var catchAllTypes = {};
         for (var i = 0; i < rotaRows.length; i++) {
+            if (rotaRows[i].use_custom_escalation) continue;
             var v = (rotaRows[i].catch_all || '').replace(/^\s+|\s+$/g, '');
             if (v) catchAllTypes[v] = true;
         }
