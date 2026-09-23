@@ -177,9 +177,17 @@ checkbox is on.
 
 ## Known limitations
 
-- **`cmn_rota.catch_all`**: only the `group_manager` value is implemented. `all`
-  ("Notify All") and `individual` ("Notify Individual") are detected and logged but
-  not yet built into a rule.
+- **`cmn_rota.catch_all`**: `group_manager` and `individual` are implemented.
+  `all` ("Notify All") is detected and logged but not yet built into a rule -- it
+  needs `catch_all_roster`'s members resolved and turned into an
+  `every_member_assignment_strategy`-style "page together" target (confirmed via
+  the form's own UI Policy that `all` means everyone in one specific,
+  explicitly-chosen roster, not the group's whole membership), which is more
+  work than the single-field lookup `individual` needed. If a group's rotas
+  disagree on `catch_all` type across regions, `group_manager` wins over
+  `individual` (matching this function's pre-existing single-winner behavior);
+  `catch_all_wait_time` (falls back to a 30-minute default when blank) sets the
+  delay for whichever rule gets built.
 - **`GlideScheduleDateTime` is undocumented** (absent from ServiceNow's official
   scoped `GlideDateTime` API reference) but is what `_localizedIso`/
   `_tzOffsetSecondsFromUtc` rely on for DST-aware local-to-UTC conversion, since

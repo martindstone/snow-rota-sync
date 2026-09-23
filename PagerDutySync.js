@@ -82,11 +82,25 @@ PagerDutySync.prototype = {
         // is handled -- with the wrong string, this matched NOTHING in real data,
         // meaning the catch-all feature silently built no rule for any of the 16
         // rotas (across several groups, not just Wintel) actually configured with
-        // it. 'all' ("Notify All" -- presumably every member of the assignment
-        // group) and 'individual' ("Notify Individual" -- unclear which
-        // individual without more investigation) are still unhandled; a rota
-        // using either still logs a warning instead of silently doing nothing.
-        this.HANDLED_CATCH_ALL_TYPES = {'group_manager': true};
+        // it.
+        //
+        // 'individual' now handled too -- confirmed via cmn_rota's own "Catch-All
+        // is Individual" UI Policy (condition catch_all=individual, action makes
+        // catch_all_member visible AND mandatory) that it's a direct reference to
+        // one named sys_user, not a roster or group lookup. Resolved through the
+        // same email->PD-user path as every other user reference in this file.
+        //
+        // 'all' ("Notify All") is still unhandled -- a rota using it still logs a
+        // warning instead of silently doing nothing. Its own UI Policy proves the
+        // earlier guess in this comment ("presumably every member of the
+        // assignment group") was wrong: it makes catch_all_roster visible and
+        // mandatory, i.e. "all" means every member of one specific, explicitly
+        // chosen roster, not the group's whole membership. Building it needs that
+        // roster's members resolved and turned into an every_member_assignment_
+        // strategy-style "page together" target (see Architecture notes in the
+        // README), not a simple group-wide broadcast -- bigger than the one-field
+        // lookup 'individual' needed, scoped separately.
+        this.HANDLED_CATCH_ALL_TYPES = {'group_manager': true, 'individual': true};
         this.ROTATION_ORDER_SENTINEL_THRESHOLD = 1000;
         // A sanity ceiling on a single cmn_schedule_span's computed duration, meant
         // to catch a genuine data problem (e.g. start/end misordered across days,
@@ -255,6 +269,8 @@ PagerDutySync.prototype = {
                 schedule_sys_id: rotaGr.schedule.toString(),
                 schedule_time_zone: rotaGr.schedule.time_zone ? rotaGr.schedule.time_zone.toString() : '',
                 catch_all: rotaGr.getValue('catch_all') || '',
+                catch_all_wait_time: rotaGr.getValue('catch_all_wait_time') || '',
+                catch_all_member_email: rotaGr.catch_all_member.email ? rotaGr.catch_all_member.email.toString() : '',
                 use_custom_escalation: rotaGr.getValue('use_custom_escalation') === 'true',
                 group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : ''
             };
@@ -1257,10 +1273,14 @@ PagerDutySync.prototype = {
         // its real custom escalation is lives entirely outside ServiceNow, outside
         // this sync's reach. See README's "Custom escalation" section.
         var catchAllTypes = {};
+        var rowsByType = {};
         for (var i = 0; i < rotaRows.length; i++) {
             if (rotaRows[i].use_custom_escalation) continue;
             var v = (rotaRows[i].catch_all || '').replace(/^\s+|\s+$/g, '');
-            if (v) catchAllTypes[v] = true;
+            if (!v) continue;
+            catchAllTypes[v] = true;
+            if (!rowsByType.hasOwnProperty(v)) rowsByType[v] = [];
+            rowsByType[v].push(rotaRows[i]);
         }
         var anyType = false;
         for (var t in catchAllTypes) { if (catchAllTypes.hasOwnProperty(t)) anyType = true; }
@@ -1273,32 +1293,81 @@ PagerDutySync.prototype = {
         if (unhandled.length > 0) {
             gs.warn('catch_all type(s) [' + unhandled.join(', ') + '] found but not handled; no rule added for these');
         }
-        if (!catchAllTypes.hasOwnProperty('group_manager')) return null;
 
-        var managerEmails = {};
-        for (var j = 0; j < rotaRows.length; j++) {
-            var em = (rotaRows[j].group_manager_email || '').replace(/^\s+|\s+$/g, '');
-            if (em) managerEmails[em] = true;
-        }
-        var emailList = [];
-        for (var e in managerEmails) { if (managerEmails.hasOwnProperty(e)) emailList.push(e); }
-        emailList.sort();
-
-        var userId;
-        if (emailList.length === 0) {
-            gs.warn("catch_all is 'group_manager' but group.manager.email is blank on every rota; using the fallback user");
-            userId = this.FALLBACK_USER_ID;
-        } else {
-            if (emailList.length > 1) {
-                gs.warn('this group\'s rotas disagree on group.manager.email [' + emailList.join(', ') + ']; using the first');
+        // group_manager takes priority over individual if a group's rotas somehow
+        // disagree (different regions configured differently) -- matches this
+        // function's pre-existing behavior of picking one winner rather than
+        // building multiple catch-all rules, just extended to a second type
+        // instead of silently dropping it.
+        var userId, sourceRows;
+        if (catchAllTypes.hasOwnProperty('group_manager')) {
+            sourceRows = rowsByType.group_manager;
+            var managerEmails = {};
+            for (var j = 0; j < sourceRows.length; j++) {
+                var em = (sourceRows[j].group_manager_email || '').replace(/^\s+|\s+$/g, '');
+                if (em) managerEmails[em] = true;
             }
-            userId = this._resolveUser(emailList[0], emailToId).id;
+            var emailList = [];
+            for (var e in managerEmails) { if (managerEmails.hasOwnProperty(e)) emailList.push(e); }
+            emailList.sort();
+
+            if (emailList.length === 0) {
+                gs.warn("catch_all is 'group_manager' but group.manager.email is blank on every rota; using the fallback user");
+                userId = this.FALLBACK_USER_ID;
+            } else {
+                if (emailList.length > 1) {
+                    gs.warn('this group\'s rotas disagree on group.manager.email [' + emailList.join(', ') + ']; using the first');
+                }
+                userId = this._resolveUser(emailList[0], emailToId).id;
+            }
+        } else if (catchAllTypes.hasOwnProperty('individual')) {
+            sourceRows = rowsByType.individual;
+            var memberEmails = {};
+            for (var k = 0; k < sourceRows.length; k++) {
+                var mem = (sourceRows[k].catch_all_member_email || '').replace(/^\s+|\s+$/g, '');
+                if (mem) memberEmails[mem] = true;
+            }
+            var memberEmailList = [];
+            for (var me in memberEmails) { if (memberEmails.hasOwnProperty(me)) memberEmailList.push(me); }
+            memberEmailList.sort();
+
+            if (memberEmailList.length === 0) {
+                gs.warn("catch_all is 'individual' but catch_all_member.email is blank on every rota; using the fallback user");
+                userId = this.FALLBACK_USER_ID;
+            } else {
+                if (memberEmailList.length > 1) {
+                    gs.warn('this group\'s rotas disagree on catch_all_member.email [' + memberEmailList.join(', ') + ']; using the first');
+                }
+                userId = this._resolveUser(memberEmailList[0], emailToId).id;
+            }
+        } else {
+            return null; // only 'all' (or something newer/unrecognized) present -- logged above, not built
         }
 
         return {
-            escalation_delay_in_minutes: this.CATCH_ALL_DELAY_MINUTES,
+            escalation_delay_in_minutes: this._catchAllDelayMinutes(sourceRows),
             targets: [{id: userId, type: 'user_reference'}]
         };
+    },
+
+    // catch_all_wait_time is the same glide_duration shape as cmn_rota_roster.
+    // time_before_escalation (see _parseDelayMinutes's comment for the format
+    // quirk) -- reused here rather than the hardcoded CATCH_ALL_DELAY_MINUTES,
+    // which was silently ignoring this field even though ServiceNow's own form
+    // always shows it as the configurable delay for the catch-all rule. Falls
+    // back to CATCH_ALL_DELAY_MINUTES only when every contributing rota's
+    // catch_all_wait_time is blank, and takes the max across rotas when they
+    // disagree -- same "don't escalate away from someone too early" reasoning
+    // _buildRuleForLevel already applies to time_before_escalation.
+    _catchAllDelayMinutes: function(rotaRows) {
+        var minutes = null;
+        for (var i = 0; i < rotaRows.length; i++) {
+            var raw = rotaRows[i].catch_all_wait_time;
+            if (!raw) continue;
+            var parsed = this._parseDelayMinutes(raw);
+            minutes = (minutes === null) ? parsed : Math.max(minutes, parsed);
+        }
+        return (minutes === null) ? this.CATCH_ALL_DELAY_MINUTES : minutes;
     },
 
     // ------------------------------------------------------------------------------
