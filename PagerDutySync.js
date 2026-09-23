@@ -235,7 +235,7 @@ PagerDutySync.prototype = {
 
     _syncOneGroup: function(groupName, asOf, dryRun, collected) {
         var snow = this._loadSnowData(groupName);
-        var coverageWindows = this._loadCoverageWindows(snow);
+        var coverageWindows = this._loadCoverageWindows(snow, asOf);
         var classification = this._classifyGroup(groupName, snow, coverageWindows);
         gs.info('classified "' + groupName + '" as ' + classification.shape +
             (classification.reason ? (' (' + classification.reason + ')') : ''));
@@ -436,13 +436,13 @@ PagerDutySync.prototype = {
     // ------------------------------------------------------------------------------
 
     // Returns {rota_sys_id: {days: [1-7,...], startTimeOfDay: 'HH:MM:SS', durationSeconds: N}}
-    _loadCoverageWindows: function(snow) {
+    _loadCoverageWindows: function(snow, asOf) {
         var ownWindow = {};
         var rotas = snow.rotasForGroup();
         for (var i = 0; i < rotas.length; i++) {
             var rota = rotas[i];
             if (!rota.schedule_sys_id) continue;
-            var window = this._computeCoverageWindow(rota.schedule_sys_id, rota.name);
+            var window = this._computeCoverageWindow(rota.schedule_sys_id, rota.name, asOf);
             if (window) ownWindow[rota.sys_id] = window;
         }
         return ownWindow;
@@ -462,7 +462,7 @@ PagerDutySync.prototype = {
     // i.e. every coverage window in this whole file would have silently computed as
     // "none," and every group would have misclassified as needs_review. See
     // _parseScheduleDateTime(), used below to normalize before either API touches it.
-    _computeCoverageWindow: function(scheduleSysId, rotaLabel) {
+    _computeCoverageWindow: function(scheduleSysId, rotaLabel, asOf) {
         var spanGr = new GlideRecord('cmn_schedule_span');
         spanGr.addQuery('schedule', scheduleSysId);
         // 'weekdays' is a distinct real repeat_type value from 'daily' (confirmed
@@ -499,6 +499,27 @@ PagerDutySync.prototype = {
         var repeatCountsSeen = {};
         var earliestAnchor = null;
         while (spanGr.next()) {
+            // repeat_until is a real cmn_schedule_span field (compact YYYYMMDD,
+            // '00000000' sentinel for "no end date" -- same convention
+            // _isBlankRosterValue/_normalizeRosterDate already handle for
+            // rotation_start_date) that was never read here at all before this --
+            // confirmed live: a rotation ended by setting repeat_until in the past
+            // (rather than deactivating the rota/roster, which stays active=true)
+            // kept being read as an ongoing, currently-valid recurring pattern
+            // forever. Same day-boundary convention as _activeMemberRows' `to`
+            // check below (expires at the START of that day, not through the end
+            // of it) for consistency within this file.
+            var repeatUntilRaw = spanGr.getValue('repeat_until');
+            if (!this._isBlankRosterValue(repeatUntilRaw)) {
+                var repeatUntilGdt = new GlideDateTime(this._normalizeRosterDate(repeatUntilRaw) + ' 00:00:00');
+                if (repeatUntilGdt.compareTo(asOf) < 0) {
+                    gs.info('"' + rotaLabel + '": span ' + spanGr.getUniqueValue() + '\'s repeat_until (' +
+                        this._normalizeRosterDate(repeatUntilRaw) + ') is in the past; excluding it from this ' +
+                        'rota\'s coverage window computation');
+                    continue;
+                }
+            }
+
             var startNormalized = this._parseScheduleDateTime(spanGr.getValue('start_date_time'));
             var endNormalized = this._parseScheduleDateTime(spanGr.getValue('end_date_time'));
             if (!startNormalized || !endNormalized) continue;
@@ -966,14 +987,14 @@ PagerDutySync.prototype = {
             intervalType = 'weekly';
         }
 
-        // rotation_start_date/rotation_start_time anchor WHICH member's turn is
-        // "current" (effective_since) -- kept separate from window.anchorUtcIso
-        // (which anchors the shift's time-of-day shape/recurrence), since they can
-        // legitimately differ: a coverage window can be old while a roster's current
-        // membership rotation started more recently. See _rotationPhaseAnchorIso for
-        // the fallback when rotation_start_date/rotation_start_time are blank
-        // (confirmed happens on real data) and _localizedIso for the compact-date
-        // parsing this depends on otherwise (same fix as the v2 file).
+        // rotation_start_date/rotation_start_time is sent as effective_since below,
+        // but that field does NOT control which member PagerDuty shows as current
+        // -- see the "ROTATION PHASE ALIGNMENT" section above _rotationMemberOffset
+        // for why, and how the members array gets rotated instead to actually
+        // apply it. _rotationPhaseAnchorIso's own fallback (blank
+        // rotation_start_date/time) still governs effective_since here, same as
+        // always -- _rotationMemberOffset separately falls back to "no rotation"
+        // in that same case, so the two stay consistent with each other.
         var effectiveSince = this._rotationPhaseAnchorIso(rosterRow, tzName, window.anchorUtcIso);
 
         var active = this._activeMemberRows(memberRows, asOf);
@@ -995,6 +1016,16 @@ PagerDutySync.prototype = {
                 '" (' + rotaRow.name + ') filled with the fallback user');
         }
 
+        var shiftsPerMember = this._shiftsPerMember(window, intervalType, intervalCount);
+        var rotationOffset = this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, members.length);
+        if (rotationOffset) {
+            gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
+                rotationOffset + '/' + members.length + ' to align with rotation_start_date (' +
+                rosterRow.rotation_start_date + ') -- its coverage window\'s own anchor date disagrees with ' +
+                'that by enough whole shift-blocks to otherwise put the wrong member first');
+        }
+        members = this._rotateForPhase(members, rotationOffset);
+
         return {
             name: rotaRow.name + ' - ' + rosterRow.name,
             start_time: this._zonedDateTime(window.anchorUtcIso, tzName),
@@ -1003,7 +1034,7 @@ PagerDutySync.prototype = {
             recurrence: [this._rruleForWindow(window)],
             assignment_strategy: {
                 type: 'rotating_member_assignment_strategy',
-                shifts_per_member: this._shiftsPerMember(window, intervalType, intervalCount),
+                shifts_per_member: shiftsPerMember,
                 members: members
             }
         };
@@ -1212,6 +1243,167 @@ PagerDutySync.prototype = {
             'rotation_start_date/rotation_start_time; using a fallback anchor for its rotation phase instead ' +
             '-- which member appears "current" here is not derived from real ServiceNow data');
         return fallbackAnchorUtcIso || this.FIXED_FALLBACK_ANCHOR_ISO;
+    },
+
+    // ------------------------------------------------------------------------------
+    // ROTATION PHASE ALIGNMENT
+    //
+    // effective_since (above) does NOT control which member PagerDuty shows as
+    // currently on-call -- confirmed against PagerDuty's own v3 API reference for
+    // POST .../events: "effective_since... When this event starts producing
+    // shifts (UTC)" is a visibility floor, and separately, "past values are
+    // clamped to now" (confirmed live: every event's effective_since reads back
+    // as the moment of the most recent sync, regardless of what's sent). The
+    // event description there is explicit that phase comes from a different
+    // triple entirely: "a recurring time window (start_time, end_time,
+    // recurrence)" -- i.e. occurrence position is counted from start_time, which
+    // this file derives from the coverage window's own span anchor
+    // (window.anchorUtcIso), NOT from rotation_start_date. Nothing forces those
+    // two dates to agree, and in real data they usually don't (confirmed live:
+    // 356-357 days apart for one customer's rota, which happens to land exactly
+    // on a half-cycle boundary -- a permanent, deterministic member-position
+    // swap, not an intermittent glitch). rotation_start_date genuinely has zero
+    // effect on which member shows as on-call without this section.
+    //
+    // Since start_time can't be moved without either breaking the coverage-window
+    // shape or (for a BYDAY pattern) risking landing on an uncovered weekday, the
+    // fix instead rotates the *members array* by however many shift-blocks
+    // separate window.anchorUtcIso from rotation_start_date, so occurrence 0 at
+    // start_time lines up with whichever member should really be first as of
+    // rotation_start_date. A blank rotation_start_date (_isBlankRosterValue)
+    // leaves the array unrotated -- same "no real anchor to align to" philosophy
+    // _rotationPhaseAnchorIso already applies to effective_since.
+    // ------------------------------------------------------------------------------
+
+    // How many shift-blocks (of shiftsPerMember occurrences each) separate
+    // window.anchorUtcIso from rosterRow.rotation_start_date, mod memberCount --
+    // i.e. how far to rotate the members array so occurrence 0 lines up with the
+    // roster's real intended first member. Returns 0 (no rotation) whenever
+    // there's no real rotation_start_date to align to, or the local-date
+    // resolution below can't pin one down -- fails safe to today's unrotated
+    // behavior rather than guessing.
+    _rotationMemberOffset: function(rosterRow, window, tzName, shiftsPerMember, memberCount) {
+        if (memberCount <= 1) return 0; // nothing to rotate
+        if (this._isBlankRosterValue(rosterRow.rotation_start_date) || this._isBlankRosterValue(rosterRow.rotation_start_time)) {
+            return 0;
+        }
+        var anchorLocalDate = this._localDateForUtcAnchor(window.anchorUtcIso, tzName);
+        if (!anchorLocalDate) return 0;
+
+        var rotationDate = this._normalizeRosterDate(rosterRow.rotation_start_date);
+        var elapsedDays = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', rotationDate + ' 00:00:00') / 86400);
+        if (elapsedDays === 0) return 0;
+
+        var anchorWeekday = this._weekdayOfDateStr(anchorLocalDate);
+        var occurrenceIndex = this._countCoveredDaysBetween(window.days, anchorWeekday, elapsedDays);
+        var blocks = Math.floor(occurrenceIndex / shiftsPerMember);
+
+        // _rotateForPhase defines rotated[k] = members[(k+offset) mod N] (rotate
+        // LEFT by offset). PagerDuty selects rotated[blocks mod N] as current at
+        // rotation_start_date, which expands to members[(blocks+offset) mod N] --
+        // for that to land on members[0] (index 0, ServiceNow's intended "first"
+        // member), offset must satisfy (blocks+offset) mod N == 0, i.e.
+        // offset = -blocks mod N. NOT blocks mod N -- confirmed live via
+        // exhaustive validation against real multi-region data: for N=2 (NA/
+        // LATAM) blocks mod N and -blocks mod N always coincide (a coincidence of
+        // mod-2 arithmetic, since -x = x mod 2 for any integer x), which is
+        // exactly why the 2-member cases this was first built and tested against
+        // never exposed the missing negation -- N=3/N=4 regions (several other
+        // groups' EMEA/APAC-2/Americas rosters) diverge from it in most cases.
+        return (((-blocks % memberCount) + memberCount) % memberCount);
+    },
+
+    // Finds the local calendar date ('YYYY-MM-DD', in tzName) that anchorUtcIso
+    // falls on -- i.e. the real local date of window.anchorUtcIso. Confirmed live
+    // that window.startTimeOfDay is NOT a local time-of-day (it's extracted
+    // straight from the already-UTC-labeled span value in _computeCoverageWindow,
+    // so it's the UTC clock reading) -- an earlier version of this function
+    // wrongly fed it into _localizedIso as if it were local, which only
+    // coincidentally works when the real UTC offset happens to be a whole number
+    // of hours that doesn't cross a day boundary; it silently failed (safely --
+    // logged a warning and left the event unrotated, no corruption) for
+    // Hardware's own Weekend rota, whose real UTC-7 PDT offset does cross one.
+    // This version doesn't need to know any time-of-day at all: for each
+    // candidate date, _localizedIso of that date's local midnight and local
+    // 23:59:59 bracket the full UTC range that local calendar day spans (ISO8601
+    // strings compare correctly as plain strings, chronological order matches
+    // lexical order) -- whichever candidate's bracket contains anchorUtcIso is
+    // the real local date, regardless of what time of day the anchor actually is.
+    // Reuses the already-proven local->UTC direction (_localizedIso) rather than
+    // adding a second, independent UTC->local conversion path; the true local
+    // date is always within 1 day of anchorUtcIso's own UTC date (no real-world
+    // UTC offset exceeds 24h), so trying that date and its two neighbors is
+    // exhaustive, not a heuristic.
+    _localDateForUtcAnchor: function(anchorUtcIso, tzName) {
+        var utcDatePart = anchorUtcIso.substring(0, 10);
+        var candidates = [utcDatePart, this._shiftDateStr(utcDatePart, -1), this._shiftDateStr(utcDatePart, 1)];
+        for (var i = 0; i < candidates.length; i++) {
+            var dayStartUtc = this._localizedIso(candidates[i], '00:00:00', tzName);
+            var dayEndUtc = this._localizedIso(candidates[i], '23:59:59', tzName);
+            if (anchorUtcIso >= dayStartUtc && anchorUtcIso <= dayEndUtc) return candidates[i];
+        }
+        gs.warn('PagerDutySync: could not resolve the local calendar date for anchor "' + anchorUtcIso +
+            '" in zone "' + tzName + '" (tried ' + candidates.join(', ') + '); leaving this event\'s member ' +
+            'order unrotated rather than guessing at rotation-phase alignment');
+        return null;
+    },
+
+    // 'YYYY-MM-DD' -> 'YYYY-MM-DD', shifted by `days` (may be negative). Treated
+    // as a plain calendar-date shift (addDaysUTC on a bare midnight instant), not
+    // a real timezone-aware instant -- this is only ever used to generate the two
+    // candidate dates either side of a UTC date part, never as a real moment.
+    _shiftDateStr: function(dateStr, days) {
+        var gdt = new GlideDateTime(dateStr + ' 00:00:00');
+        gdt.addDaysUTC(days);
+        return gdt.getValue().substring(0, 10);
+    },
+
+    // 'YYYY-MM-DD' -> 1(Monday)..7(Sunday), matching _decodeDaysOfWeek's
+    // convention. Plain Gregorian-calendar arithmetic (JS Date, UTC-anchored so
+    // there's no local-timezone ambiguity in what is purely an abstract "what
+    // weekday is this date" fact, independent of any real timezone) -- not a
+    // ServiceNow API call, so nothing here depends on GlideDateTime's day-of-week
+    // support one way or the other.
+    _weekdayOfDateStr: function(dateStr) {
+        var parts = dateStr.split('-');
+        var jsDay = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10))).getUTCDay(); // 0=Sunday..6=Saturday
+        return jsDay === 0 ? 7 : jsDay;
+    },
+
+    // Signed count of window-covered days in the `elapsedDays`-day span starting
+    // at (and including) a day with weekday `anchorWeekday` -- e.g. elapsedDays=7
+    // with every day covered returns 7; elapsedDays=357 with every day covered
+    // returns 357 (confirmed against real data: this is exactly NA's case, 357
+    // days between its two anchors, both "every day" coverage). Decomposes into
+    // whole weeks (each contributing exactly coveredDays.length occurrences,
+    // regardless of which specific days those are) plus a bounded remainder check
+    // (at most 6 iterations) for the partial week left over, rather than a
+    // day-by-day walk across what can be a year or more -- same answer, no loop
+    // over hundreds of iterations.
+    _countCoveredDaysBetween: function(coveredDays, anchorWeekday, elapsedDays) {
+        var sign = elapsedDays < 0 ? -1 : 1;
+        var n = Math.abs(elapsedDays);
+        var fullWeeks = Math.floor(n / 7);
+        var remainder = n % 7;
+        var count = fullWeeks * coveredDays.length;
+        for (var i = 0; i < remainder; i++) {
+            var stepsFromAnchor = sign > 0 ? i : -(i + 1);
+            var dow = (((anchorWeekday - 1 + stepsFromAnchor) % 7) + 7) % 7 + 1;
+            if (coveredDays.indexOf(dow) !== -1) count++;
+        }
+        return sign * count;
+    },
+
+    // Rotates a members array left by `offset` positions (wrapping), e.g.
+    // offset=1 on [A,B] -> [B,A]. offset=0 returns the same array unchanged (no
+    // new array allocated) -- the common case, since most rosters' coverage
+    // window and rotation_start_date already happen to agree.
+    _rotateForPhase: function(members, offset) {
+        if (!offset) return members;
+        var n = members.length;
+        var rotated = [];
+        for (var i = 0; i < n; i++) rotated.push(members[(i + offset) % n]);
+        return rotated;
     },
 
     // Confirmed live on real data: a blank cmn_rota_roster.rotation_start_date/

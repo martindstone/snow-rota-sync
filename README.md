@@ -16,6 +16,8 @@ on an instance that already has that app installed and configured.
 | `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
 | `business_rule_sync_on_change.js` | Business Rule | System Definition > Business Rules, on `cmn_rota`. **Ships inactive.** |
+| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.py` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
+| `export_oncall_config.py` | Standalone script | Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring) and a few more `cmn_rota_roster` fields the UI Action doesn't pull yet. For situations where getting a button pasted into someone's ServiceNow instance isn't an option (no admin access to grant, security review overhead, etc.) but a Python script they can read start-to-finish and run themselves is. Stdlib only, nothing to `pip install`. See its own docstring for usage. |
 
 None of these files are meant to be uploaded/imported directly (there's no Update Set
 here) -- copy each script body into the corresponding record type, using the settings
@@ -52,6 +54,48 @@ lists alphabetically, they cluster together), and keeps it distinct from the cor
 app's own auto-provisioned naming (`SN-<group>` / `SN:<group>`) so the two mechanisms
 can't collide if a group is ever under both. Defined once as
 `SYNCED_NAME_PREFIX`/`SYNCED_DESCRIPTION` in `PagerDutySync.initialize()`.
+
+## Rotation phase alignment
+
+`cmn_rota_roster.rotation_start_date`/`rotation_start_time` is sent to PagerDuty as
+an event's `effective_since`, on the assumption that field controls which member
+shows as currently on-call. **It doesn't.** Confirmed against PagerDuty's own v3
+API reference for `POST .../events`: `effective_since` is documented as "When this
+event starts producing shifts" (a visibility floor) with "past values are clamped
+to now" -- and confirmed live, separately, that resyncing an event (which always
+gets a fresh `effective_since` stamped to the sync's own run time) does not change
+who's actually shown on-call. Phase is governed entirely by `start_time` +
+`recurrence`, which this port derives from the coverage window's own span anchor
+(`window.anchorUtcIso`) -- a value with no configured relationship to
+`rotation_start_date` at all. Nothing forces the two to agree, and in real data
+they usually don't (confirmed against a real customer export: two of five regions
+in one group landed exactly on a half-cycle boundary -- a permanent, deterministic
+member-position swap, not an intermittent glitch).
+
+Fixed by rotating the `assignment_strategy.members` array (in `_buildEvent`, via
+`_rotationMemberOffset`/`_rotateForPhase`) by however many shift-blocks separate
+the two anchors, so occurrence 0 at `start_time` lines up with whichever member
+should really be first as of `rotation_start_date`. A blank `rotation_start_date`
+leaves the array unrotated (same "no real anchor to align to" fallback
+`_rotationPhaseAnchorIso` already applies to `effective_since`). Deliberately
+**not** applied in `_buildAlternatingEvent` (the paired week-on/week-off path) --
+that function already anchors purely to the shared coverage window on purpose,
+since there's no single side's `rotation_start_date` that would be the "right" one
+to pick for a merged pair.
+
+Validated two ways before deploying: isolated unit tests against known values
+(including the exact case that first surfaced this, and a DST-crossing case that
+caught a second bug in an earlier version of the local-date resolution), and an
+exhaustive check against a real 8-group/68-roster customer export, using each
+member's own `rotation_schedule` (ServiceNow's own system-generated per-member
+on-call computation -- see `export_oncall_config.py`'s docstring) as independent
+ground truth: 0 regressions, 7 confirmed real fixes (only 2 of which had been
+reported; the other 5 were latent). The remaining unrotated cases in that export
+were all accounted for, not just unverified -- 17 resolved to the
+`_buildAlternatingEvent` path (confirmed via matching coverage-window shapes at
+the same order value, which is exactly what that function's own pairing detection
+looks for) and 1 to an already-diagnosed unrelated data issue (a blank
+`cmn_rota_member.member` reference).
 
 ## Architecture notes
 
@@ -156,6 +200,23 @@ single span's computed duration can be before `_computeCoverageWindow` discards 
 as probable bad data (misordered start/end producing a nonsensical multi-day
 span). A genuinely longer intentional window -- a long-weekend block spanning more
 than 3 days, say -- would hit this same silent-discard-to-24/7 failure mode again.
+
+**`repeat_until`**: a real `cmn_schedule_span` field (compact `YYYYMMDD`,
+`'00000000'` sentinel for "no end date") that's now read -- a span whose
+`repeat_until` has already passed is excluded from that rota's coverage-window
+computation. This was a genuine gap: someone ending a rotation by setting
+`repeat_until` in the past (rather than deactivating the rota/roster, which stays
+`active=true`) had that pattern read as an ongoing, currently-valid recurrence
+forever, with nothing in the sync log to explain why an ended rotation kept
+showing up. **Known consequence, chosen deliberately over the alternative**: if
+that expired span was a rota's *only* span, `_computeCoverageWindow` returns
+`null` for it the same way it does for any rota with no usable window today --
+which currently means `_defaultAlwaysOnWindow`'s 24/7-every-day fallback kicks
+in, not "no coverage." So an expired single-span rota doesn't disappear from the
+sync, it becomes an always-on rotation instead. Confirmed live and logged
+clearly (`"<rota>": span <sys_id>'s repeat_until (<date>) is in the past;
+excluding it...`) either way, so this is visible rather than a second silent
+surprise layered on top of the first one it fixes.
 
 ## Custom escalation
 
