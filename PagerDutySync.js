@@ -153,14 +153,15 @@ PagerDutySync.prototype = {
     syncAll: function(dryRun) {
         dryRun = (dryRun === false) ? false : true;
         var asOf = new GlideDateTime();
-        var collected = {schedules: [], escalation_policies: []};
+        var collected = {schedules: [], escalation_policies: [], overrides: []};
         var groupNames = this._enrolledGroupNames();
         for (var i = 0; i < groupNames.length; i++) {
             this._syncOneGroup(groupNames[i], asOf, dryRun, collected);
         }
         gs.info('PagerDutySync.syncAll ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') +
             'complete: ' + collected.schedules.length + ' schedule action(s), ' +
-            collected.escalation_policies.length + ' escalation policy action(s)');
+            collected.escalation_policies.length + ' escalation policy action(s), ' +
+            collected.overrides.length + ' coverage override(s)');
         gs.info(JSON.stringify(collected, null, 2));
         return collected;
     },
@@ -174,7 +175,7 @@ PagerDutySync.prototype = {
             return null;
         }
         var asOf = new GlideDateTime();
-        var collected = {schedules: [], escalation_policies: []};
+        var collected = {schedules: [], escalation_policies: [], overrides: []};
         this._syncOneGroup(groupName, asOf, dryRun, collected);
         gs.info('PagerDutySync.syncGroup(' + groupName + ') ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') + 'complete');
         gs.info(JSON.stringify(collected, null, 2));
@@ -243,6 +244,9 @@ PagerDutySync.prototype = {
                 'either was never loaded or has expired); leaving its PagerDuty objects untouched this run');
             return;
         }
+        this._rosterOverrides = this._loadRosterOverrides(groupName, snow, asOf);
+        this._eventRosters = {};
+        this._appliedOverrideRosters = {};
         var classification = this._classifyGroup(groupName, snow, coverageWindows);
         gs.info('classified "' + groupName + '" as ' + classification.shape +
             (classification.reason ? (' (' + classification.reason + ')') : ''));
@@ -254,6 +258,7 @@ PagerDutySync.prototype = {
         } else {
             this._buildBestEffortEscalationPolicy(groupName, snow, coverageWindows, asOf, dryRun, collected);
         }
+        this._warnUnappliedOverrides(groupName, snow);
     },
 
     _loadSnowData: function(groupName) {
@@ -300,6 +305,10 @@ PagerDutySync.prototype = {
                 rotation_interval_count: rosterGr.getValue('rotation_interval_count'),
                 rotation_interval_type: rosterGr.getValue('rotation_interval_type'),
                 rotation_start_date: rosterGr.getValue('rotation_start_date'),
+                // "Day of week for rotation" on the roster form -- the weekday ServiceNow
+                // actually hands off on when set (see _rotationAlignment). Blank means
+                // "use the weekday of rotation_start_date".
+                dow_for_rotate: rosterGr.getValue('dow_for_rotate') || '',
                 rotation_start_time: rosterGr.getValue('rotation_start_time'),
                 rota_sys_id: rotaSysId
             };
@@ -1058,7 +1067,14 @@ PagerDutySync.prototype = {
         }
 
         var shiftsPerMember = this._shiftsPerMember(window, intervalType, intervalCount);
-        var rotationOffset = this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, members.length);
+        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType);
+        var rotationOffset = alignment.offset;
+        var eventAnchorUtcIso = alignment.anchorUtcIso;
+        if (eventAnchorUtcIso !== window.anchorUtcIso) {
+            gs.info('  note: moved "' + rosterRow.name + '" (' + rotaRow.name + ')\'s start_time from ' + window.anchorUtcIso +
+                ' to ' + eventAnchorUtcIso + ' so its handoffs land on the roster\'s rotate-on weekday (dow_for_rotate / ' +
+                'rotation_start_date) instead of the coverage window\'s anchor weekday');
+        }
         if (rotationOffset) {
             gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
                 rotationOffset + '/' + members.length + ' to align with rotation_start_date (' +
@@ -1067,10 +1083,11 @@ PagerDutySync.prototype = {
         }
         members = this._rotateForPhase(members, rotationOffset);
 
+        this._registerEventRosters(rotaRow.name + ' - ' + rosterRow.name, [rosterRow.sys_id], 'single');
         return {
             name: rotaRow.name + ' - ' + rosterRow.name,
-            start_time: this._zonedDateTime(window.anchorUtcIso, tzName),
-            end_time: this._zonedDateTime(this._addSecondsToUtcIso(window.anchorUtcIso, window.durationSeconds), tzName),
+            start_time: this._zonedDateTime(eventAnchorUtcIso, tzName),
+            end_time: this._zonedDateTime(this._addSecondsToUtcIso(eventAnchorUtcIso, window.durationSeconds), tzName),
             effective_since: effectiveSince,
             recurrence: [this._rruleForWindow(window)],
             assignment_strategy: {
@@ -1122,6 +1139,9 @@ PagerDutySync.prototype = {
         for (var m = 0; m < interleavedIds.length; m++) {
             members.push({type: 'user_member', user_id: interleavedIds[m]});
         }
+        var sideRosterIds = [];
+        for (var sr = 0; sr < orderedRows.length; sr++) sideRosterIds.push(orderedRows[sr].sys_id);
+        this._registerEventRosters(names.join(' / alternating with / '), sideRosterIds, 'alternating');
 
         return {
             name: names.join(' / alternating with / '),
@@ -1184,6 +1204,9 @@ PagerDutySync.prototype = {
             }
             names.push(rows[i].name);
         }
+        var everyMemberRosterIds = [];
+        for (var er = 0; er < rows.length; er++) everyMemberRosterIds.push(rows[er].sys_id);
+        this._registerEventRosters(eventName || names.join(' + '), everyMemberRosterIds, 'every_member');
 
         return {
             name: eventName || names.join(' + '),
@@ -1315,6 +1338,71 @@ PagerDutySync.prototype = {
     // leaves the array unrotated -- same "no real anchor to align to" philosophy
     // _rotationPhaseAnchorIso already applies to effective_since.
     // ------------------------------------------------------------------------------
+
+    // The handoff WEEKDAY, not just the phase. PagerDuty hands off every
+    // shiftsPerMember occurrences counted from start_time, so for an every-day
+    // window the handoff weekday is simply start_time's weekday -- which comes from
+    // the coverage window, not from anything the roster says. ServiceNow's is
+    // `dow_for_rotate` ("Day of week for rotation" on the roster form) when set,
+    // otherwise the weekday of rotation_start_date. Confirmed against ServiceNow's
+    // own engine on a scratch roster (Wednesday start date, Monday rotate-on day):
+    // the first member's block runs Monday-Sunday of the week CONTAINING the start
+    // date, i.e. blocks are aligned back to the rotate-on weekday on or before the
+    // start date, the next member starts the following Monday, and so on. It is
+    // neither a short first partial week nor a first block starting at the next
+    // Monday. (rotation_start_dow, the other day-of-week field, is '1' on every
+    // roster in a real 123-roster export -- a constant, not information.)
+    //
+    // So for a weekly-interval roster on an every-day window, this (a) finds that
+    // aligned rotation start date, (b) moves start_time EARLIER by whole local days
+    // so an integral number of blocks separates it from that date -- earlier
+    // rather than later, so no occurrence is ever lost -- which puts PagerDuty's
+    // handoffs on the same weekday as ServiceNow's, and (c) rotates the members
+    // array by the whole-block count so the right person is first. Everything
+    // else (BYDAY windows, daily-interval rosters) falls through to
+    // _rotationMemberOffset unchanged: none of the real data needing this used
+    // either, and a BYDAY window's handoff may land on an uncovered weekday.
+    // Returns {offset, anchorUtcIso}; anchorUtcIso is the window's own unless moved.
+    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType) {
+        var unchanged = {offset: 0, anchorUtcIso: window.anchorUtcIso};
+        if (memberCount <= 1 || !this._hasRotationStart(rosterRow)) return unchanged;
+        if (intervalType !== 'weekly' || !this._daysAreEveryDay(window.days)) {
+            return {offset: this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, memberCount),
+                    anchorUtcIso: window.anchorUtcIso};
+        }
+        var anchorLocalDate = this._localDateForUtcAnchor(window.anchorUtcIso, tzName);
+        if (!anchorLocalDate) return unchanged;
+
+        var rotationDate = this._normalizeRosterDate(rosterRow.rotation_start_date);
+        var rotationWeekday = this._weekdayOfDateStr(rotationDate);
+        var dow = parseInt(rosterRow.dow_for_rotate, 10);
+        if (isNaN(dow) || dow < 1 || dow > 7) dow = rotationWeekday;
+        var gridDate = this._shiftDateStr(rotationDate, -(((rotationWeekday - dow) % 7 + 7) % 7));
+
+        var blockDays = shiftsPerMember; // every-day window: one occurrence per day
+        var daysToGrid = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', gridDate + ' 00:00:00') / 86400);
+        var blocks = daysToGrid > 0 ? Math.ceil(daysToGrid / blockDays) : 0;
+        var alignedDate = this._shiftDateStr(gridDate, -blocks * blockDays);
+        var shiftDays = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', alignedDate + ' 00:00:00') / 86400);
+
+        return {
+            offset: ((-blocks % memberCount) + memberCount) % memberCount,
+            anchorUtcIso: shiftDays === 0
+                ? window.anchorUtcIso
+                : this._shiftAnchorLocalDays(window.anchorUtcIso, anchorLocalDate, tzName, shiftDays)
+        };
+    },
+
+    // Moves an anchor instant by whole LOCAL calendar days, keeping its local
+    // time-of-day (so a shift across a DST change moves the UTC instant by an hour
+    // rather than drifting the local handoff time). The local time-of-day is the
+    // anchor's offset from local midnight of its own local date.
+    _shiftAnchorLocalDays: function(anchorUtcIso, anchorLocalDate, tzName, days) {
+        var midnightUtc = this._localizedIso(anchorLocalDate, '00:00:00', tzName);
+        var secondsIntoDay = this._dateDiffSeconds(midnightUtc.replace('T', ' ').replace(/Z$/, ''),
+            anchorUtcIso.replace('T', ' ').replace(/Z$/, ''));
+        return this._localizedIso(this._shiftDateStr(anchorLocalDate, days), this._secondsToTimeOfDay(secondsIntoDay), tzName);
+    },
 
     // How many shift-blocks (of shiftsPerMember occurrences each) separate
     // window.anchorUtcIso from rosterRow.rotation_start_date, mod memberCount --
@@ -1778,12 +1866,20 @@ PagerDutySync.prototype = {
             payload: {schedule: {name: name, time_zone: tzName, description: description}, events: events}
         });
 
+        var desiredOverrides = this._desiredOverrides(name, events);
+
         if (dryRun) {
+            for (var dov = 0; dov < desiredOverrides.length; dov++) {
+                collected.overrides.push({schedule: name, event: desiredOverrides[dov].eventName, start_time: desiredOverrides[dov].startIso,
+                    end_time: desiredOverrides[dov].endIso, user_id: desiredOverrides[dov].userId, snow_span: desiredOverrides[dov].spanSysId});
+            }
             if (existing) {
-                gs.info('  [dry run] would UPDATE v3 schedule "' + name + '" (' + existing.id + ') with ' + events.length + ' event(s)');
+                gs.info('  [dry run] would UPDATE v3 schedule "' + name + '" (' + existing.id + ') with ' + events.length + ' event(s)' +
+                    (desiredOverrides.length ? ' and ' + desiredOverrides.length + ' coverage override(s)' : ''));
                 return existing.id;
             }
-            gs.info('  [dry run] would CREATE v3 schedule "' + name + '" with ' + events.length + ' event(s)');
+            gs.info('  [dry run] would CREATE v3 schedule "' + name + '" with ' + events.length + ' event(s)' +
+                (desiredOverrides.length ? ' and ' + desiredOverrides.length + ' coverage override(s)' : ''));
             return this._nextPlaceholderId('schedule');
         }
 
@@ -1863,6 +1959,7 @@ PagerDutySync.prototype = {
         // rotation.
         var now = new GlideDateTime();
         var createdRotationCount = 0, updatedEventCount = 0, skippedEndedCount = 0;
+        var rotationIdByEventName = {};
         for (var k = 0; k < events.length; k++) {
             var desiredEvent = events[k];
             var match = rotationByEventName[desiredEvent.name];
@@ -1886,6 +1983,7 @@ PagerDutySync.prototype = {
                 createdRotationCount++;
             }
             this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: desiredEvent});
+            rotationIdByEventName[desiredEvent.name] = rotationId;
             gs.info('  created event "' + desiredEvent.name + '" on schedule "' + name + '"');
         }
         if (createdRotationCount) gs.info('  created ' + createdRotationCount + ' new rotation(s) on "' + name + '"');
@@ -1895,7 +1993,180 @@ PagerDutySync.prototype = {
                 'won\'t delete them) before adding the replacement alongside them in the same rotation');
         }
 
+        // Coverage overrides go on last: they hang off a rotation id, and the delete/
+        // recreate of each event above may have removed or truncated old ones. A
+        // failure here must not abort the sync (the escalation policy that targets
+        // this schedule is still to be written), so it is logged and swallowed.
+        try {
+            this._reconcileOverrides(rest, scheduleId, name, desiredOverrides, rotationIdByEventName, now);
+        } catch (overrideError) {
+            gs.error('PagerDutySync: could not reconcile coverage overrides on "' + name + '" (' + scheduleId + '): ' + overrideError);
+        }
+
         return scheduleId;
+    },
+
+    // ------------------------------------------------------------------------------
+    // COVERAGE OVERRIDES (roster_schedule_span type=on_call -> v3 overrides)
+    // ------------------------------------------------------------------------------
+    // ServiceNow's "Provide coverage" stores a one-off roster_schedule_span
+    // (type=on_call, roster + user set) on the covering user's own schedule. The
+    // on-call resolver (OnCallRotationSNC._checkForOverrideMemberByRoster) treats it
+    // as an OVERRIDE: while the span is active, that user replaces whoever the
+    // roster's rotation says is on call, whether or not they are a roster member.
+    // That is exactly a v3 override on the rotation built for that roster
+    // (POST v3/schedules/{id}/overrides, keyed by rotation_id) -- confirmed live that
+    // it replaces the scheduled person during the overlap with that rotation's
+    // shifts and has no effect outside them.
+    //
+    // Not covered: time_off spans (SN skips a person who is off and pages the NEXT
+    // member in roster order instead), repeating coverage spans, spans with no
+    // roster (group-wide fallback), and rosters folded into a simultaneous
+    // (every_member) event, where an override would have to name which member it
+    // replaces. Each of those is logged, not silently dropped.
+
+    _loadRosterOverrides: function(groupName, snow, asOf) {
+        var byRoster = {};
+        var groupWideCount = 0, repeatingCount = 0, noUserCount = 0;
+        try {
+            var spanGr = new GlideRecord('roster_schedule_span');
+            spanGr.addQuery('group.name', groupName);
+            spanGr.addQuery('type', 'on_call');
+            spanGr.query();
+            while (spanGr.next()) {
+                var startNormalized = this._parseScheduleDateTime(spanGr.getValue('start_date_time'));
+                var endNormalized = this._parseScheduleDateTime(spanGr.getValue('end_date_time'));
+                if (!startNormalized || !endNormalized) continue;
+                if (new GlideDateTime(endNormalized).compareTo(asOf) <= 0) continue; // already over
+                var rosterSysId = spanGr.roster.toString();
+                if (!rosterSysId) { groupWideCount++; continue; }
+                if (!snow.rosterBySysId.hasOwnProperty(rosterSysId)) continue;
+                var repeatType = spanGr.getValue('repeat_type') || '';
+                if (repeatType) { repeatingCount++; continue; }
+                var userEmail = spanGr.user.email ? spanGr.user.email.toString() : '';
+                if (!userEmail) { noUserCount++; continue; }
+                byRoster[rosterSysId] = byRoster[rosterSysId] || [];
+                byRoster[rosterSysId].push({
+                    sys_id: spanGr.getUniqueValue(),
+                    startIso: startNormalized.replace(' ', 'T') + 'Z',
+                    endIso: endNormalized.replace(' ', 'T') + 'Z',
+                    userEmail: userEmail,
+                    userName: spanGr.user.name ? spanGr.user.name.toString() : userEmail
+                });
+            }
+        } catch (loadError) {
+            gs.warn('PagerDutySync: could not read roster_schedule_span for "' + groupName + '" (' + loadError +
+                '); coverage shifts will not be synced this run');
+            return {};
+        }
+        if (groupWideCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + groupWideCount + ' current/future coverage span(s) ' +
+            'with no roster (group-wide); not synced to PagerDuty');
+        if (repeatingCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + repeatingCount + ' current/future REPEATING coverage ' +
+            'span(s); only one-off coverage is synced, these are not');
+        if (noUserCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + noUserCount + ' current/future coverage span(s) with no ' +
+            'resolvable user; not synced to PagerDuty');
+        return byRoster;
+    },
+
+    _registerEventRosters: function(eventName, rosterIds, kind) {
+        this._eventRosters = this._eventRosters || {};
+        this._eventRosters[eventName] = {rosterIds: rosterIds, kind: kind};
+    },
+
+    _desiredOverrides: function(scheduleName, events) {
+        var out = [];
+        var byRoster = this._rosterOverrides || {};
+        var emailToId = this._emailToIdCache || {};
+        this._appliedOverrideRosters = this._appliedOverrideRosters || {};
+        for (var e = 0; e < events.length; e++) {
+            var registration = (this._eventRosters || {})[events[e].name];
+            if (!registration) continue;
+            for (var r = 0; r < registration.rosterIds.length; r++) {
+                var rosterSysId = registration.rosterIds[r];
+                var spans = byRoster[rosterSysId];
+                if (!spans) continue;
+                if (registration.kind === 'every_member') continue; // reported by _warnUnappliedOverrides
+                this._appliedOverrideRosters[rosterSysId] = true;
+                for (var s = 0; s < spans.length; s++) {
+                    var resolved = this._resolveUser(spans[s].userEmail, emailToId);
+                    if (!resolved.matched) {
+                        gs.warn('PagerDutySync: coverage span ' + spans[s].sys_id + ' (' + spans[s].userName + ', ' + spans[s].startIso +
+                            ' to ' + spans[s].endIso + ') on "' + scheduleName + '" skipped: no PagerDuty user with email ' + spans[s].userEmail);
+                        continue;
+                    }
+                    out.push({eventName: events[e].name, startIso: spans[s].startIso, endIso: spans[s].endIso,
+                        userId: resolved.id, spanSysId: spans[s].sys_id, userName: spans[s].userName});
+                }
+            }
+        }
+        return out;
+    },
+
+    _warnUnappliedOverrides: function(groupName, snow) {
+        var byRoster = this._rosterOverrides || {};
+        for (var rosterSysId in byRoster) {
+            if (!byRoster.hasOwnProperty(rosterSysId) || this._appliedOverrideRosters[rosterSysId]) continue;
+            var rosterRow = snow.rosterBySysId[rosterSysId];
+            gs.warn('PagerDutySync: ' + byRoster[rosterSysId].length + ' coverage span(s) on "' + groupName + '" roster "' +
+                (rosterRow ? rosterRow.name : rosterSysId) + '" were not synced -- that roster has no rotation of its own in ' +
+                'PagerDuty (single named person, or folded into a simultaneous multi-roster event)');
+        }
+    },
+
+    // Makes the not-yet-finished v3 overrides on a schedule equal the desired set:
+    // deletes any that ServiceNow no longer has, creates any that are missing.
+    // Anyone who adds an override by hand in PagerDuty on a synced schedule loses it
+    // on the next sync -- same "this sync owns the schedule" rule as the rotations.
+    // Overrides that already ended are left alone (PagerDuty won't delete those, and
+    // deleting one that is mid-flight only truncates it to now).
+    _reconcileOverrides: function(rest, scheduleId, scheduleName, desired, rotationIdByEventName, asOf) {
+        var nowIso = asOf.getValue().replace(' ', 'T') + 'Z';
+        var untilIso = this._addSecondsToUtcIso(nowIso, 730 * 86400);
+        var wanted = {};
+        var toCreate = [];
+        for (var d = 0; d < desired.length; d++) {
+            var rotationId = rotationIdByEventName[desired[d].eventName];
+            if (!rotationId) continue;
+            if (desired[d].endIso > untilIso) untilIso = this._addSecondsToUtcIso(desired[d].endIso, 86400);
+            var key = [rotationId, desired[d].startIso, desired[d].endIso, desired[d].userId].join('|');
+            wanted[key] = true;
+            toCreate.push({key: key, body: {
+                start_time: desired[d].startIso, end_time: desired[d].endIso, rotation_id: rotationId,
+                overriding_member: {type: 'user_member', user_id: desired[d].userId}
+            }, info: desired[d]});
+        }
+
+        var listing = rest.getRESTThrowable('v3/schedules/' + scheduleId + '/overrides?since=' + nowIso + '&until=' + untilIso).data;
+        var existingOverrides = (listing && listing.overrides) || [];
+        var have = {};
+        var deleted = 0, created = 0;
+        for (var x = 0; x < existingOverrides.length; x++) {
+            var ov = existingOverrides[x];
+            if (ov.end_time <= nowIso) continue; // already finished
+            var ovKey = [ov.rotation_id, ov.start_time, ov.end_time, ov.overriding_member ? ov.overriding_member.user_id : ''].join('|');
+            if (wanted.hasOwnProperty(ovKey) && !have.hasOwnProperty(ovKey)) {
+                have[ovKey] = true;
+                continue;
+            }
+            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/overrides/' + ov.id, null);
+            deleted++;
+        }
+
+        var bodies = [];
+        for (var c = 0; c < toCreate.length; c++) {
+            if (have.hasOwnProperty(toCreate[c].key)) continue;
+            bodies.push(toCreate[c].body);
+            gs.info('  coverage override on "' + scheduleName + '": ' + toCreate[c].info.userName + ' covers "' +
+                toCreate[c].info.eventName + '" ' + toCreate[c].info.startIso + ' to ' + toCreate[c].info.endIso +
+                ' (ServiceNow span ' + toCreate[c].info.spanSysId + ')');
+        }
+        if (bodies.length) {
+            this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/overrides', {overrides: bodies});
+            created = bodies.length;
+        }
+        if (deleted || created) {
+            gs.info('  coverage overrides on "' + scheduleName + '": ' + created + ' created, ' + deleted + ' removed');
+        }
     },
 
     // PagerDuty_REST's own *RESTThrowable() methods extract error detail via

@@ -17,7 +17,7 @@ on an instance that already has that app installed and configured.
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
 | `business_rule_sync_on_change.js` | Business Rule | System Definition > Business Rules, on `cmn_rota`. **Ships inactive.** |
 | `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.txt` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
-| `export_oncall_config.txt` | Standalone script | A Python script saved as `.txt` so mail filters let it through -- rename to `.py` to run it. Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring), the extra `cmn_rota_roster` day-of-week/payload fields, who each span is *for* and what it overrides (`user`/`parent`/`show_as`/`notes`), each rota's `based_on` calendar, and an `other_schedules` sweep of everything else attached to the group's rotas/rosters/members -- where a one-off "Provide coverage" shift or swap would live (PagerDutySync doesn't read any of those yet). Stdlib only, nothing to `pip install`. See its own docstring for usage. |
+| `export_oncall_config.txt` | Standalone script | A Python script saved as `.txt` so mail filters let it through -- rename to `.py` to run it. Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring), the extra `cmn_rota_roster` day-of-week/payload fields, who each span is *for* and what it overrides (`user`/`parent`/`show_as`/`notes`), each rota's `based_on` calendar, an `other_schedules` sweep of everything else attached to the group's rotas/rosters/members, and a `roster_schedule_spans` / `roster_schedule_span_proposals` sweep -- `roster_schedule_span` ("Roster Schedule Entry", a `cmn_schedule_span` subclass keyed by `roster`, or by `group` for time off, and living on the covering *user's* schedule rather than any rota's) is where ServiceNow stores one-off "Provide coverage" shifts (`type=on_call`, shown in its calendar as "<user> (<roster> Coverage)") and time off, so none of the schedule-based queries can see them. PagerDutySync syncs the one-off `type=on_call` coverage spans as v3 overrides (see "Coverage overrides" below); time off is still not synced. That sweep degrades to a warning if the account can't read those tables. Stdlib only, nothing to `pip install`. See its own docstring for usage. |
 
 None of these files are meant to be uploaded/imported directly (there's no Update Set
 here) -- copy each script body into the corresponding record type, using the settings
@@ -120,11 +120,74 @@ out exactly one shift-block off because of it -- 14 rosters in that export had t
 same shape, and correcting it took the confirmed-fix count from 7 to 15. Only an
 all-zero *date* means unset.
 
-**Not covered: the handoff weekday.** Rotating the array changes who is first, not
-which weekday a handoff lands on -- that comes from the coverage window's anchor
-weekday. ServiceNow's `rotation_start_dow`/`dow_for_rotate` ("rotate on Monday")
-are still never read, so a roster whose rotation was moved to a different weekday
-(e.g. Wednesday to Monday) still hands off on the old one in PagerDuty.
+### Handoff weekday (`dow_for_rotate`)
+
+Rotating the array changes who is first, not which weekday a handoff lands on --
+that comes from `start_time`'s weekday. The roster form's **"Day of week for
+rotation"** (`cmn_rota_roster.dow_for_rotate`, 1=Mon..7=Sun; the sibling
+`rotation_start_dow` is a constant `1` and is ignored) is the weekday ServiceNow
+actually hands off on. Confirmed by experiment on a PDI: with a Wednesday
+`rotation_start_date` and rotate-on Monday, ServiceNow's own per-member schedules
+start the first member's turn on the Monday on/before the start date and run
+Monday-to-Monday from there -- the first member owns that whole block.
+
+`_rotationAlignment` replaces the plain offset for **weekly-interval rosters whose
+window covers every day of the week**: it snaps the block grid to the
+`dow_for_rotate` weekday on/before `rotation_start_date`, then moves the event's
+`start_time` back by whole local days (DST-safe, via `_shiftAnchorLocalDays`) to the
+grid-aligned date at or before the window's own anchor and rotates the members for
+the blocks crossed. Blank/invalid `dow_for_rotate` falls back to the start date's own
+weekday, i.e. no handoff-day change. The log notes when a `start_time` is moved.
+
+**Scope:** daily-interval rosters and windows restricted to specific days (BYDAY
+patterns such as weekdays-only) keep the previous offset-only behavior -- their
+handoff weekday is not shifted. Checked offline against a real customer export by
+simulating which member/weekday PagerDuty would show at every ServiceNow turn start:
+no regressions (111 of 122 turn starts matched before and after; the rest are
+pre-existing mismatches unrelated to the weekday), and the one roster whose
+configured `dow_for_rotate` differed from the window's anchor weekday (Global
+Middleware Support) had its `start_time` weekday moved from Monday to Thursday to
+match, with member/turn agreement unchanged.
+
+## Coverage overrides ("Provide coverage")
+
+ServiceNow stores a one-off "Provide coverage" shift as a `roster_schedule_span`
+(`type=on_call`, `roster` + `user` set, living on the covering user's own schedule),
+so none of the rota/roster queries can see it. Read from ServiceNow's own on-call
+resolver (`OnCallRotationSNC._checkForOverrideMemberByRoster`), it is an **override**:
+while the span is active, that user *replaces* whoever the roster's rotation says is
+on call for that roster -- they need not be a roster member. (Found from a real
+customer export: one span, Joy Navarra, on the Major Incident NA Primary roster
+for Monday 2026-10-26 12:00:30-21:00:30Z -- exactly one occurrence of the NA window --
+created 2026-09-24. She belongs to the EMEA rota, not NA Primary.)
+
+The sync writes each such span as a **v3 override** on the rotation built for that
+roster (`POST v3/schedules/{id}/overrides` with `rotation_id` + `overriding_member`).
+Confirmed live against PagerDuty: an override replaces the scheduled person during
+its overlap with that rotation's shifts and does nothing outside them, so a span
+wider or narrower than the rotation window behaves like ServiceNow's. After the
+schedule's events are rebuilt, `_reconcileOverrides` lists the schedule's unfinished
+overrides and makes them equal the desired set -- creating missing ones, deleting ones
+whose span is gone or changed. Verified on a PDI: created, idempotent on a second
+sync (it survives the event delete/recreate), and removed when the span was deleted.
+
+- Only spans that haven't ended yet are synced; past ones are ignored (PagerDuty
+  won't delete past overrides anyway, and deleting an in-flight one just truncates it
+  to now, which the reconcile step ignores).
+- **An override added by hand in PagerDuty on a synced schedule is removed on the
+  next sync**, same "the sync owns this schedule" rule as its rotations.
+- The covering user must have a PagerDuty user with the same email; otherwise the span
+  is skipped with a warning (an override to the fallback user would be wrong).
+- Failures here are logged and don't abort the group's sync.
+
+**Not synced (each logged as a warning, never silently dropped):**
+- `type=time_off` spans. ServiceNow skips the person who is off and pages the *next*
+  member in roster order instead; that isn't a plain override and isn't implemented.
+- Repeating coverage spans (`repeat_type` set).
+- Spans with no roster (a group-wide fallback in ServiceNow).
+- Rosters with no rotation of their own in PagerDuty: a single named person, or a
+  roster folded into a simultaneous (every_member) event, where an override would
+  have to say which member it replaces.
 
 ## Architecture notes
 
