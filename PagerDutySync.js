@@ -235,7 +235,14 @@ PagerDutySync.prototype = {
 
     _syncOneGroup: function(groupName, asOf, dryRun, collected) {
         var snow = this._loadSnowData(groupName);
-        var coverageWindows = this._loadCoverageWindows(snow, asOf);
+        var expiredRotaIds = {};
+        var coverageWindows = this._loadCoverageWindows(snow, asOf, expiredRotaIds);
+        this._dropExpiredRotas(snow, expiredRotaIds);
+        if (snow.rotasForGroup().length === 0) {
+            gs.warn('PagerDutySync: "' + groupName + '" has no rota left with current coverage (every rota ' +
+                'either was never loaded or has expired); leaving its PagerDuty objects untouched this run');
+            return;
+        }
         var classification = this._classifyGroup(groupName, snow, coverageWindows);
         gs.info('classified "' + groupName + '" as ' + classification.shape +
             (classification.reason ? (' (' + classification.reason + ')') : ''));
@@ -436,16 +443,49 @@ PagerDutySync.prototype = {
     // ------------------------------------------------------------------------------
 
     // Returns {rota_sys_id: {days: [1-7,...], startTimeOfDay: 'HH:MM:SS', durationSeconds: N}}
-    _loadCoverageWindows: function(snow, asOf) {
+    _loadCoverageWindows: function(snow, asOf, expiredRotaIds) {
         var ownWindow = {};
         var rotas = snow.rotasForGroup();
         for (var i = 0; i < rotas.length; i++) {
             var rota = rotas[i];
             if (!rota.schedule_sys_id) continue;
-            var window = this._computeCoverageWindow(rota.schedule_sys_id, rota.name, asOf);
-            if (window) ownWindow[rota.sys_id] = window;
+            var state = {expiredSpans: 0};
+            var window = this._computeCoverageWindow(rota.schedule_sys_id, rota.name, asOf, state);
+            if (window) {
+                ownWindow[rota.sys_id] = window;
+            } else if (state.expiredSpans > 0 && expiredRotaIds) {
+                expiredRotaIds[rota.sys_id] = true;
+            }
         }
         return ownWindow;
+    },
+
+    // A rota whose ONLY usable recurring spans all have a repeat_until in the past
+    // has ended -- that's how ServiceNow admins retire a rotation without
+    // deactivating the rota/roster (both stay active=true). It's removed from this
+    // sync entirely, rather than left to fall through to _defaultAlwaysOnWindow's
+    // 24/7-every-day default like a rota that simply has no window configured.
+    // The always-on fallback was the original behavior of the repeat_until fix and
+    // was confirmed live to be wrong for this case, twice over: the ended
+    // regions kept paging around the clock, AND having no window flipped the whole
+    // group to needs_review (_classifyGroup), which renamed its escalation policy
+    // and schedules and forked a duplicate set in PagerDuty. Dropping the rota
+    // here (before classification) avoids both; any PagerDuty rotation it left
+    // behind on a schedule found by name is removed by _upsertScheduleV3's
+    // "no longer produced by this sync" cleanup.
+    _dropExpiredRotas: function(snow, expiredRotaIds) {
+        for (var rotaId in expiredRotaIds) {
+            if (!expiredRotaIds.hasOwnProperty(rotaId) || !snow.rotaBySysId.hasOwnProperty(rotaId)) continue;
+            gs.info('skipping rota "' + snow.rotaBySysId[rotaId].name + '": every recurring span on its schedule has a ' +
+                'repeat_until in the past, so it has no current coverage (not falling back to an always-on window)');
+            var rosters = snow.rosterByRotaSysId[rotaId] || [];
+            for (var i = 0; i < rosters.length; i++) {
+                delete snow.membersByRosterSysId[rosters[i].sys_id];
+                delete snow.rosterBySysId[rosters[i].sys_id];
+            }
+            delete snow.rosterByRotaSysId[rotaId];
+            delete snow.rotaBySysId[rotaId];
+        }
     },
 
     // Reads and merges every recurring cmn_schedule_span row for one schedule into a
@@ -462,7 +502,7 @@ PagerDutySync.prototype = {
     // i.e. every coverage window in this whole file would have silently computed as
     // "none," and every group would have misclassified as needs_review. See
     // _parseScheduleDateTime(), used below to normalize before either API touches it.
-    _computeCoverageWindow: function(scheduleSysId, rotaLabel, asOf) {
+    _computeCoverageWindow: function(scheduleSysId, rotaLabel, asOf, state) {
         var spanGr = new GlideRecord('cmn_schedule_span');
         spanGr.addQuery('schedule', scheduleSysId);
         // 'weekdays' is a distinct real repeat_type value from 'daily' (confirmed
@@ -516,6 +556,7 @@ PagerDutySync.prototype = {
                     gs.info('"' + rotaLabel + '": span ' + spanGr.getUniqueValue() + '\'s repeat_until (' +
                         this._normalizeRosterDate(repeatUntilRaw) + ') is in the past; excluding it from this ' +
                         'rota\'s coverage window computation');
+                    if (state) state.expiredSpans++;
                     continue;
                 }
             }
@@ -1236,11 +1277,11 @@ PagerDutySync.prototype = {
     // failing that, FIXED_FALLBACK_ANCHOR_ISO. Never falls back to "now" -- see
     // that constant's comment for why.
     _rotationPhaseAnchorIso: function(rosterRow, tzName, fallbackAnchorUtcIso) {
-        if (!this._isBlankRosterValue(rosterRow.rotation_start_date) && !this._isBlankRosterValue(rosterRow.rotation_start_time)) {
-            return this._localizedIso(rosterRow.rotation_start_date, rosterRow.rotation_start_time, tzName);
+        if (this._hasRotationStart(rosterRow)) {
+            return this._localizedIso(rosterRow.rotation_start_date, this._rotationStartTime(rosterRow), tzName);
         }
         gs.warn('PagerDutySync: roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no ' +
-            'rotation_start_date/rotation_start_time; using a fallback anchor for its rotation phase instead ' +
+            'rotation_start_date; using a fallback anchor for its rotation phase instead ' +
             '-- which member appears "current" here is not derived from real ServiceNow data');
         return fallbackAnchorUtcIso || this.FIXED_FALLBACK_ANCHOR_ISO;
     },
@@ -1284,9 +1325,7 @@ PagerDutySync.prototype = {
     // behavior rather than guessing.
     _rotationMemberOffset: function(rosterRow, window, tzName, shiftsPerMember, memberCount) {
         if (memberCount <= 1) return 0; // nothing to rotate
-        if (this._isBlankRosterValue(rosterRow.rotation_start_date) || this._isBlankRosterValue(rosterRow.rotation_start_time)) {
-            return 0;
-        }
+        if (!this._hasRotationStart(rosterRow)) return 0;
         var anchorLocalDate = this._localDateForUtcAnchor(window.anchorUtcIso, tzName);
         if (!anchorLocalDate) return 0;
 
@@ -1406,14 +1445,34 @@ PagerDutySync.prototype = {
         return rotated;
     },
 
-    // Confirmed live on real data: a blank cmn_rota_roster.rotation_start_date/
-    // rotation_start_time doesn't always mean an empty string -- ServiceNow's own
-    // "unset" sentinel for these fields is all zeros ("00000000"/"000000"), which
-    // is truthy and would otherwise slip past a plain `if (value)` check straight
-    // into _localizedIso, producing the same kind of invalid-date garbage a truly
-    // blank value did before that fallback existed (0000-00-00 isn't a real date).
+    // Confirmed live on real data: a blank cmn_rota_roster.rotation_start_date
+    // doesn't always mean an empty string -- ServiceNow's own "unset" sentinel is
+    // all zeros ("00000000"), which is truthy and would otherwise slip past a
+    // plain `if (value)` check straight into _localizedIso, producing the same
+    // kind of invalid-date garbage a truly blank value did before that fallback
+    // existed (0000-00-00 isn't a real date).
+    //
+    // That all-zeros logic is only sound for a DATE. It was originally applied to
+    // rotation_start_time too, which is wrong: "000000" is a perfectly real time
+    // (midnight), and all-day rotations (rotation_all_day=true) routinely store
+    // exactly that. Treating it as unset made every such roster look like it had
+    // no rotation start at all -- confirmed live against a customer's SQLDBA
+    // APAC-1 Primary (real rotation_start_date 2026-05-04, time 000000), which
+    // silently skipped phase alignment and came out exactly one shift-block off
+    // (PagerDuty had its 8-person cycle starting Oct 12, ServiceNow Oct 19); 14
+    // rosters in that customer's export had the same shape. So: whether a roster
+    // has a rotation start is decided by its DATE alone (_hasRotationStart), and
+    // a blank/zero time on a real date just means midnight (_rotationStartTime).
     _isBlankRosterValue: function(raw) {
         return !raw || /^0+$/.test(raw);
+    },
+
+    _hasRotationStart: function(rosterRow) {
+        return !this._isBlankRosterValue(rosterRow.rotation_start_date);
+    },
+
+    _rotationStartTime: function(rosterRow) {
+        return rosterRow.rotation_start_time || '000000';
     },
 
     _normalizeRosterDate: function(raw) {
@@ -1583,7 +1642,10 @@ PagerDutySync.prototype = {
     // and is only used for escalation_policies lookups in this file; schedules use
     // _findScheduleV3ByName below instead, since v3's list endpoint has a different
     // response shape (see that function's comment).
-    _findByName: function(endpoint, name) {
+    // alternateNames (optional): fallbacks checked in the same single pass over the
+    // list (it's a full re-page of PagerDuty per call, so a second lookup would
+    // double the cost) -- only used when nothing matches `name` itself.
+    _findByName: function(endpoint, name, alternateNames) {
         var rest = new x_pd_integration.PagerDuty_REST();
         // Does NOT use ?query= -- confirmed live for the v3 schedules endpoint
         // (see _findScheduleV3ByName) that PagerDuty's ?query= parameter silently
@@ -1610,7 +1672,23 @@ PagerDutySync.prototype = {
             gs.warn('found ' + matches.length + ' existing ' + endpoint + ' named "' + name + '"; using the first (' +
                 matches[0].id + ') and leaving the others as-is');
         }
-        return matches.length ? matches[0] : null;
+        if (matches.length) {
+            for (var a0 = 0; alternateNames && a0 < alternateNames.length; a0++) {
+                for (var f0 = 0; f0 < found.length; f0++) {
+                    if (found[f0].name === alternateNames[a0]) {
+                        gs.info('note: ' + endpoint + ' "' + alternateNames[a0] + '" (' + found[f0].id + ') also exists alongside "' +
+                            name + '" (' + matches[0].id + ') and is being left untouched -- it looks like a stale duplicate');
+                    }
+                }
+            }
+            return matches[0];
+        }
+        for (var a = 0; alternateNames && a < alternateNames.length; a++) {
+            for (var f = 0; f < found.length; f++) {
+                if (found[f].name === alternateNames[a]) return found[f];
+            }
+        }
+        return null;
     },
 
     // PagerDuty_REST.getAllItemsThrowable() resolves the response's array key from
@@ -1879,7 +1957,15 @@ PagerDutySync.prototype = {
     // schedule_reference), which callers set when they build a rule's targets.
     _upsertEscalationPolicy: function(payload, dryRun, collected) {
         var name = payload.escalation_policy.name;
-        var existing = this._findByName('escalation_policies', name);
+        // Policies created before the suffix was dropped are named "<name> (NEEDS
+        // REVIEW)". Adopt (and, via the PUT below, rename) one of those rather than
+        // creating a duplicate -- but only when no policy already has the plain
+        // name, which always wins (see _findByName).
+        var legacyName = name + ' (NEEDS REVIEW)';
+        var existing = this._findByName('escalation_policies', name, [legacyName]);
+        if (existing && existing.name === legacyName) {
+            gs.info('adopting existing policy "' + legacyName + '" (' + existing.id + ') as "' + name + '" -- renaming it in place');
+        }
         var action = existing ? 'update' : 'create';
         collected.escalation_policies.push({action: action, id: existing ? existing.id : null, payload: payload});
 
@@ -2191,8 +2277,17 @@ PagerDutySync.prototype = {
         var epPayload = {
             escalation_policy: {
                 type: 'escalation_policy',
-                name: this._syncedName(groupName + ' (NEEDS REVIEW)'),
-                description: this.SYNCED_DESCRIPTION,
+                // Same name as the follow_the_sun/single_region paths give this group's
+                // policy -- the "needs review" flag lives in the description, NOT the
+                // name. It used to be a name suffix, which meant any change to a group's
+                // classification (confirmed live: a rota's coverage window disappearing
+                // flipped a group follow_the_sun -> needs_review) changed the policy's
+                // identity, so _findByName found nothing and a second, duplicate policy
+                // (plus a differently-named schedule set) was created alongside the
+                // original instead of updating it.
+                name: this._syncedName(groupName),
+                description: this.SYNCED_DESCRIPTION + ' NEEDS REVIEW: this group did not fit a clean follow-the-sun ' +
+                    'shape (see PagerDutySync log for the reason), so this policy is a best-effort approximation.',
                 num_loops: this.NUM_LOOPS,
                 escalation_rules: rules
             }

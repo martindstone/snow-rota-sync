@@ -16,8 +16,8 @@ on an instance that already has that app installed and configured.
 | `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
 | `business_rule_sync_on_change.js` | Business Rule | System Definition > Business Rules, on `cmn_rota`. **Ships inactive.** |
-| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.py` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
-| `export_oncall_config.py` | Standalone script | Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring) and a few more `cmn_rota_roster` fields the UI Action doesn't pull yet. For situations where getting a button pasted into someone's ServiceNow instance isn't an option (no admin access to grant, security review overhead, etc.) but a Python script they can read start-to-finish and run themselves is. Stdlib only, nothing to `pip install`. See its own docstring for usage. |
+| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.txt` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
+| `export_oncall_config.txt` | Standalone script | A Python script saved as `.txt` so mail filters let it through -- rename to `.py` to run it. Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring), the extra `cmn_rota_roster` day-of-week/payload fields, who each span is *for* and what it overrides (`user`/`parent`/`show_as`/`notes`), each rota's `based_on` calendar, and an `other_schedules` sweep of everything else attached to the group's rotas/rosters/members -- where a one-off "Provide coverage" shift or swap would live (PagerDutySync doesn't read any of those yet). Stdlib only, nothing to `pip install`. See its own docstring for usage. |
 
 None of these files are meant to be uploaded/imported directly (there's no Update Set
 here) -- copy each script body into the corresponding record type, using the settings
@@ -55,6 +55,19 @@ app's own auto-provisioned naming (`SN-<group>` / `SN:<group>`) so the two mecha
 can't collide if a group is ever under both. Defined once as
 `SYNCED_NAME_PREFIX`/`SYNCED_DESCRIPTION` in `PagerDutySync.initialize()`.
 
+A group's escalation policy has **one stable name whatever the group's
+classification is**. A `needs_review` group used to get a `... (NEEDS REVIEW)` name
+suffix, so any classification change (e.g. a rota losing its coverage window) changed
+the policy's identity and a second, duplicate policy was created instead of updating
+the first. The flag now lives in the policy's *description* ("NEEDS REVIEW: ...").
+Policies created under the old suffixed name are adopted and renamed in place on the
+next sync (`_upsertEscalationPolicy` -> `_findByName(..., alternateNames)`); if both
+the plain and the suffixed name already exist, the plain one is updated, the other is
+left alone, and the log says it looks like a stale duplicate. **Schedules are not yet
+covered by this:** follow_the_sun names them by role (`<group> - Primary`), best-effort
+by level (`<group> - level 100`), so a classification flip still forks a second set of
+schedules -- it just no longer forks the policy or (for expired rotas) happens at all.
+
 ## Rotation phase alignment
 
 `cmn_rota_roster.rotation_start_date`/`rotation_start_time` is sent to PagerDuty as
@@ -88,14 +101,30 @@ Validated two ways before deploying: isolated unit tests against known values
 caught a second bug in an earlier version of the local-date resolution), and an
 exhaustive check against a real 8-group/68-roster customer export, using each
 member's own `rotation_schedule` (ServiceNow's own system-generated per-member
-on-call computation -- see `export_oncall_config.py`'s docstring) as independent
-ground truth: 0 regressions, 7 confirmed real fixes (only 2 of which had been
-reported; the other 5 were latent). The remaining unrotated cases in that export
+on-call computation -- see `export_oncall_config.txt`'s docstring) as independent
+ground truth: 0 regressions, 15 confirmed real fixes (only 2 of which had been
+reported; the rest were latent). The remaining unrotated cases in that export
 were all accounted for, not just unverified -- 17 resolved to the
 `_buildAlternatingEvent` path (confirmed via matching coverage-window shapes at
 the same order value, which is exactly what that function's own pairing detection
 looks for) and 1 to an already-diagnosed unrelated data issue (a blank
 `cmn_rota_member.member` reference).
+
+**Only the DATE decides whether a roster has a rotation start.** `000000` is a
+real time (midnight) -- all-day rotations store exactly that -- so a real
+`rotation_start_date` with a `000000` time is used as-is (`_hasRotationStart`,
+`_rotationStartTime`). An earlier version treated an all-zero *time* as ServiceNow's
+"unset" sentinel too, which silently skipped alignment for every such roster; a
+customer's SQLDBA APAC-1 Primary (8 members, real start date, midnight time) came
+out exactly one shift-block off because of it -- 14 rosters in that export had the
+same shape, and correcting it took the confirmed-fix count from 7 to 15. Only an
+all-zero *date* means unset.
+
+**Not covered: the handoff weekday.** Rotating the array changes who is first, not
+which weekday a handoff lands on -- that comes from the coverage window's anchor
+weekday. ServiceNow's `rotation_start_dow`/`dow_for_rotate` ("rotate on Monday")
+are still never read, so a roster whose rotation was moved to a different weekday
+(e.g. Wednesday to Monday) still hands off on the old one in PagerDuty.
 
 ## Architecture notes
 
@@ -202,21 +231,22 @@ span). A genuinely longer intentional window -- a long-weekend block spanning mo
 than 3 days, say -- would hit this same silent-discard-to-24/7 failure mode again.
 
 **`repeat_until`**: a real `cmn_schedule_span` field (compact `YYYYMMDD`,
-`'00000000'` sentinel for "no end date") that's now read -- a span whose
-`repeat_until` has already passed is excluded from that rota's coverage-window
-computation. This was a genuine gap: someone ending a rotation by setting
-`repeat_until` in the past (rather than deactivating the rota/roster, which stays
-`active=true`) had that pattern read as an ongoing, currently-valid recurrence
-forever, with nothing in the sync log to explain why an ended rotation kept
-showing up. **Known consequence, chosen deliberately over the alternative**: if
-that expired span was a rota's *only* span, `_computeCoverageWindow` returns
-`null` for it the same way it does for any rota with no usable window today --
-which currently means `_defaultAlwaysOnWindow`'s 24/7-every-day fallback kicks
-in, not "no coverage." So an expired single-span rota doesn't disappear from the
-sync, it becomes an always-on rotation instead. Confirmed live and logged
-clearly (`"<rota>": span <sys_id>'s repeat_until (<date>) is in the past;
-excluding it...`) either way, so this is visible rather than a second silent
-surprise layered on top of the first one it fixes.
+`'00000000'` sentinel for "no end date"). Someone ending a rotation by setting it
+in the past (rather than deactivating the rota/roster, which stays `active=true`)
+used to have that pattern read as an ongoing recurrence forever. A span whose
+`repeat_until` has passed is now excluded, and **a rota whose usable recurring
+spans have all expired is dropped from the sync entirely** (`_dropExpiredRotas`,
+logged as `skipping rota "<name>": every recurring span ... has a repeat_until in
+the past`) -- it is deliberately *not* treated like a rota with no window
+configured. The first version of this fix did fall through to
+`_defaultAlwaysOnWindow`'s 24/7 default, and a customer's real data showed why
+that's wrong: the ended regions kept paging around the clock, *and* a missing
+window flips the whole group to `needs_review` (`_classifyGroup`), which used to
+rename its escalation policy and schedules and fork a duplicate set in PagerDuty.
+Any PagerDuty rotation an expired rota left on a schedule found by name is removed
+by `_upsertScheduleV3`'s "no longer produced by this sync" cleanup. If every rota
+in a group has expired, the group is left untouched that run (logged as a warning)
+rather than pushing an empty policy.
 
 ## Custom escalation
 
