@@ -96,6 +96,10 @@ that function already anchors purely to the shared coverage window on purpose,
 since there's no single side's `rotation_start_date` that would be the "right" one
 to pick for a merged pair.
 
+This offset-from-`rotation_start_date` math is now only a *fallback* -- see
+"Ground-truth on-call lookup" below for what runs first and why the date-math
+estimate alone isn't safe once a roster's membership has ever changed.
+
 Validated two ways before deploying: isolated unit tests against known values
 (including the exact case that first surfaced this, and a DST-crossing case that
 caught a second bug in an earlier version of the local-date resolution), and an
@@ -119,6 +123,74 @@ customer's SQLDBA APAC-1 Primary (8 members, real start date, midnight time) cam
 out exactly one shift-block off because of it -- 14 rosters in that export had the
 same shape, and correcting it took the confirmed-fix count from 7 to 15. Only an
 all-zero *date* means unset.
+
+### Ground-truth on-call lookup
+
+The array-rotation approach above (`_rotationMemberOffset`/the date-math branches
+in `_rotationAlignment`) estimates who's first by recomputing occurrence-count
+from `rotation_start_date` using the roster's *current* member count and order
+values -- implicitly assuming that count has never changed. **It isn't a safe
+assumption.** Reported live by a customer: after adding a member to Major
+Incident's NA/EMEA Primary rosters and resyncing, the new member showed up in
+PagerDuty "in a different order" than ServiceNow.
+
+Read ServiceNow's actual on-call engine to understand why
+(`OnCallRosterSNC.getActiveMembersOrdered`, fired synchronously by a business
+rule -- `Update Rotation Schedules (Member)`/`(Roster)` -- whenever roster
+membership changes): it does **not** recompute the whole rotation's history when
+a member is added or removed. It finds whoever was on call the day before, then
+continues the round-robin from there -- the next member is whichever remaining
+member has the next-higher `order` value, wrapping around. Nothing before the
+edit is touched. That's a fundamentally different algorithm from "occurrence-count
+mod current N," and the two only coincide when the roster's member count has been
+constant since `rotation_start_date` -- which a real "someone joined/left" edit
+is, by definition, exactly the case where it hasn't.
+
+Confirmed live on a PDI both ways: adding a 3rd member to a static 2-member
+weekly roster (Hardware US Primary, unchanged since 2018) happened to coincide
+with what the date-math estimate would have predicted (a coincidence of that
+roster's specific parity, not a general guarantee) -- and, separately, a unit
+test that deliberately forces the two to disagree, plus a full live rerun of the
+same 3rd-member experiment through the real deployed sync, confirmed the fix
+reproduces ServiceNow's actual answer (`David` through Sep 27, `Fred` Sep
+28-Oct 4, `Beth` Oct 5-11, `David` again from Oct 12) rather than the old
+estimate.
+
+**The fix**: before falling back to date-math, `_rotationAlignment` asks
+ServiceNow directly. `_groundTruthMemberIndex` checks each active member's own
+`cmn_rota_member.rotation_schedule` (the same live, system-computed schedule
+already used as this file's own validation ground truth, and by ServiceNow's own
+resolver -- `OnCallRotationSNC._checkForOverrideMemberByRoster` evaluates the
+same table the same way) via `GlideSchedule.isInSchedule`, to find who
+ServiceNow really has on call *right now* (`asOf`, the sync's own run time --
+see below for why not `rotation_start_date`). `_offsetForGroundTruth` then
+back-solves the array rotation that reproduces that member in the matching
+PagerDuty slot. As a side effect this also correctly skips a member who's
+currently on their own time off (ServiceNow's schedule generation already
+routes their turn to the next member for that span -- see
+`_createMemberRotationSchedules`'s excluded-span patching), which plain
+order/date math has no way to know about either.
+
+**Why `asOf` ("now"), not `rotation_start_date`:** after a membership change,
+ServiceNow caps the *old* segment's `repeat_until` at the date of the edit and
+starts a new, open-ended segment from there -- so a historical anchor date can
+fall inside a since-capped segment that no longer evaluates as "on call" at
+all, while "now" is always inside whichever segment is currently open.
+
+**Falls back** to the pre-existing date-math estimate only when no active
+member has an evaluable `rotation_schedule` (a brand-new roster ServiceNow
+hasn't computed a schedule for yet, or the `GlideSchedule` lookup errors) --
+logged, not silent. When ground truth *is* found but disagrees with what the
+date-math estimate would have said, that disagreement is logged too (a useful
+signal that a roster's membership has changed since `rotation_start_date`).
+
+**Scope**: only the plain one-roster-per-event path (`_buildEvent`, used by
+every classification shape for an ordinary roster). Deliberately not applied to
+`_buildAlternatingEvent` or `_buildEveryMemberEvent` -- both already build their
+member order from something other than a single roster's own rotation math (see
+above for why `_buildAlternatingEvent` doesn't use `rotation_start_date` at
+all), so there's no single roster's `rotation_schedule` that would be the right
+ground truth to check.
 
 ### Handoff weekday (`dow_for_rotate`)
 
@@ -361,3 +433,8 @@ checkbox is on.
   `[`/`]`** (every name this port creates has brackets, per the naming convention
   above) -- `_findByName`/`_findScheduleV3ByName` don't use it; they page through
   the full list and rely on an exact client-side match instead.
+- **Ground-truth on-call lookup adds one `GlideSchedule` evaluation per active
+  member per roster per sync** (see "Ground-truth on-call lookup" above) -- not
+  expected to be significant next to the PagerDuty API calls a sync already
+  makes, but not separately measured against a large roster (e.g. Americas'
+  14-member Primary/Secondary) either.

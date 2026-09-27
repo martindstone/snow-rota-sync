@@ -329,7 +329,11 @@ PagerDutySync.prototype = {
                 order: memberGr.getValue('order'),
                 from: memberGr.getValue('from'),
                 to: memberGr.getValue('to'),
-                member_email: memberGr.member.email ? memberGr.member.email.toString() : ''
+                member_email: memberGr.member.email ? memberGr.member.email.toString() : '',
+                // ServiceNow's own live-computed "who holds this member's turn and
+                // when" schedule -- see _groundTruthMemberIndex, which is the real
+                // fix for rotation phase/order, not this field's mere presence.
+                rotation_schedule: memberGr.getValue('rotation_schedule') || ''
             };
             membersByRosterSysId[rosterSysId] = membersByRosterSysId[rosterSysId] || [];
             membersByRosterSysId[rosterSysId].push(memberRow);
@@ -1067,7 +1071,7 @@ PagerDutySync.prototype = {
         }
 
         var shiftsPerMember = this._shiftsPerMember(window, intervalType, intervalCount);
-        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType);
+        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType, active, asOf);
         var rotationOffset = alignment.offset;
         var eventAnchorUtcIso = alignment.anchorUtcIso;
         if (eventAnchorUtcIso !== window.anchorUtcIso) {
@@ -1075,7 +1079,11 @@ PagerDutySync.prototype = {
                 ' to ' + eventAnchorUtcIso + ' so its handoffs land on the roster\'s rotate-on weekday (dow_for_rotate / ' +
                 'rotation_start_date) instead of the coverage window\'s anchor weekday');
         }
-        if (rotationOffset) {
+        if (rotationOffset && alignment.groundTruth) {
+            gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
+                rotationOffset + '/' + members.length + ' to match who ServiceNow\'s own rotation_schedule has on ' +
+                'call right now (ground truth -- see _groundTruthMemberIndex)');
+        } else if (rotationOffset) {
             gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
                 rotationOffset + '/' + members.length + ' to align with rotation_start_date (' +
                 rosterRow.rotation_start_date + ') -- its coverage window\'s own anchor date disagrees with ' +
@@ -1363,34 +1371,151 @@ PagerDutySync.prototype = {
     // _rotationMemberOffset unchanged: none of the real data needing this used
     // either, and a BYDAY window's handoff may land on an uncovered weekday.
     // Returns {offset, anchorUtcIso}; anchorUtcIso is the window's own unless moved.
-    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType) {
+    // rosterRow/window/tzName/shiftsPerMember/memberCount/intervalType are as
+    // before; `active` (the roster's currently-active member rows, in the same
+    // order the caller's members array is built from) and `asOf` (the sync's
+    // "now") are new -- both optional, but omitting them just means this can
+    // only ever fall back to the date-math estimate below, never the real fix.
+    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType, active, asOf) {
         var unchanged = {offset: 0, anchorUtcIso: window.anchorUtcIso};
         if (memberCount <= 1 || !this._hasRotationStart(rosterRow)) return unchanged;
-        if (intervalType !== 'weekly' || !this._daysAreEveryDay(window.days)) {
-            return {offset: this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, memberCount),
-                    anchorUtcIso: window.anchorUtcIso};
+
+        // Step 1: where the event's start_time actually lands (and so which
+        // weekday its handoffs fall on) -- unaffected by anything below, since
+        // that's governed by start_time's weekday, not by which array slot holds
+        // which member. Unchanged from before this ground-truth work.
+        var anchorUtcIso = window.anchorUtcIso;
+        var dateMathOffset;
+        if (intervalType === 'weekly' && this._daysAreEveryDay(window.days)) {
+            var anchorLocalDate = this._localDateForUtcAnchor(window.anchorUtcIso, tzName);
+            if (!anchorLocalDate) return unchanged;
+
+            var rotationDate = this._normalizeRosterDate(rosterRow.rotation_start_date);
+            var rotationWeekday = this._weekdayOfDateStr(rotationDate);
+            var dow = parseInt(rosterRow.dow_for_rotate, 10);
+            if (isNaN(dow) || dow < 1 || dow > 7) dow = rotationWeekday;
+            var gridDate = this._shiftDateStr(rotationDate, -(((rotationWeekday - dow) % 7 + 7) % 7));
+
+            var blockDays = shiftsPerMember; // every-day window: one occurrence per day
+            var daysToGrid = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', gridDate + ' 00:00:00') / 86400);
+            var gridBlocks = daysToGrid > 0 ? Math.ceil(daysToGrid / blockDays) : 0;
+            var alignedDate = this._shiftDateStr(gridDate, -gridBlocks * blockDays);
+            var shiftDays = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', alignedDate + ' 00:00:00') / 86400);
+
+            anchorUtcIso = shiftDays === 0 ? window.anchorUtcIso : this._shiftAnchorLocalDays(window.anchorUtcIso, anchorLocalDate, tzName, shiftDays);
+            dateMathOffset = ((-gridBlocks % memberCount) + memberCount) % memberCount;
+        } else {
+            dateMathOffset = this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, memberCount);
         }
-        var anchorLocalDate = this._localDateForUtcAnchor(window.anchorUtcIso, tzName);
-        if (!anchorLocalDate) return unchanged;
 
-        var rotationDate = this._normalizeRosterDate(rosterRow.rotation_start_date);
-        var rotationWeekday = this._weekdayOfDateStr(rotationDate);
-        var dow = parseInt(rosterRow.dow_for_rotate, 10);
-        if (isNaN(dow) || dow < 1 || dow > 7) dow = rotationWeekday;
-        var gridDate = this._shiftDateStr(rotationDate, -(((rotationWeekday - dow) % 7 + 7) % 7));
+        // Step 2: WHO goes in which slot. Ask ServiceNow's own live
+        // rotation_schedule who it really has on call `asOf`, and back-solve the
+        // array rotation that reproduces that -- see _groundTruthMemberIndex for
+        // why date-math (Step 1's dateMathOffset, or _rotationMemberOffset) can't
+        // be trusted for this on its own: it implicitly assumes the member COUNT
+        // has been constant since rotation_start_date, which a real "someone
+        // joined/left the rotation" edit breaks. Falls back to the date-math
+        // estimate only when no member has a live schedule to check (e.g. a
+        // brand new roster ServiceNow hasn't computed yet, or the lookup fails).
+        if (active && asOf) {
+            var groundTruthIndex = this._groundTruthMemberIndex(active, tzName, asOf);
+            if (groundTruthIndex >= 0) {
+                var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, asOf, groundTruthIndex);
+                if (groundTruthOffset !== null) {
+                    if (groundTruthOffset !== dateMathOffset) {
+                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name + ') disagrees with the rotation_start_date ' +
+                            'estimate (offset ' + groundTruthOffset + ' vs ' + dateMathOffset + ') -- likely roster membership has ' +
+                            'changed since rotation_start_date; using the ground-truth value');
+                    }
+                    return {offset: groundTruthOffset, anchorUtcIso: anchorUtcIso, groundTruth: true};
+                }
+            }
+        }
+        return {offset: dateMathOffset, anchorUtcIso: anchorUtcIso, groundTruth: false};
+    },
 
-        var blockDays = shiftsPerMember; // every-day window: one occurrence per day
-        var daysToGrid = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', gridDate + ' 00:00:00') / 86400);
-        var blocks = daysToGrid > 0 ? Math.ceil(daysToGrid / blockDays) : 0;
-        var alignedDate = this._shiftDateStr(gridDate, -blocks * blockDays);
-        var shiftDays = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', alignedDate + ' 00:00:00') / 86400);
+    // Finds which member in `active` ServiceNow's own on-call engine actually
+    // has active at `asOf`, by evaluating each member's own
+    // cmn_rota_member.rotation_schedule -- a GlideSchedule ServiceNow itself
+    // keeps live-accurate via a business rule (see OnCallRosterSNC.
+    // getActiveMembersOrdered / computeRotationSchedules) every time roster
+    // membership changes.
+    //
+    // This exists because that real algorithm is NOT equivalent to recomputing
+    // occurrence-count from rotation_start_date with the CURRENT member count
+    // (what _rotationMemberOffset/the date-math branch above do). Confirmed
+    // live on a PDI: adding a 3rd member to a 2-member weekly roster did not
+    // retroactively reapply "mod 3" to the whole history back to
+    // rotation_start_date -- ServiceNow preserved whoever was already on call
+    // and inserted the new member as "next in order" from that point forward
+    // (OnCallRosterSNC.getActiveMembersOrdered: finds who held the PREVIOUS
+    // period, then continues the round-robin starting after their `order`,
+    // wrapping). Pure date-math coincidentally reproduces this only when the
+    // roster's member count has never changed since rotation_start_date, or the
+    // new member happens to land where continuity would have put them anyway
+    // (confirmed BOTH ways live: matched for Hardware's own test roster,
+    // reported as wrong by a real customer for Major Incident's NA/EMEA Primary
+    // rosters after they added a member) -- there's no way to tell which case
+    // you're in from the roster's current fields alone, so this reads
+    // ServiceNow's own answer directly instead of guessing.
+    //
+    // Reuses the pattern OnCallRotationSNC._checkForOverrideMemberByRoster
+    // already uses for the same table (GlideSchedule.isInSchedule), not a new
+    // evaluation method -- and, as a side effect, this also correctly skips a
+    // member whose OWN time-off/exclude spans make them not really on call
+    // right now (ServiceNow's schedule generation already routes their turn to
+    // the next member for that window -- see _createMemberRotationSchedules'
+    // excluded-span patching), which pure order/date math has no way to know
+    // about either.
+    //
+    // Returns the index into `active`, or -1 if no member's schedule covers
+    // `asOf` (a roster with no live schedule yet, e.g. brand new, or every
+    // lookup failed) -- callers fall back to date-math in that case.
+    _groundTruthMemberIndex: function(active, tzName, asOf) {
+        for (var i = 0; i < active.length; i++) {
+            var scheduleSysId = active[i].rotation_schedule;
+            if (!scheduleSysId) continue;
+            try {
+                var sched = new GlideSchedule(scheduleSysId);
+                sched.setTimeZone(tzName);
+                if (sched.isValid() && sched.isInSchedule(asOf)) return i;
+            } catch (e) {
+                gs.warn('PagerDutySync: could not evaluate rotation_schedule ' + scheduleSysId +
+                    ' for ground-truth on-call lookup: ' + e);
+            }
+        }
+        return -1;
+    },
 
-        return {
-            offset: ((-blocks % memberCount) + memberCount) % memberCount,
-            anchorUtcIso: shiftDays === 0
-                ? window.anchorUtcIso
-                : this._shiftAnchorLocalDays(window.anchorUtcIso, anchorLocalDate, tzName, shiftDays)
-        };
+    // Given that active[groundTruthIndex] is confirmed (via
+    // _groundTruthMemberIndex) to be who ServiceNow really has on call at
+    // `asOf`, solves for the array rotation that puts them in the matching
+    // PagerDuty slot: PagerDuty selects rotated[blocksToNow mod N] as current at
+    // `asOf` (rotated[k] = members[(k+offset) mod N] per _rotateForPhase, same
+    // convention _rotationMemberOffset documents) -- for that to equal
+    // members[groundTruthIndex], offset = (groundTruthIndex - blocksToNow) mod N.
+    // blocksToNow is computed the same way _rotationMemberOffset always has
+    // (occurrence-count from the event's own anchor to the target date, divided
+    // by shiftsPerMember) -- just anchored to `asOf` (guaranteed to fall inside
+    // ServiceNow's currently-open rotation pattern) instead of
+    // rotation_start_date (which, after a membership change, may now fall
+    // inside an old, since-capped segment of that pattern -- see
+    // _groundTruthMemberIndex -- and so is no longer safe to use as the
+    // ground-truth check instant, only as the date-math fallback's estimate).
+    // Returns null (never 0) if either date can't be resolved, so callers can
+    // tell "couldn't compute" from "computed, offset happens to be 0".
+    _offsetForGroundTruth: function(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, asOf, groundTruthIndex) {
+        var anchorLocalDate = this._localDateForUtcAnchor(anchorUtcIso, tzName);
+        var asOfUtcIso = asOf.getValue().replace(' ', 'T') + 'Z';
+        var asOfLocalDate = this._localDateForUtcAnchor(asOfUtcIso, tzName);
+        if (!anchorLocalDate || !asOfLocalDate) return null;
+
+        var elapsedDays = Math.round(this._dateDiffSeconds(anchorLocalDate + ' 00:00:00', asOfLocalDate + ' 00:00:00') / 86400);
+        var anchorWeekday = this._weekdayOfDateStr(anchorLocalDate);
+        var occurrenceIndex = this._countCoveredDaysBetween(window.days, anchorWeekday, elapsedDays);
+        var blocksToNow = Math.floor(occurrenceIndex / shiftsPerMember);
+
+        return (((groundTruthIndex - blocksToNow) % memberCount) + memberCount) % memberCount;
     },
 
     // Moves an anchor instant by whole LOCAL calendar days, keeping its local
@@ -2059,6 +2184,10 @@ PagerDutySync.prototype = {
                 '); coverage shifts will not be synced this run');
             return {};
         }
+        var loadedRosters = 0, loadedSpans = 0;
+        for (var lr in byRoster) { if (byRoster.hasOwnProperty(lr)) { loadedRosters++; loadedSpans += byRoster[lr].length; } }
+        gs.info('PagerDutySync: "' + groupName + '": ' + loadedSpans + ' current/future one-off coverage span(s) on ' + loadedRosters +
+            ' roster(s) will be synced as PagerDuty overrides');
         if (groupWideCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + groupWideCount + ' current/future coverage span(s) ' +
             'with no roster (group-wide); not synced to PagerDuty');
         if (repeatingCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + repeatingCount + ' current/future REPEATING coverage ' +
