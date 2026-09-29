@@ -284,7 +284,13 @@ PagerDutySync.prototype = {
                 catch_all_wait_time: rotaGr.getValue('catch_all_wait_time') || '',
                 catch_all_member_email: rotaGr.catch_all_member.email ? rotaGr.catch_all_member.email.toString() : '',
                 use_custom_escalation: rotaGr.getValue('use_custom_escalation') === 'true',
-                group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : ''
+                group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : '',
+                // Which on-call engine this rota is on -- see _groundTruthMemberIndex's
+                // "NEW ENGINE" branch for why this matters: '2024_schedule_engine' rotas
+                // never populate cmn_rota_member.rotation_schedule at all (confirmed
+                // against a real customer instance), so ground truth for those has to
+                // come from cmn_rota_roster.rotation_payload instead.
+                schedule_engine: rotaGr.getValue('schedule_engine') || ''
             };
         }
 
@@ -310,7 +316,11 @@ PagerDutySync.prototype = {
                 // "use the weekday of rotation_start_date".
                 dow_for_rotate: rosterGr.getValue('dow_for_rotate') || '',
                 rotation_start_time: rosterGr.getValue('rotation_start_time'),
-                rota_sys_id: rotaSysId
+                rota_sys_id: rotaSysId,
+                // The 2024 schedule engine's own ground truth -- see rotaRow.schedule_engine
+                // and _groundTruthMemberIndex. A JSON blob keyed by cmn_rota_member sys_id,
+                // blank on old-engine rotas.
+                rotation_payload: rosterGr.getValue('rotation_payload') || ''
             };
             rosterBySysId[rosterRow.sys_id] = rosterRow;
             rosterByRotaSysId[rotaSysId] = rosterByRotaSysId[rotaSysId] || [];
@@ -1071,7 +1081,7 @@ PagerDutySync.prototype = {
         }
 
         var shiftsPerMember = this._shiftsPerMember(window, intervalType, intervalCount);
-        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType, active, asOf);
+        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType, active, asOf, rotaRow.schedule_engine);
         var rotationOffset = alignment.offset;
         var eventAnchorUtcIso = alignment.anchorUtcIso;
         if (eventAnchorUtcIso !== window.anchorUtcIso) {
@@ -1376,7 +1386,7 @@ PagerDutySync.prototype = {
     // order the caller's members array is built from) and `asOf` (the sync's
     // "now") are new -- both optional, but omitting them just means this can
     // only ever fall back to the date-math estimate below, never the real fix.
-    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType, active, asOf) {
+    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType, active, asOf, scheduleEngine) {
         var unchanged = {offset: 0, anchorUtcIso: window.anchorUtcIso};
         if (memberCount <= 1 || !this._hasRotationStart(rosterRow)) return unchanged;
 
@@ -1418,14 +1428,21 @@ PagerDutySync.prototype = {
         // estimate only when no member has a live schedule to check (e.g. a
         // brand new roster ServiceNow hasn't computed yet, or the lookup fails).
         if (active && asOf) {
-            var groundTruthIndex = this._groundTruthMemberIndex(active, tzName, asOf);
+            // 2024_schedule_engine rotas never populate cmn_rota_member.rotation_schedule
+            // at all (confirmed against a real customer instance) -- their ground truth
+            // lives in cmn_rota_roster.rotation_payload instead. See
+            // _groundTruthMemberIndexNewEngine for that format.
+            var isNewEngine = scheduleEngine === '2024_schedule_engine';
+            var groundTruthIndex = isNewEngine
+                ? this._groundTruthMemberIndexNewEngine(active, rosterRow.rotation_payload, asOf, window, shiftsPerMember, tzName)
+                : this._groundTruthMemberIndex(active, tzName, asOf);
             if (groundTruthIndex >= 0) {
                 var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, asOf, groundTruthIndex);
                 if (groundTruthOffset !== null) {
                     if (groundTruthOffset !== dateMathOffset) {
-                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name + ') disagrees with the rotation_start_date ' +
-                            'estimate (offset ' + groundTruthOffset + ' vs ' + dateMathOffset + ') -- likely roster membership has ' +
-                            'changed since rotation_start_date; using the ground-truth value');
+                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name + ', ' + (isNewEngine ? 'rotation_payload' : 'rotation_schedule') +
+                            ') disagrees with the rotation_start_date estimate (offset ' + groundTruthOffset + ' vs ' + dateMathOffset +
+                            ') -- likely roster membership has changed since rotation_start_date; using the ground-truth value');
                     }
                     return {offset: groundTruthOffset, anchorUtcIso: anchorUtcIso, groundTruth: true};
                 }
@@ -1485,6 +1502,138 @@ PagerDutySync.prototype = {
             }
         }
         return -1;
+    },
+
+    // The 2024 schedule engine's equivalent of _groundTruthMemberIndex, for
+    // rotas where that one can never find anything (schedule_engine ==
+    // '2024_schedule_engine' rotas don't populate cmn_rota_member.
+    // rotation_schedule at all -- confirmed against a real customer instance:
+    // it stayed null across every export, on every roster of a whole group,
+    // even though ServiceNow's own on-call calendar for those rosters clearly
+    // renders a working rotation). That engine's ground truth lives in
+    // cmn_rota_roster.rotation_payload instead -- a JSON blob whose exact
+    // shape was reverse-engineered from a real customer's own live payload
+    // (Major Incident (Global) / NA / Primary), not from ServiceNow's
+    // documentation (there isn't any public documentation of this format):
+    //   { "memberPlans": {
+    //       "member_sys_ids": [<cmn_rota_member sys_id>, ...],
+    //       "plans": [{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"|null,
+    //                  "members_in_order": [<index into member_sys_ids>, ...],
+    //                  "lastOnCallMember": <cmn_rota_member sys_id>}, ...] },
+    //     "memberSpanCache": { "spans": [
+    //       ["YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM:SS", <index into member_sys_ids>], ...
+    //     ] } }
+    // memberSpanCache.spans is a literal, ServiceNow-computed day-by-day
+    // answer covering roughly the next ~10 days from whenever it was last
+    // built -- exact, no interpretation needed, and this always prefers it
+    // when it covers `asOf`.
+    //
+    // Confirmed by decoding a real customer's actual payload against what
+    // they independently reported ServiceNow's calendar showing (NA Primary:
+    // Bruno starting Sep 28, Miguel Oct 5, Eduardo Oct 12) that this engine's
+    // real algorithm, unlike the old engine's (see _groundTruthMemberIndex's
+    // own comment), does NOT let a member's current turn run to its natural
+    // end before inserting a newly-added member -- it hands off to "next by
+    // order" IMMEDIATELY at the moment of the edit, truncating whoever was
+    // mid-turn, and only settles into a clean, full-length round-robin from
+    // the next block boundary onward. That's a genuinely different algorithm
+    // from the old engine's, not a variant of the same one -- which is why
+    // this reads the engine's own answer directly rather than trying to
+    // special-case that difference into the date-math estimate.
+    _groundTruthMemberIndexNewEngine: function(active, rotationPayloadRaw, asOf, window, shiftsPerMember, tzName) {
+        var memberSysId = this._newEngineMemberSysIdAt(rotationPayloadRaw, asOf, window, shiftsPerMember, tzName);
+        if (!memberSysId) return -1;
+        for (var i = 0; i < active.length; i++) {
+            if (active[i].sys_id === memberSysId) return i;
+        }
+        return -1;
+    },
+
+    // Returns the cmn_rota_member sys_id the 2024 engine's rotation_payload
+    // says is on call at `asOf`, or null if that can't be determined (blank/
+    // unparseable payload, or `asOf` falls outside both the cache and any
+    // extrapolatable plan -- callers fall back to date-math in that case,
+    // same as _groundTruthMemberIndex's -1).
+    _newEngineMemberSysIdAt: function(rotationPayloadRaw, asOf, window, shiftsPerMember, tzName) {
+        if (!rotationPayloadRaw) return null;
+        var parsed;
+        try {
+            parsed = JSON.parse(rotationPayloadRaw);
+        } catch (e) {
+            gs.warn('PagerDutySync: could not parse rotation_payload for ground-truth lookup: ' + e);
+            return null;
+        }
+        var memberPlans = parsed.memberPlans;
+        if (!memberPlans || !memberPlans.member_sys_ids || !memberPlans.member_sys_ids.length) return null;
+        var memberSysIds = memberPlans.member_sys_ids;
+        var asOfStr = asOf.getValue();
+
+        var cacheSpans = parsed.memberSpanCache && parsed.memberSpanCache.spans;
+        if (!cacheSpans || !cacheSpans.length) return null;
+
+        // Tier 1: asOf falls inside the cache's own covered window -- exact.
+        for (var c = 0; c < cacheSpans.length; c++) {
+            if (cacheSpans[c][0] <= asOfStr && asOfStr < cacheSpans[c][1]) {
+                return memberSysIds[cacheSpans[c][2]];
+            }
+        }
+
+        // Tier 2: asOf is past the cache's last known instant (this sync is
+        // running later than ServiceNow last rendered/cached this roster's
+        // calendar). Extrapolate forward in whole shift-blocks from that last
+        // instant through whichever plan currently applies -- safe once past
+        // the cache's window, since any transition-period irregularity (see
+        // this function's own header comment) is necessarily over by then and
+        // the rotation is back to a steady, predictable round-robin.
+        var last = cacheSpans[cacheSpans.length - 1];
+        if (last[1] > asOfStr) return null; // asOf falls in an unextrapolatable gap before the cache's end
+        var plan = this._newEnginePlanCovering(memberPlans.plans, asOfStr);
+        if (!plan || !plan.members_in_order || !plan.members_in_order.length) return null;
+        var order = plan.members_in_order;
+        var lastPos = order.indexOf(last[2]);
+        if (lastPos < 0) return null; // whoever the cache last named isn't in the current plan any more
+
+        // Anchor the extrapolation at the START of that final member's block, not
+        // at the single last cached day -- the cache is a per-DAY listing, not a
+        // per-BLOCK one, so its final entry is just "the last day ServiceNow
+        // bothered to cache," which can (as here) land exactly on a block's own
+        // last day. Using that day directly as the floor-division anchor
+        // undercounts by a whole block whenever it does (confirmed against the
+        // customer's own real payload: extrapolating from 2026-10-04, the last
+        // cached day, put Oct 5 still in Bruno's block instead of correctly
+        // starting Miguel's) -- scanning back to where this member's block
+        // actually began fixes it, matching the same floor-from-a-true-
+        // block-start convention _offsetForGroundTruth already relies on.
+        var blockStartIdx = cacheSpans.length - 1;
+        while (blockStartIdx > 0 && cacheSpans[blockStartIdx - 1][2] === last[2]) blockStartIdx--;
+        var blockStart = cacheSpans[blockStartIdx];
+
+        var blockStartUtcIso = blockStart[0].replace(' ', 'T') + 'Z';
+        var blockStartLocalDate = this._localDateForUtcAnchor(blockStartUtcIso, tzName);
+        var asOfUtcIso = asOfStr.replace(' ', 'T') + 'Z';
+        var asOfLocalDate = this._localDateForUtcAnchor(asOfUtcIso, tzName);
+        if (!blockStartLocalDate || !asOfLocalDate) return null;
+
+        var elapsedDays = Math.round(this._dateDiffSeconds(blockStartLocalDate + ' 00:00:00', asOfLocalDate + ' 00:00:00') / 86400);
+        var anchorWeekday = this._weekdayOfDateStr(blockStartLocalDate);
+        var occurrenceIndex = this._countCoveredDaysBetween(window.days, anchorWeekday, elapsedDays);
+        var blocksAhead = Math.floor(occurrenceIndex / shiftsPerMember);
+        var newPos = (((lastPos + blocksAhead) % order.length) + order.length) % order.length;
+        return memberSysIds[order[newPos]];
+    },
+
+    // Finds the plan (in rotation_payload.memberPlans.plans) whose [start, end]
+    // range (dates, 'YYYY-MM-DD'; a null end means open-ended) covers `dateStr`
+    // ('YYYY-MM-DD HH:MM:SS' or similar -- only its first 10 characters are
+    // used). Returns null if none does.
+    _newEnginePlanCovering: function(plans, dateStr) {
+        if (!plans) return null;
+        var localDate = dateStr.slice(0, 10);
+        for (var i = 0; i < plans.length; i++) {
+            var p = plans[i];
+            if ((!p.start || p.start <= localDate) && (!p.end || p.end >= localDate)) return p;
+        }
+        return null;
     },
 
     // Given that active[groundTruthIndex] is confirmed (via

@@ -157,7 +157,9 @@ reproduces ServiceNow's actual answer (`David` through Sep 27, `Fred` Sep
 estimate.
 
 **The fix**: before falling back to date-math, `_rotationAlignment` asks
-ServiceNow directly. `_groundTruthMemberIndex` checks each active member's own
+ServiceNow directly, via whichever of its two on-call engines the rota is
+actually on (see "The 2024 schedule engine" below for the second one).
+On the older engine, `_groundTruthMemberIndex` checks each active member's own
 `cmn_rota_member.rotation_schedule` (the same live, system-computed schedule
 already used as this file's own validation ground truth, and by ServiceNow's own
 resolver -- `OnCallRotationSNC._checkForOverrideMemberByRoster` evaluates the
@@ -177,20 +179,78 @@ starts a new, open-ended segment from there -- so a historical anchor date can
 fall inside a since-capped segment that no longer evaluates as "on call" at
 all, while "now" is always inside whichever segment is currently open.
 
-**Falls back** to the pre-existing date-math estimate only when no active
-member has an evaluable `rotation_schedule` (a brand-new roster ServiceNow
-hasn't computed a schedule for yet, or the `GlideSchedule` lookup errors) --
-logged, not silent. When ground truth *is* found but disagrees with what the
-date-math estimate would have said, that disagreement is logged too (a useful
-signal that a roster's membership has changed since `rotation_start_date`).
+**Falls back** to the pre-existing date-math estimate when no ground-truth
+source resolves anything -- a brand-new roster ServiceNow hasn't computed a
+schedule for yet, a `GlideSchedule`/JSON-parse error, or (old engine only) no
+active member has an evaluable `rotation_schedule` -- logged, not silent. When
+ground truth *is* found but disagrees with what the date-math estimate would
+have said, that disagreement is logged too (a useful signal that a roster's
+membership has changed since `rotation_start_date`).
 
 **Scope**: only the plain one-roster-per-event path (`_buildEvent`, used by
 every classification shape for an ordinary roster). Deliberately not applied to
 `_buildAlternatingEvent` or `_buildEveryMemberEvent` -- both already build their
 member order from something other than a single roster's own rotation math (see
 above for why `_buildAlternatingEvent` doesn't use `rotation_start_date` at
-all), so there's no single roster's `rotation_schedule` that would be the right
-ground truth to check.
+all), so there's no single roster's ground truth that would be the right one to
+check.
+
+#### The 2024 schedule engine
+
+ServiceNow has **two** separate on-call computation systems, selected per rota
+by `cmn_rota.schedule_engine`. The older one (blank/`old_schedule_engine`,
+everything above this subsection) materializes each member's own turns into
+`cmn_rota_member.rotation_schedule`. The newer one (`2024_schedule_engine`)
+**never populates that field at all** -- confirmed against a real customer
+instance: every member of every roster in an entire group (`Major Incident
+(Global)`) had `rotation_schedule` permanently `null`, even though ServiceNow's
+own on-call calendar for those rosters clearly rendered a working rotation.
+Its ground truth lives in `cmn_rota_roster.rotation_payload` instead -- a JSON
+field with no public ServiceNow documentation; its shape here was
+reverse-engineered from a real customer's own live payload and confirmed
+correct against three dates they independently reported seeing on ServiceNow's
+own calendar:
+
+```
+{ "memberPlans": {
+    "member_sys_ids": [<cmn_rota_member sys_id>, ...],
+    "plans": [{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"|null,
+               "members_in_order": [<index into member_sys_ids>, ...]}, ...] },
+  "memberSpanCache": { "spans": [
+    ["YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM:SS", <index into member_sys_ids>], ...
+  ] } }
+```
+
+`_groundTruthMemberIndexNewEngine`/`_newEngineMemberSysIdAt` read this in two
+tiers: **(1)** `memberSpanCache.spans` is a literal, ServiceNow-computed
+day-by-day answer covering roughly the next ~10 days -- exact, used whenever it
+covers `asOf`. **(2)** past the cache's end, extrapolate forward in whole
+shift-blocks from the *start* of the cache's final member's block (not its last
+cached day -- the cache is per-day, so its last entry can land exactly on a
+block's last day, which undercounts by a whole block if used directly as the
+anchor; found and fixed via a unit test built from the real payload below)
+through whichever `plans[]` entry currently applies.
+
+**Confirmed by decoding a real customer's actual `rotation_payload`** (Major
+Incident (Global) / NA / Primary, captured live) against what they
+independently reported ServiceNow's calendar showing after adding a member
+(Bruno starting Sep 28, Miguel Oct 5, Eduardo Oct 12 -- both tiers reproduce all
+three exactly) that this engine's real algorithm, unlike the old engine's, does
+**not** let a member's current turn run to its natural end before inserting a
+newly-added member -- it hands off to "next by order" *immediately* at the
+moment of the edit, truncating whoever was mid-turn, and only settles into a
+clean, full-length round-robin from the next block boundary onward. That's a
+genuinely different algorithm from the old engine's continuity rule above, not
+a variant of it -- confirmed by hand-decoding the real payload's two `plans[]`
+entries (a 4-day truncated first block, then a 3-day makeup block, then clean
+7-day blocks from there), not inferred.
+
+Which engine a rota is on isn't visible from `cmn_rota.schedule_engine` alone
+if an instance-wide property forces one engine for everything --
+`isShiftOnOldEngine`/`isShiftOnNewEngine` in ServiceNow's own
+`OnCallRotationSNC` check `gs.getProperty('com.snc.on_call_rotation.
+force_use_schedule_engine')` before falling back to the field. Not read by this
+port; `rotaRow.schedule_engine` reflects the field only.
 
 ### Handoff weekday (`dow_for_rotate`)
 
@@ -438,3 +498,20 @@ checkbox is on.
   expected to be significant next to the PagerDuty API calls a sync already
   makes, but not separately measured against a large roster (e.g. Americas'
   14-member Primary/Secondary) either.
+- **2024-schedule-engine ground truth (`rotation_payload`) doesn't check the
+  `com.snc.on_call_rotation.force_use_schedule_engine` system property** -- if
+  an instance forces every rota onto one engine regardless of its own
+  `schedule_engine` field, `rotaRow.schedule_engine` (read from the field only)
+  can disagree with which engine actually computed that rota, and ground truth
+  is tried against the wrong one (falls back to date-math either way, not
+  silently wrong, but not the fix either). Not known to be the case on the one
+  customer instance this was built against.
+- **`rotation_payload`'s tier-2 extrapolation (past `memberSpanCache`'s ~10-day
+  window) assumes a clean, unchanging round-robin from the last cached block
+  onward** -- correct once the transition period a membership change causes is
+  over (which the cache itself, built after the edit, already covers), but a
+  *second* membership change made after the last sync -- and after
+  `rotation_payload`'s own cache goes stale -- before the next one runs would
+  not be reflected; the extrapolation has no way to know about it. Re-running
+  the sync soon after such a change (so `asOf` falls inside ServiceNow's own
+  freshly-rebuilt cache window, tier 1) sidesteps this.
