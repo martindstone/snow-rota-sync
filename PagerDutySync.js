@@ -141,6 +141,27 @@ PagerDutySync.prototype = {
         this.FIXED_FALLBACK_ANCHOR_ISO = '2020-01-06T00:00:00Z'; // arbitrary Monday
 
         this._placeholderCounter = {schedule: 0, escalation_policy: 0};
+
+        // Bumped by hand on every real change to this file (not tied to git or any
+        // other version control this port doesn't have visibility into on a
+        // customer's instance) -- exists purely so a run's own log output says,
+        // unambiguously, which exact version of this script actually executed.
+        // Confirmed live this matters: a stale/duplicate Script Include, or a
+        // fix script run before an update was actually saved, can otherwise look
+        // identical to a real fix failing -- see VERSION_LOGGED_AT below.
+        this.VERSION = 'v18-2026-09-29-ground-truth-via-ocrotationv2-getspans';
+    },
+
+    // Logs VERSION and the exact server date/time this call started, before
+    // anything else runs (so it's the first thing in the log even if a later
+    // step throws) -- called at the top of every public entry point. Answers
+    // "which code, and when" with certainty, independent of a Script Include's
+    // own sys_updated_on (which reflects when it was saved, not which copy of
+    // it a given run actually executed -- the two can diverge if there's a
+    // stale duplicate, or if a run was kicked off from cached/queued state).
+    _logVersionAndStart: function(entryPoint) {
+        gs.info('PagerDutySync ' + entryPoint + ' starting -- version ' + this.VERSION +
+            ', server time ' + new GlideDateTime().getValue() + ' UTC');
     },
 
     // ------------------------------------------------------------------------------
@@ -151,6 +172,7 @@ PagerDutySync.prototype = {
     // for safety when called programmatically (e.g. from a Background Script); UI
     // Actions should pass false explicitly once they've been tested.
     syncAll: function(dryRun) {
+        this._logVersionAndStart('syncAll');
         dryRun = (dryRun === false) ? false : true;
         var asOf = new GlideDateTime();
         var collected = {schedules: [], escalation_policies: [], overrides: []};
@@ -168,6 +190,7 @@ PagerDutySync.prototype = {
 
     // Sync a single group by its exact name (must be enrolled in u_pagerduty_sync_group).
     syncGroup: function(groupName, dryRun) {
+        this._logVersionAndStart('syncGroup(' + groupName + ')');
         dryRun = (dryRun === false) ? false : true;
         if (!this.isEnrolled(groupName)) {
             gs.warn('PagerDutySync.syncGroup: ' + groupName + ' is not enrolled in ' +
@@ -284,13 +307,7 @@ PagerDutySync.prototype = {
                 catch_all_wait_time: rotaGr.getValue('catch_all_wait_time') || '',
                 catch_all_member_email: rotaGr.catch_all_member.email ? rotaGr.catch_all_member.email.toString() : '',
                 use_custom_escalation: rotaGr.getValue('use_custom_escalation') === 'true',
-                group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : '',
-                // Which on-call engine this rota is on -- see _groundTruthMemberIndex's
-                // "NEW ENGINE" branch for why this matters: '2024_schedule_engine' rotas
-                // never populate cmn_rota_member.rotation_schedule at all (confirmed
-                // against a real customer instance), so ground truth for those has to
-                // come from cmn_rota_roster.rotation_payload instead.
-                schedule_engine: rotaGr.getValue('schedule_engine') || ''
+                group_manager_email: rotaGr.group.manager.email ? rotaGr.group.manager.email.toString() : ''
             };
         }
 
@@ -316,11 +333,7 @@ PagerDutySync.prototype = {
                 // "use the weekday of rotation_start_date".
                 dow_for_rotate: rosterGr.getValue('dow_for_rotate') || '',
                 rotation_start_time: rosterGr.getValue('rotation_start_time'),
-                rota_sys_id: rotaSysId,
-                // The 2024 schedule engine's own ground truth -- see rotaRow.schedule_engine
-                // and _groundTruthMemberIndex. A JSON blob keyed by cmn_rota_member sys_id,
-                // blank on old-engine rotas.
-                rotation_payload: rosterGr.getValue('rotation_payload') || ''
+                rota_sys_id: rotaSysId
             };
             rosterBySysId[rosterRow.sys_id] = rosterRow;
             rosterByRotaSysId[rotaSysId] = rosterByRotaSysId[rotaSysId] || [];
@@ -340,10 +353,10 @@ PagerDutySync.prototype = {
                 from: memberGr.getValue('from'),
                 to: memberGr.getValue('to'),
                 member_email: memberGr.member.email ? memberGr.member.email.toString() : '',
-                // ServiceNow's own live-computed "who holds this member's turn and
-                // when" schedule -- see _groundTruthMemberIndex, which is the real
-                // fix for rotation phase/order, not this field's mere presence.
-                rotation_schedule: memberGr.getValue('rotation_schedule') || ''
+                // The underlying sys_user's own sys_id -- matched against
+                // OCRotationV2.getSpans()'s own user_id to find who it says is
+                // really on call. See _groundTruthMemberIndex.
+                member_sys_id: memberGr.getValue('member') || ''
             };
             membersByRosterSysId[rosterSysId] = membersByRosterSysId[rosterSysId] || [];
             membersByRosterSysId[rosterSysId].push(memberRow);
@@ -1081,7 +1094,7 @@ PagerDutySync.prototype = {
         }
 
         var shiftsPerMember = this._shiftsPerMember(window, intervalType, intervalCount);
-        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType, active, asOf, rotaRow.schedule_engine);
+        var alignment = this._rotationAlignment(rosterRow, window, tzName, shiftsPerMember, members.length, intervalType, active, asOf);
         var rotationOffset = alignment.offset;
         var eventAnchorUtcIso = alignment.anchorUtcIso;
         if (eventAnchorUtcIso !== window.anchorUtcIso) {
@@ -1386,7 +1399,7 @@ PagerDutySync.prototype = {
     // order the caller's members array is built from) and `asOf` (the sync's
     // "now") are new -- both optional, but omitting them just means this can
     // only ever fall back to the date-math estimate below, never the real fix.
-    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType, active, asOf, scheduleEngine) {
+    _rotationAlignment: function(rosterRow, window, tzName, shiftsPerMember, memberCount, intervalType, active, asOf) {
         var unchanged = {offset: 0, anchorUtcIso: window.anchorUtcIso};
         if (memberCount <= 1 || !this._hasRotationStart(rosterRow)) return unchanged;
 
@@ -1418,29 +1431,31 @@ PagerDutySync.prototype = {
             dateMathOffset = this._rotationMemberOffset(rosterRow, window, tzName, shiftsPerMember, memberCount);
         }
 
-        // Step 2: WHO goes in which slot. Ask ServiceNow's own live
-        // rotation_schedule who it really has on call `asOf`, and back-solve the
-        // array rotation that reproduces that -- see _groundTruthMemberIndex for
-        // why date-math (Step 1's dateMathOffset, or _rotationMemberOffset) can't
-        // be trusted for this on its own: it implicitly assumes the member COUNT
-        // has been constant since rotation_start_date, which a real "someone
-        // joined/left the rotation" edit breaks. Falls back to the date-math
-        // estimate only when no member has a live schedule to check (e.g. a
-        // brand new roster ServiceNow hasn't computed yet, or the lookup fails).
+        // Step 2: WHO goes in which slot. Ask ServiceNow's own live on-call
+        // engine who it really has on call `asOf`, and back-solve the array
+        // rotation that reproduces that -- see _groundTruthMemberIndex for why
+        // date-math (Step 1's dateMathOffset, or _rotationMemberOffset) can't
+        // be trusted for this on its own: it implicitly assumes the member
+        // COUNT has been constant since rotation_start_date, which a real
+        // "someone joined/left the rotation" edit breaks. Falls back to the
+        // date-math estimate only when ServiceNow's own live lookup finds
+        // nothing for this roster at `asOf`.
         if (active && asOf) {
-            // 2024_schedule_engine rotas never populate cmn_rota_member.rotation_schedule
-            // at all (confirmed against a real customer instance) -- their ground truth
-            // lives in cmn_rota_roster.rotation_payload instead. See
-            // _groundTruthMemberIndexNewEngine for that format.
-            var isNewEngine = scheduleEngine === '2024_schedule_engine';
-            var groundTruthIndex = isNewEngine
-                ? this._groundTruthMemberIndexNewEngine(active, rosterRow.rotation_payload, asOf, window, shiftsPerMember, tzName)
-                : this._groundTruthMemberIndex(active, tzName, asOf);
+            var groundTruthIndex = this._groundTruthMemberIndex(active, rosterRow.rota_sys_id, rosterRow.sys_id, asOf);
+
+            // Diagnostic trail -- logs the outcome for every roster ground truth
+            // is even attempted on, not just when it fails. Kept permanent (not
+            // a one-off investigation probe) since "did this actually find an
+            // answer, right now, for this roster" is worth being able to check
+            // on any future run without a separate script.
+            gs.info('  ground-truth check (' + rosterRow.name + '): live on-call lookup -> ' +
+                (groundTruthIndex >= 0 ? ('found, index ' + groundTruthIndex) : 'not found'));
+
             if (groundTruthIndex >= 0) {
                 var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, asOf, groundTruthIndex);
                 if (groundTruthOffset !== null) {
                     if (groundTruthOffset !== dateMathOffset) {
-                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name + ', ' + (isNewEngine ? 'rotation_payload' : 'rotation_schedule') +
+                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name +
                             ') disagrees with the rotation_start_date estimate (offset ' + groundTruthOffset + ' vs ' + dateMathOffset +
                             ') -- likely roster membership has changed since rotation_start_date; using the ground-truth value');
                     }
@@ -1452,188 +1467,97 @@ PagerDutySync.prototype = {
     },
 
     // Finds which member in `active` ServiceNow's own on-call engine actually
-    // has active at `asOf`, by evaluating each member's own
-    // cmn_rota_member.rotation_schedule -- a GlideSchedule ServiceNow itself
-    // keeps live-accurate via a business rule (see OnCallRosterSNC.
-    // getActiveMembersOrdered / computeRotationSchedules) every time roster
-    // membership changes.
+    // has active RIGHT NOW, by calling the exact same live computation its own
+    // on-call calendar widget uses (OCRotationV2.getSpans(), via
+    // _getSpansForRota below) rather than reading either engine's own cached/
+    // materialized field directly.
     //
-    // This exists because that real algorithm is NOT equivalent to recomputing
-    // occurrence-count from rotation_start_date with the CURRENT member count
-    // (what _rotationMemberOffset/the date-math branch above do). Confirmed
-    // live on a PDI: adding a 3rd member to a 2-member weekly roster did not
-    // retroactively reapply "mod 3" to the whole history back to
-    // rotation_start_date -- ServiceNow preserved whoever was already on call
-    // and inserted the new member as "next in order" from that point forward
-    // (OnCallRosterSNC.getActiveMembersOrdered: finds who held the PREVIOUS
-    // period, then continues the round-robin starting after their `order`,
-    // wrapping). Pure date-math coincidentally reproduces this only when the
-    // roster's member count has never changed since rotation_start_date, or the
-    // new member happens to land where continuity would have put them anyway
-    // (confirmed BOTH ways live: matched for Hardware's own test roster,
-    // reported as wrong by a real customer for Major Incident's NA/EMEA Primary
-    // rosters after they added a member) -- there's no way to tell which case
-    // you're in from the roster's current fields alone, so this reads
-    // ServiceNow's own answer directly instead of guessing.
+    // Replaces two earlier, field-reading approaches -- both confirmed
+    // unreliable on a real customer instance, for reasons never fully
+    // resolved:
+    //   - cmn_rota_member.rotation_schedule (the old engine's own materialized
+    //     per-member schedule): confirmed live that reading it via
+    //     `new GlideSchedule(scheduleSysId)` can silently return the WRONG
+    //     answer (isValid() true, isInSchedule() false, for a date the span
+    //     unambiguously covers) -- a bug in that constructor form specifically,
+    //     not the data. Fixing it (rebuilding via addTimeSpan() instead) only
+    //     helps when the field is actually populated, and on a real customer
+    //     instance it was null for an entire group's rosters.
+    //   - cmn_rota_roster.rotation_payload (the 2024 schedule engine's own
+    //     JSON): confirmed live (by forcing a test roster onto the new engine)
+    //     that ServiceNow does NOT durably persist this field at rest -- it's a
+    //     write-on-compute cache, populated only as a side effect of something
+    //     actually calling the live span-computation path. A real customer's
+    //     export and this sync's own GlideRecord reads both consistently saw
+    //     it blank; the one time it read populated was almost certainly a
+    //     transient snapshot from something else (a calendar view) having just
+    //     triggered that computation, not a stable value to depend on reading
+    //     cold.
     //
-    // Reuses the pattern OnCallRotationSNC._checkForOverrideMemberByRoster
-    // already uses for the same table (GlideSchedule.isInSchedule), not a new
-    // evaluation method -- and, as a side effect, this also correctly skips a
-    // member whose OWN time-off/exclude spans make them not really on call
-    // right now (ServiceNow's schedule generation already routes their turn to
-    // the next member for that window -- see _createMemberRotationSchedules'
-    // excluded-span patching), which pure order/date math has no way to know
-    // about either.
+    // getSpans() also sidesteps needing to determine which engine a rota is on
+    // at all -- OCRotationV2.getSpans() makes that call internally
+    // (OnCallRotation.isShiftOnNewEngine(rotaGr)), which is itself one of the
+    // unreliable reads above. Confirmed live both ways on a PDI: matched
+    // PagerDuty's own live on-call display exactly for an old-engine roster
+    // (Hardware US Primary), and reproduced a real customer's exact reported
+    // on-call sequence for a forced-new-engine roster (member added, engine
+    // upgraded, in the same order the customer's real timeline did it).
     //
-    // Returns the index into `active`, or -1 if no member's schedule covers
-    // `asOf` (a roster with no live schedule yet, e.g. brand new, or every
-    // lookup failed) -- callers fall back to date-math in that case.
-    _groundTruthMemberIndex: function(active, tzName, asOf) {
+    // As a side effect, this also correctly skips a member whose OWN time-off
+    // makes them not really on call right now (ServiceNow's live computation
+    // already accounts for that), which pure order/date math has no way to
+    // know about either.
+    //
+    // Returns the index into `active`, or -1 if getSpans() found nothing for
+    // this roster at `asOf` (e.g. the rota has no coverage-window span of its
+    // own yet, or the call itself errors) -- callers fall back to date-math in
+    // that case.
+    _groundTruthMemberIndex: function(active, rotaSysId, rosterSysId, asOf) {
+        var userIdByRoster = this._getSpansForRota(rotaSysId, asOf);
+        var userId = userIdByRoster[rosterSysId];
+        if (!userId) return -1;
         for (var i = 0; i < active.length; i++) {
-            var scheduleSysId = active[i].rotation_schedule;
-            if (!scheduleSysId) continue;
-            try {
-                var sched = new GlideSchedule(scheduleSysId);
-                sched.setTimeZone(tzName);
-                if (sched.isValid() && sched.isInSchedule(asOf)) return i;
-            } catch (e) {
-                gs.warn('PagerDutySync: could not evaluate rotation_schedule ' + scheduleSysId +
-                    ' for ground-truth on-call lookup: ' + e);
-            }
+            if (active[i].member_sys_id === userId) return i;
         }
         return -1;
     },
 
-    // The 2024 schedule engine's equivalent of _groundTruthMemberIndex, for
-    // rotas where that one can never find anything (schedule_engine ==
-    // '2024_schedule_engine' rotas don't populate cmn_rota_member.
-    // rotation_schedule at all -- confirmed against a real customer instance:
-    // it stayed null across every export, on every roster of a whole group,
-    // even though ServiceNow's own on-call calendar for those rosters clearly
-    // renders a working rotation). That engine's ground truth lives in
-    // cmn_rota_roster.rotation_payload instead -- a JSON blob whose exact
-    // shape was reverse-engineered from a real customer's own live payload
-    // (Major Incident (Global) / NA / Primary), not from ServiceNow's
-    // documentation (there isn't any public documentation of this format):
-    //   { "memberPlans": {
-    //       "member_sys_ids": [<cmn_rota_member sys_id>, ...],
-    //       "plans": [{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"|null,
-    //                  "members_in_order": [<index into member_sys_ids>, ...],
-    //                  "lastOnCallMember": <cmn_rota_member sys_id>}, ...] },
-    //     "memberSpanCache": { "spans": [
-    //       ["YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM:SS", <index into member_sys_ids>], ...
-    //     ] } }
-    // memberSpanCache.spans is a literal, ServiceNow-computed day-by-day
-    // answer covering roughly the next ~10 days from whenever it was last
-    // built -- exact, no interpretation needed, and this always prefers it
-    // when it covers `asOf`.
+    // Calls ServiceNow's own live on-call computation for every roster on
+    // `rotaSysId` at once, at the single instant `asOf`, and returns a
+    // {rosterSysId: userId} map -- exactly the {roster_id, user_id} pairs
+    // OCRotationV2.getSpans() reports for that instant, filtered to the
+    // 'cmn_rota_member' entries (it also returns 'cmn_schedule_span' entries
+    // for the rota's own coverage window, which aren't relevant here).
     //
-    // Confirmed by decoding a real customer's actual payload against what
-    // they independently reported ServiceNow's calendar showing (NA Primary:
-    // Bruno starting Sep 28, Miguel Oct 5, Eduardo Oct 12) that this engine's
-    // real algorithm, unlike the old engine's (see _groundTruthMemberIndex's
-    // own comment), does NOT let a member's current turn run to its natural
-    // end before inserting a newly-added member -- it hands off to "next by
-    // order" IMMEDIATELY at the moment of the edit, truncating whoever was
-    // mid-turn, and only settles into a clean, full-length round-robin from
-    // the next block boundary onward. That's a genuinely different algorithm
-    // from the old engine's, not a variant of the same one -- which is why
-    // this reads the engine's own answer directly rather than trying to
-    // special-case that difference into the date-math estimate.
-    _groundTruthMemberIndexNewEngine: function(active, rotationPayloadRaw, asOf, window, shiftsPerMember, tzName) {
-        var memberSysId = this._newEngineMemberSysIdAt(rotationPayloadRaw, asOf, window, shiftsPerMember, tzName);
-        if (!memberSysId) return -1;
-        for (var i = 0; i < active.length; i++) {
-            if (active[i].sys_id === memberSysId) return i;
-        }
-        return -1;
-    },
+    // Memoized per (rota, asOf) for the lifetime of this PagerDutySync
+    // instance -- getSpans() is a real computation, not a field read, and a
+    // sync's several rosters on the same rota share one call instead of
+    // recomputing per roster.
+    _getSpansForRota: function(rotaSysId, asOf) {
+        this._rotaSpansCache = this._rotaSpansCache || {};
+        var cacheKey = rotaSysId + '|' + asOf.getValue();
+        if (this._rotaSpansCache.hasOwnProperty(cacheKey)) return this._rotaSpansCache[cacheKey];
 
-    // Returns the cmn_rota_member sys_id the 2024 engine's rotation_payload
-    // says is on call at `asOf`, or null if that can't be determined (blank/
-    // unparseable payload, or `asOf` falls outside both the cache and any
-    // extrapolatable plan -- callers fall back to date-math in that case,
-    // same as _groundTruthMemberIndex's -1).
-    _newEngineMemberSysIdAt: function(rotationPayloadRaw, asOf, window, shiftsPerMember, tzName) {
-        if (!rotationPayloadRaw) return null;
-        var parsed;
+        var result = {};
         try {
-            parsed = JSON.parse(rotationPayloadRaw);
-        } catch (e) {
-            gs.warn('PagerDutySync: could not parse rotation_payload for ground-truth lookup: ' + e);
-            return null;
-        }
-        var memberPlans = parsed.memberPlans;
-        if (!memberPlans || !memberPlans.member_sys_ids || !memberPlans.member_sys_ids.length) return null;
-        var memberSysIds = memberPlans.member_sys_ids;
-        var asOfStr = asOf.getValue();
-
-        var cacheSpans = parsed.memberSpanCache && parsed.memberSpanCache.spans;
-        if (!cacheSpans || !cacheSpans.length) return null;
-
-        // Tier 1: asOf falls inside the cache's own covered window -- exact.
-        for (var c = 0; c < cacheSpans.length; c++) {
-            if (cacheSpans[c][0] <= asOfStr && asOfStr < cacheSpans[c][1]) {
-                return memberSysIds[cacheSpans[c][2]];
+            var start = new GlideDateTime(asOf);
+            var end = new GlideDateTime(asOf);
+            end.addSeconds(1);
+            var spans = new OCRotationV2()
+                .setStartDate(start.getDisplayValueInternal(), true)
+                .setEndDate(end.getDisplayValueInternal(), true, true)
+                .setRotaIds(rotaSysId)
+                .getSpans();
+            for (var i = 0; i < spans.length; i++) {
+                if (spans[i].table === 'cmn_rota_member' && spans[i].roster_id) {
+                    result[spans[i].roster_id] = spans[i].user_id;
+                }
             }
+        } catch (e) {
+            gs.warn('PagerDutySync: OCRotationV2.getSpans() failed for rota ' + rotaSysId + ': ' + e);
         }
-
-        // Tier 2: asOf is past the cache's last known instant (this sync is
-        // running later than ServiceNow last rendered/cached this roster's
-        // calendar). Extrapolate forward in whole shift-blocks from that last
-        // instant through whichever plan currently applies -- safe once past
-        // the cache's window, since any transition-period irregularity (see
-        // this function's own header comment) is necessarily over by then and
-        // the rotation is back to a steady, predictable round-robin.
-        var last = cacheSpans[cacheSpans.length - 1];
-        if (last[1] > asOfStr) return null; // asOf falls in an unextrapolatable gap before the cache's end
-        var plan = this._newEnginePlanCovering(memberPlans.plans, asOfStr);
-        if (!plan || !plan.members_in_order || !plan.members_in_order.length) return null;
-        var order = plan.members_in_order;
-        var lastPos = order.indexOf(last[2]);
-        if (lastPos < 0) return null; // whoever the cache last named isn't in the current plan any more
-
-        // Anchor the extrapolation at the START of that final member's block, not
-        // at the single last cached day -- the cache is a per-DAY listing, not a
-        // per-BLOCK one, so its final entry is just "the last day ServiceNow
-        // bothered to cache," which can (as here) land exactly on a block's own
-        // last day. Using that day directly as the floor-division anchor
-        // undercounts by a whole block whenever it does (confirmed against the
-        // customer's own real payload: extrapolating from 2026-10-04, the last
-        // cached day, put Oct 5 still in Bruno's block instead of correctly
-        // starting Miguel's) -- scanning back to where this member's block
-        // actually began fixes it, matching the same floor-from-a-true-
-        // block-start convention _offsetForGroundTruth already relies on.
-        var blockStartIdx = cacheSpans.length - 1;
-        while (blockStartIdx > 0 && cacheSpans[blockStartIdx - 1][2] === last[2]) blockStartIdx--;
-        var blockStart = cacheSpans[blockStartIdx];
-
-        var blockStartUtcIso = blockStart[0].replace(' ', 'T') + 'Z';
-        var blockStartLocalDate = this._localDateForUtcAnchor(blockStartUtcIso, tzName);
-        var asOfUtcIso = asOfStr.replace(' ', 'T') + 'Z';
-        var asOfLocalDate = this._localDateForUtcAnchor(asOfUtcIso, tzName);
-        if (!blockStartLocalDate || !asOfLocalDate) return null;
-
-        var elapsedDays = Math.round(this._dateDiffSeconds(blockStartLocalDate + ' 00:00:00', asOfLocalDate + ' 00:00:00') / 86400);
-        var anchorWeekday = this._weekdayOfDateStr(blockStartLocalDate);
-        var occurrenceIndex = this._countCoveredDaysBetween(window.days, anchorWeekday, elapsedDays);
-        var blocksAhead = Math.floor(occurrenceIndex / shiftsPerMember);
-        var newPos = (((lastPos + blocksAhead) % order.length) + order.length) % order.length;
-        return memberSysIds[order[newPos]];
-    },
-
-    // Finds the plan (in rotation_payload.memberPlans.plans) whose [start, end]
-    // range (dates, 'YYYY-MM-DD'; a null end means open-ended) covers `dateStr`
-    // ('YYYY-MM-DD HH:MM:SS' or similar -- only its first 10 characters are
-    // used). Returns null if none does.
-    _newEnginePlanCovering: function(plans, dateStr) {
-        if (!plans) return null;
-        var localDate = dateStr.slice(0, 10);
-        for (var i = 0; i < plans.length; i++) {
-            var p = plans[i];
-            if ((!p.start || p.start <= localDate) && (!p.end || p.end >= localDate)) return p;
-        }
-        return null;
+        this._rotaSpansCache[cacheKey] = result;
+        return result;
     },
 
     // Given that active[groundTruthIndex] is confirmed (via

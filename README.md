@@ -374,6 +374,17 @@ sync (it survives the event delete/recreate), and removed when the span was dele
 4. Once a dry run looks right for every group you've enrolled (`sync.syncAll(true)`),
    test the UI Actions end-to-end.
 
+**Every run logs its own version and exact server start time** (`PagerDutySync
+syncGroup(...) starting -- version vN-..., server time ...`) as the very first
+line, before anything else executes -- so a run's own log always says
+unambiguously which copy of this file actually ran and when, independent of a
+Script Include's `sys_updated_on` (which reflects when it was last *saved*, not
+which version a given run actually executed -- the two can diverge if there's a
+stale duplicate Script Include, or a run was kicked off before an edit was
+actually saved). `VERSION` (in `initialize()`) is bumped by hand on every real
+change to this file -- there's no other version control visible from inside a
+customer's instance to check against.
+
 ## Coverage window repeat types
 
 `cmn_schedule_span.repeat_type` is a choice field with 10 real values; only some are
