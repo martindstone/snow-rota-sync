@@ -149,7 +149,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v18-2026-09-29-ground-truth-via-ocrotationv2-getspans';
+        this.VERSION = 'v20-2026-09-30-forward-fallback-startNumeric-tz-fix';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -1441,7 +1441,7 @@ PagerDutySync.prototype = {
         // date-math estimate only when ServiceNow's own live lookup finds
         // nothing for this roster at `asOf`.
         if (active && asOf) {
-            var groundTruthIndex = this._groundTruthMemberIndex(active, rosterRow.rota_sys_id, rosterRow.sys_id, asOf);
+            var groundTruth = this._groundTruthMemberIndex(active, rosterRow.rota_sys_id, rosterRow.sys_id, asOf);
 
             // Diagnostic trail -- logs the outcome for every roster ground truth
             // is even attempted on, not just when it fails. Kept permanent (not
@@ -1449,10 +1449,11 @@ PagerDutySync.prototype = {
             // answer, right now, for this roster" is worth being able to check
             // on any future run without a separate script.
             gs.info('  ground-truth check (' + rosterRow.name + '): live on-call lookup -> ' +
-                (groundTruthIndex >= 0 ? ('found, index ' + groundTruthIndex) : 'not found'));
+                (groundTruth.index >= 0 ? ('found via ' + groundTruth.source + ', index ' + groundTruth.index) :
+                    'not found (checked exact instant and nearest future occurrence)'));
 
-            if (groundTruthIndex >= 0) {
-                var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, asOf, groundTruthIndex);
+            if (groundTruth.index >= 0) {
+                var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, groundTruth.checkInstant, groundTruth.index);
                 if (groundTruthOffset !== null) {
                     if (groundTruthOffset !== dateMathOffset) {
                         gs.info('  note: ground-truth on-call lookup (' + rosterRow.name +
@@ -1508,26 +1509,54 @@ PagerDutySync.prototype = {
     // already accounts for that), which pure order/date math has no way to
     // know about either.
     //
-    // Returns the index into `active`, or -1 if getSpans() found nothing for
-    // this roster at `asOf` (e.g. the rota has no coverage-window span of its
-    // own yet, or the call itself errors) -- callers fall back to date-math in
-    // that case.
+    // Returns {index, checkInstant, source} -- index into `active` (-1 if
+    // unresolvable), checkInstant (a GlideDateTime) is the real instant that
+    // index was actually confirmed at (NOT always `asOf` itself -- see below),
+    // and source is a short string for logging. Callers fall back to
+    // date-math when index is -1 (e.g. the rota has no coverage-window span
+    // of its own yet, or every lookup below errors).
+    //
+    // Tries the exact instant `asOf` first (via _getSpansForRota) -- correct
+    // and cheap whenever the sync happens to run while someone's actually on
+    // call. Falls back to _getSpansForRotaForward (the nearest FUTURE
+    // occurrence) only when that comes up empty -- confirmed live against a
+    // real customer group (Major Incident (Global)) whose regions' coverage
+    // windows don't sum to a full 24h (NA 12:00:30-21:00:30Z, EMEA
+    // 21:01-01:00Z, leaving an ~11.5h daily gap): a sync that happens to run
+    // during that gap has no "right now" to check for either roster at all,
+    // even though the rotation itself is perfectly well-defined.
+    //
+    // Deliberately searches FORWARD only, never backward: _offsetForGroundTruth
+    // just needs ONE trustworthy (instant, member) pair to back-solve the
+    // array's offset -- but a PAST occurrence risks being a stale,
+    // pre-membership-change read (ServiceNow doesn't retroactively recompute
+    // history when a member is added/removed -- see this file's own notes on
+    // that), whereas anything ServiceNow reports about a FUTURE instant is
+    // necessarily computed fresh as of right now, so it can never be stale
+    // relative to an edit that's already happened.
     _groundTruthMemberIndex: function(active, rotaSysId, rosterSysId, asOf) {
-        var userIdByRoster = this._getSpansForRota(rotaSysId, asOf);
-        var userId = userIdByRoster[rosterSysId];
-        if (!userId) return -1;
-        for (var i = 0; i < active.length; i++) {
-            if (active[i].member_sys_id === userId) return i;
+        var entry = this._getSpansForRota(rotaSysId, asOf)[rosterSysId];
+        var source = 'exact instant';
+        if (!entry) {
+            entry = this._getSpansForRotaForward(rotaSysId, asOf)[rosterSysId];
+            source = 'nearest future occurrence';
         }
-        return -1;
+        if (!entry) return {index: -1, checkInstant: null, source: null};
+        for (var i = 0; i < active.length; i++) {
+            if (active[i].member_sys_id === entry.userId) return {index: i, checkInstant: entry.checkInstant, source: source};
+        }
+        return {index: -1, checkInstant: null, source: null};
     },
 
     // Calls ServiceNow's own live on-call computation for every roster on
     // `rotaSysId` at once, at the single instant `asOf`, and returns a
-    // {rosterSysId: userId} map -- exactly the {roster_id, user_id} pairs
-    // OCRotationV2.getSpans() reports for that instant, filtered to the
-    // 'cmn_rota_member' entries (it also returns 'cmn_schedule_span' entries
-    // for the rota's own coverage window, which aren't relevant here).
+    // {rosterSysId: {userId, checkInstant}} map -- checkInstant is always
+    // `asOf` itself here (this is the exact-instant path); kept as an object
+    // rather than a plain user_id so the caller has one consistent shape
+    // whether the answer came from here or from _getSpansForRotaForward.
+    // Filtered to 'cmn_rota_member' entries (OCRotationV2.getSpans() also
+    // returns 'cmn_schedule_span' entries for the rota's own coverage window,
+    // not relevant here).
     //
     // Memoized per (rota, asOf) for the lifetime of this PagerDutySync
     // instance -- getSpans() is a real computation, not a field read, and a
@@ -1550,13 +1579,71 @@ PagerDutySync.prototype = {
                 .getSpans();
             for (var i = 0; i < spans.length; i++) {
                 if (spans[i].table === 'cmn_rota_member' && spans[i].roster_id) {
-                    result[spans[i].roster_id] = spans[i].user_id;
+                    result[spans[i].roster_id] = {userId: spans[i].user_id, checkInstant: asOf};
                 }
             }
         } catch (e) {
             gs.warn('PagerDutySync: OCRotationV2.getSpans() failed for rota ' + rotaSysId + ': ' + e);
         }
         this._rotaSpansCache[cacheKey] = result;
+        return result;
+    },
+
+    // Fallback for _groundTruthMemberIndex when the exact-instant check finds
+    // nothing (see that function's own comment for why this searches forward
+    // only). Finds the NEAREST future 'cmn_rota_member' occurrence per roster
+    // -- earliest start time >= asOf -- across an 8-day forward window
+    // (comfortably covers even a weekly rotation_interval_type, not just the
+    // daily case that motivated this, in one bounded call) and returns
+    // {rosterSysId: {userId, checkInstant}}, where checkInstant is that
+    // occurrence's own start time (a GlideDateTime), NOT `asOf` -- the caller
+    // (_offsetForGroundTruth) back-solves the array's offset from whichever
+    // real instant it's given, so handing it the instant ground truth was
+    // actually confirmed at, rather than `asOf` itself, is what makes this
+    // correct regardless of how many handoffs lie between `asOf` and that
+    // found occurrence.
+    //
+    // Memoized separately from _getSpansForRota's own cache (same (rota,asOf)
+    // keying) -- a materially more expensive call (multi-day window), only
+    // worth making when the cheap exact check already came up empty.
+    _getSpansForRotaForward: function(rotaSysId, asOf) {
+        this._rotaSpansForwardCache = this._rotaSpansForwardCache || {};
+        var cacheKey = rotaSysId + '|' + asOf.getValue();
+        if (this._rotaSpansForwardCache.hasOwnProperty(cacheKey)) return this._rotaSpansForwardCache[cacheKey];
+
+        var result = {};
+        try {
+            var start = new GlideDateTime(asOf);
+            var end = new GlideDateTime(asOf);
+            end.addDaysUTC(8);
+            var spans = new OCRotationV2()
+                .setStartDate(start.getDisplayValueInternal(), true)
+                .setEndDate(end.getDisplayValueInternal(), true, true)
+                .setRotaIds(rotaSysId)
+                .getSpans();
+            for (var i = 0; i < spans.length; i++) {
+                var sp = spans[i];
+                if (sp.table !== 'cmn_rota_member' || !sp.roster_id) continue;
+                // sp.start/sp.end are GlideDateTime.getDisplayValueInternal() strings
+                // (both engines -- see OCRotationV2.formatEvent and OnCallSpansSNC),
+                // i.e. local to whatever session/execution context ran getSpans(),
+                // with no timezone marker -- NOT UTC despite the look of the string.
+                // new GlideDateTime(sp.start) would silently misread that local value
+                // as UTC, off by however many hours that session's timezone happens to
+                // be from UTC (found empirically as a real 7-hour bug on this PDI: a
+                // background-script context defaulting to a Pacific-time offset). Use
+                // startNumeric instead -- a plain UTC epoch-millisecond value, immune
+                // to session timezone entirely.
+                var spanStart = new GlideDateTime();
+                spanStart.setNumericValue(parseInt(sp.startNumeric, 10));
+                if (!result.hasOwnProperty(sp.roster_id) || spanStart.getNumericValue() < result[sp.roster_id].checkInstant.getNumericValue()) {
+                    result[sp.roster_id] = {userId: sp.user_id, checkInstant: spanStart};
+                }
+            }
+        } catch (e) {
+            gs.warn('PagerDutySync: OCRotationV2.getSpans() (forward fallback) failed for rota ' + rotaSysId + ': ' + e);
+        }
+        this._rotaSpansForwardCache[cacheKey] = result;
         return result;
     },
 
