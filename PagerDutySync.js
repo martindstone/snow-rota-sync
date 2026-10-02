@@ -149,7 +149,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v20-2026-09-30-forward-fallback-startNumeric-tz-fix';
+        this.VERSION = 'v21-2026-10-02-catch-all-scoped-to-its-rota';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -1974,6 +1974,54 @@ PagerDutySync.prototype = {
         };
     },
 
+    // ServiceNow scopes a catch-all to the rota it is configured on: the escalation
+    // plan is built from whichever rota is in force at that moment, and the
+    // catch-all step comes from that rota's own catch_all fields only
+    // (OCEscalationPathUtilSNC._getOnCallEscalationDetails -> _getCatchAllDetails ->
+    // OnCallRotation.getCatchAllType(escPlan.rotaId)). So when a group's rotas
+    // cover different time windows (follow-the-sun), "NA: group_manager, EMEA:
+    // none" means the manager is the last-resort step only during NA's window and
+    // there is no such step during EMEA's. A plain escalation-rule user target has
+    // no time dimension in PagerDuty, so this builds a dedicated schedule instead:
+    // one event per catch-all rota, restricted to that rota's own coverage window,
+    // with that rota's catch-all person as the sole member. Rotas without a
+    // catch-all contribute no event, leaving that time uncovered -- the rule then
+    // pages nobody there, matching ServiceNow. Returns null if no rota has one.
+    _buildScopedCatchAllRule: function(groupName, rotas, coverageWindows, emailToId, dryRun, collected) {
+        var events = [];
+        var maxDelay = null;
+        var tzName = null;
+        for (var i = 0; i < rotas.length; i++) {
+            var rotaRow = rotas[i];
+            var rule = this._buildCatchAllRule([rotaRow], emailToId);
+            if (!rule) continue;
+            var rotaTz = this._canonicalizeTimeZone(rotaRow.schedule_time_zone);
+            if (tzName === null) tzName = rotaTz;
+            var window = coverageWindows[rotaRow.sys_id];
+            if (!window) {
+                gs.warn('no coverage window for "' + rotaRow.name + '" (' + groupName + ') while building its catch-all; ' +
+                    'building the catch-all as always-on for this rota');
+                window = this._defaultAlwaysOnWindow(tzName, []);
+            }
+            events.push({
+                name: rotaRow.name + ' - catch-all',
+                start_time: this._zonedDateTime(window.anchorUtcIso, tzName),
+                end_time: this._zonedDateTime(this._addSecondsToUtcIso(window.anchorUtcIso, window.durationSeconds), tzName),
+                effective_since: window.anchorUtcIso,
+                recurrence: [this._rruleForWindow(window)],
+                assignment_strategy: {
+                    type: 'rotating_member_assignment_strategy',
+                    shifts_per_member: this._shiftsPerMember(window, 'weekly', 1),
+                    members: [{type: 'user_member', user_id: rule.targets[0].id}]
+                }
+            });
+            maxDelay = (maxDelay === null) ? rule.escalation_delay_in_minutes : Math.max(maxDelay, rule.escalation_delay_in_minutes);
+        }
+        if (events.length === 0) return null;
+        var scheduleId = this._upsertScheduleV3(this._syncedName(groupName + ' - catch-all'), tzName, this.SYNCED_DESCRIPTION, events, dryRun, collected);
+        return {escalation_delay_in_minutes: maxDelay, targets: [{id: scheduleId, type: 'schedule_v3_reference'}]};
+    },
+
     // catch_all_wait_time is the same glide_duration shape as cmn_rota_roster.
     // time_before_escalation (see _parseDelayMinutes's comment for the format
     // quirk) -- reused here rather than the hardcoded CATCH_ALL_DELAY_MINUTES,
@@ -2673,7 +2721,7 @@ PagerDutySync.prototype = {
             });
         }
 
-        var catchAll = this._buildCatchAllRule(rotas, emailToId);
+        var catchAll = this._buildScopedCatchAllRule(groupName, rotas, coverageWindows, emailToId, dryRun, collected);
         if (catchAll) rules.push(catchAll);
 
         var epPayload = {

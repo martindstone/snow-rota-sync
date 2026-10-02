@@ -480,11 +480,20 @@ checkbox is on.
   `every_member_assignment_strategy`-style "page together" target (confirmed via
   the form's own UI Policy that `all` means everyone in one specific,
   explicitly-chosen roster, not the group's whole membership), which is more
-  work than the single-field lookup `individual` needed. If a group's rotas
-  disagree on `catch_all` type across regions, `group_manager` wins over
-  `individual` (matching this function's pre-existing single-winner behavior);
-  `catch_all_wait_time` (falls back to a 30-minute default when blank) sets the
-  delay for whichever rule gets built.
+  work than the single-field lookup `individual` needed. ServiceNow scopes a
+  catch-all to the rota it is configured on (the escalation plan comes from
+  whichever rota is in force, and the catch-all step from that rota's own fields
+  -- `OCEscalationPathUtilSNC._getCatchAllDetails`). For follow-the-sun groups
+  `_buildScopedCatchAllRule` mirrors that: a `<group> - catch-all` schedule with
+  one event per catch-all rota, restricted to that rota's coverage window, with
+  that rota's catch-all person as sole member; rotas with no catch-all add no
+  event, so nobody is paged at that step during their window (e.g. NA =
+  `group_manager`, EMEA = none -> manager only during NA hours). Single-region
+  and needs-review groups still use the flat always-on `_buildCatchAllRule`
+  (single-winner: `group_manager` over `individual`). `catch_all_wait_time`
+  (30-minute default when blank) sets the rule's delay; across several
+  catch-all rotas in one group the largest wins, since one PagerDuty rule has
+  one delay.
 - **`GlideScheduleDateTime` is undocumented** (absent from ServiceNow's official
   scoped `GlideDateTime` API reference) but is what `_localizedIso`/
   `_tzOffsetSecondsFromUtc` rely on for DST-aware local-to-UTC conversion, since
