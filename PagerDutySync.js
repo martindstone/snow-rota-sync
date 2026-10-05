@@ -142,6 +142,26 @@ PagerDutySync.prototype = {
 
         this._placeholderCounter = {schedule: 0, escalation_policy: 0};
 
+        // Debounced sync queue (see markPending / processPending below). All of the
+        // per-group state lives as columns on u_pagerduty_sync_group itself.
+        // A change must be this old (seconds since the LAST change to the group)
+        // before the scheduled job syncs it -- a burst of edits becomes one sync.
+        this.QUIET_PERIOD_SECONDS = 120;
+        // ...but never wait longer than this since the FIRST un-synced change, so a
+        // constant stream of edits can't postpone a sync forever.
+        this.MAX_WAIT_SECONDS = 600;
+        // A running-lock older than this is assumed to belong to a crashed run.
+        this.STALE_LOCK_SECONDS = 900;
+        // Delay before retry after the 1st, 2nd, 3rd+ consecutive failure.
+        this.RETRY_BACKOFF_MINUTES = [5, 15, 60];
+        // processPending stops starting new groups after this long, leaving the rest
+        // for the next minute's run.
+        this.MAX_RUN_SECONDS = 240;
+        // Columns processPending/markPending need on SYNC_GROUP_TABLE.
+        this.SYNC_STATE_FIELDS = ['u_pending_since', 'u_last_change', 'u_running_since', 'u_claim_token',
+            'u_retry_after', 'u_last_attempt', 'u_last_result', 'u_last_message', 'u_last_success',
+            'u_consecutive_failures'];
+
         // Bumped by hand on every real change to this file (not tied to git or any
         // other version control this port doesn't have visibility into on a
         // customer's instance) -- exists purely so a run's own log output says,
@@ -149,7 +169,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v21-2026-10-02-catch-all-scoped-to-its-rota';
+        this.VERSION = 'v24-2026-10-05-end-and-replace-events';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -177,8 +197,15 @@ PagerDutySync.prototype = {
         var asOf = new GlideDateTime();
         var collected = {schedules: [], escalation_policies: [], overrides: []};
         var groupNames = this._enrolledGroupNames();
+        collected.errors = [];
         for (var i = 0; i < groupNames.length; i++) {
-            this._syncOneGroup(groupNames[i], asOf, dryRun, collected);
+            // One group failing (e.g. a rejected v3 write) must not stop the groups after it.
+            try {
+                this._syncOneGroup(groupNames[i], asOf, dryRun, collected);
+            } catch (groupError) {
+                gs.error('PagerDutySync.syncAll: "' + groupNames[i] + '" failed, continuing with the next group: ' + groupError);
+                collected.errors.push({group: groupNames[i], error: String(groupError)});
+            }
         }
         gs.info('PagerDutySync.syncAll ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') +
             'complete: ' + collected.schedules.length + ' schedule action(s), ' +
@@ -257,6 +284,284 @@ PagerDutySync.prototype = {
         return this.syncGroup(groupName, dryRun);
     },
 
+    // ------------------------------------------------------------------------------
+    // DEBOUNCED SYNC QUEUE
+    //
+    // Business Rules on the tables that feed a sync call markPending()/
+    // markPendingForRecord() instead of syncing: that stamps u_last_change (and
+    // u_pending_since, if nothing was already waiting) on the group's
+    // u_pagerduty_sync_group row. A scheduled job calls processPending() every
+    // minute, which syncs a group once its changes have gone quiet (or have waited
+    // MAX_WAIT_SECONDS), records the outcome on the same row, and retries failures
+    // with backoff. The UI Actions / Script Action go through syncGroupTracked() so
+    // a manual sync takes the same lock and leaves the same history. See README.
+    // ------------------------------------------------------------------------------
+
+    // True if every column the queue needs exists on u_pagerduty_sync_group. Logs
+    // (once per instance of this class) what's missing instead of silently no-oping:
+    // GlideRecord.setValue() on a missing column is ignored without any error.
+    _syncStateReady: function() {
+        if (this._stateReady !== undefined) return this._stateReady;
+        var gr = new GlideRecord(this.SYNC_GROUP_TABLE);
+        var missing = [];
+        for (var i = 0; i < this.SYNC_STATE_FIELDS.length; i++) {
+            if (!gr.isValidField(this.SYNC_STATE_FIELDS[i])) missing.push(this.SYNC_STATE_FIELDS[i]);
+        }
+        if (missing.length) {
+            gs.error('PagerDutySync: ' + this.SYNC_GROUP_TABLE + ' is missing column(s) ' + missing.join(', ') +
+                ' -- add them (see README, "Debounced sync queue") before using the pending-sync queue');
+        }
+        this._stateReady = (missing.length === 0);
+        return this._stateReady;
+    },
+
+    _syncRowForGroup: function(groupName) {
+        var gr = new GlideRecord(this.SYNC_GROUP_TABLE);
+        gr.addQuery('u_group.name', groupName);
+        gr.query();
+        return gr.next() ? gr : null;
+    },
+
+    _secondsSince: function(rawDateTime, nowGdt) {
+        if (!rawDateTime) return null;
+        return Math.floor((nowGdt.getNumericValue() - new GlideDateTime(rawDateTime).getNumericValue()) / 1000);
+    },
+
+    // Record that something feeding `groupName`'s sync changed. No-op (returns false)
+    // for a group that isn't enrolled.
+    markPending: function(groupName) {
+        if (!groupName || !this._syncStateReady()) return false;
+        var gr = this._syncRowForGroup(groupName);
+        if (!gr) return false;
+        var now = new GlideDateTime().getValue();
+        gr.setValue('u_last_change', now);
+        if (!gr.getValue('u_pending_since')) gr.setValue('u_pending_since', now);
+        // u_retry_after is deliberately left alone: a fresh edit shouldn't override the
+        // failure backoff (that would hammer PagerDuty during an outage). A manual
+        // "Sync" bypasses it.
+        gr.update();
+        return true;
+    },
+
+    // Called from the Business Rules with `current` (and `previous` when the rule
+    // can see one): resolves which enrolled group(s) the changed record belongs to
+    // and marks them pending. Marking the previous group too covers a rota moved
+    // between groups. Returns how many enrolled groups were marked.
+    markPendingForRecord: function(currentGr, previousGr) {
+        var names = [];
+        this._addGroupNamesForRecord(currentGr, names);
+        if (previousGr) this._addGroupNamesForRecord(previousGr, names);
+        var marked = 0;
+        for (var i = 0; i < names.length; i++) {
+            if (this.markPending(names[i])) marked++;
+        }
+        return marked;
+    },
+
+    _addGroupNamesForRecord: function(gr, names) {
+        function add(name) {
+            name = String(name || '');
+            if (name && names.indexOf(name) === -1) names.push(name);
+        }
+        var table = gr.getTableName();
+        if (table === 'cmn_rota') {
+            add(gr.group.name);
+        } else if (table === 'cmn_rota_roster') {
+            add(gr.rota.group.name);
+        } else if (table === 'cmn_rota_member') {
+            add(gr.roster.rota.group.name);
+        } else if (table === 'cmn_schedule_span') {
+            // A rota's coverage window lives on its cmn_schedule; find the rota(s) using it.
+            var scheduleId = gr.getValue('schedule');
+            if (scheduleId) {
+                var rotaGr = new GlideRecord('cmn_rota');
+                rotaGr.addQuery('schedule', scheduleId);
+                rotaGr.query();
+                while (rotaGr.next()) add(rotaGr.group.name);
+            }
+        } else if (table === 'roster_schedule_span') {
+            // Only one-off "Provide coverage" is synced (as overrides); time off is not.
+            if (String(gr.getValue('type')) === 'on_call' && gr.getValue('roster')) add(gr.roster.rota.group.name);
+        }
+    },
+
+    // Mark every enrolled group pending (nightly catch-all for time-based changes that
+    // no edit announces: a member's from/to date arriving, a repeat_until expiring).
+    markAllPending: function() {
+        var names = this._enrolledGroupNames();
+        var marked = 0;
+        for (var i = 0; i < names.length; i++) {
+            if (this.markPending(names[i])) marked++;
+        }
+        gs.info('PagerDutySync.markAllPending: marked ' + marked + ' of ' + names.length + ' enrolled group(s) pending');
+        return marked;
+    },
+
+    // Is this row due? {ok, why}. A group is due once its changes have gone quiet for
+    // QUIET_PERIOD_SECONDS, or MAX_WAIT_SECONDS have passed since the first
+    // un-synced change -- and it isn't locked by a live run or backing off after a failure.
+    _eligibility: function(row, now) {
+        var runningFor = this._secondsSince(row.getValue('u_running_since'), now);
+        if (runningFor !== null && runningFor < this.STALE_LOCK_SECONDS) return {ok: false, why: 'running'};
+        var retryAfter = row.getValue('u_retry_after');
+        if (retryAfter && new GlideDateTime(retryAfter).getNumericValue() > now.getNumericValue()) {
+            return {ok: false, why: 'backing off until ' + retryAfter};
+        }
+        var sincePending = this._secondsSince(row.getValue('u_pending_since'), now);
+        var sinceChange = this._secondsSince(row.getValue('u_last_change') || row.getValue('u_pending_since'), now);
+        if (sinceChange !== null && sinceChange >= this.QUIET_PERIOD_SECONDS) return {ok: true, why: 'quiet'};
+        if (sincePending !== null && sincePending >= this.MAX_WAIT_SECONDS) return {ok: true, why: 'max wait'};
+        return {ok: false, why: 'still changing'};
+    },
+
+    // The scheduled job's entry point (every minute). Live only: a dry run has no
+    // business going through a queue. Returns a summary object.
+    // `onlyGroups` (optional array of group names) restricts the run; the scheduled
+    // job passes nothing. Exists so tests can drive the queue without touching real groups.
+    processPending: function(onlyGroups) {
+        this._logVersionAndStart('processPending');
+        var summary = {synced: [], failed: [], skipped: [], busy: [], waiting: 0};
+        if (!this._syncStateReady()) return summary;
+        var startedAt = new GlideDateTime();
+        var due = [];
+        var gr = new GlideRecord(this.SYNC_GROUP_TABLE);
+        gr.addNotNullQuery('u_pending_since');
+        gr.orderBy('u_pending_since');
+        gr.query();
+        while (gr.next()) {
+            if (onlyGroups && onlyGroups.indexOf(gr.u_group.name.toString()) === -1) continue;
+            var verdict = this._eligibility(gr, new GlideDateTime());
+            if (verdict.ok) due.push({sysId: gr.getUniqueValue(), name: gr.u_group.name.toString(), why: verdict.why});
+            else summary.waiting++;
+        }
+        for (var i = 0; i < due.length; i++) {
+            if (this._secondsSince(startedAt.getValue(), new GlideDateTime()) > this.MAX_RUN_SECONDS) {
+                gs.warn('PagerDutySync.processPending: run budget (' + this.MAX_RUN_SECONDS + 's) used up; ' +
+                    (due.length - i) + ' due group(s) left for the next run');
+                break;
+            }
+            gs.info('PagerDutySync.processPending: syncing "' + due[i].name + '" (due: ' + due[i].why + ')');
+            var outcome = this._runTracked(due[i].sysId, 'scheduled');
+            if (outcome.status === 'success') summary.synced.push(due[i].name);
+            else if (outcome.status === 'failed') summary.failed.push(due[i].name);
+            else if (outcome.status === 'skipped') summary.skipped.push(due[i].name);
+            else summary.busy.push(due[i].name);
+        }
+        gs.info('PagerDutySync.processPending: ' + JSON.stringify(summary));
+        return summary;
+    },
+
+    // Manual / event-driven sync of one enrolled group, going through the same lock
+    // and recording the same history as the scheduled path. If a sync of this group
+    // is already running, it is queued (marked pending) instead of run concurrently.
+    syncGroupTracked: function(groupName) {
+        this._logVersionAndStart('syncGroupTracked(' + groupName + ')');
+        var row = this._syncRowForGroup(groupName);
+        if (!row) {
+            gs.warn('PagerDutySync.syncGroupTracked: ' + groupName + ' is not enrolled in ' + this.SYNC_GROUP_TABLE + '; nothing to do');
+            return {status: 'skipped', message: 'not enrolled'};
+        }
+        if (!this._syncStateReady()) {
+            // Sync-state columns not added yet: still sync (as before the queue existed),
+            // just without a lock or history. _syncStateReady() already logged what's missing.
+            gs.warn('PagerDutySync.syncGroupTracked: running "' + groupName + '" UNTRACKED (no lock, no history) ' +
+                'because ' + this.SYNC_GROUP_TABLE + ' is missing sync-state columns');
+            try {
+                this.syncGroup(groupName, false);
+                return {status: 'success', message: 'ran untracked'};
+            } catch (e) {
+                gs.error('PagerDutySync: sync of "' + groupName + '" failed: ' + e);
+                return {status: 'failed', message: String(e && e.message ? e.message : e)};
+            }
+        }
+        var outcome = this._runTracked(row.getUniqueValue(), 'manual');
+        if (outcome.status === 'busy') {
+            this.markPending(groupName);
+            gs.info('PagerDutySync.syncGroupTracked: "' + groupName + '" is already syncing; marked pending so it runs again after');
+        }
+        return outcome;
+    },
+
+    syncAllTracked: function() {
+        var names = this._enrolledGroupNames();
+        var out = [];
+        for (var i = 0; i < names.length; i++) out.push({group: names[i], outcome: this.syncGroupTracked(names[i])});
+        return out;
+    },
+
+    // Claims the row's lock, runs a LIVE syncGroup() for it inside try/catch, and
+    // writes the outcome back. Returns {status: success|failed|skipped|busy, message}.
+    _runTracked: function(sysId, trigger) {
+        var T = this.SYNC_GROUP_TABLE;
+        var now = new GlideDateTime();
+        var staleCutoff = new GlideDateTime();
+        staleCutoff.addSeconds(-this.STALE_LOCK_SECONDS);
+
+        // Claim: take the lock only if free (or stale), then confirm by token that we, not a
+        // concurrent run, were the last writer. Not a true atomic compare-and-set (ServiceNow
+        // has none), but it narrows a double-claim to a window of a few milliseconds.
+        var claim = new GlideRecord(T);
+        claim.addEncodedQuery('sys_id=' + sysId + '^u_running_sinceISEMPTY^ORu_running_since<' + staleCutoff.getValue());
+        claim.query();
+        if (!claim.next()) return {status: 'busy', message: 'another sync of this group is running'};
+        var groupName = claim.u_group.name.toString();
+        var changeWatermark = claim.getValue('u_last_change') || '';
+        var token = gs.generateGUID();
+        claim.setValue('u_running_since', now.getValue());
+        claim.setValue('u_claim_token', token);
+        claim.setValue('u_last_attempt', now.getValue());
+        claim.update();
+        var verify = new GlideRecord(T);
+        verify.get(sysId);
+        if (verify.getValue('u_claim_token') !== token) return {status: 'busy', message: 'lost the claim race'};
+
+        var status = 'success', message = '';
+        try {
+            var collected = this.syncGroup(groupName, false);
+            if (collected === null) {
+                status = 'skipped'; message = 'not enrolled';
+            } else if (collected.skipped) {
+                status = 'skipped'; message = collected.skipped;
+            } else {
+                message = collected.schedules.length + ' schedule action(s), ' + collected.escalation_policies.length +
+                    ' escalation policy action(s), ' + collected.overrides.length + ' coverage override(s) [' + trigger + ']';
+            }
+        } catch (e) {
+            status = 'failed';
+            message = String(e && e.message ? e.message : e);
+            gs.error('PagerDutySync: sync of "' + groupName + '" failed: ' + message);
+        }
+
+        var fin = new GlideRecord(T);
+        fin.get(sysId);
+        var doneAt = new GlideDateTime();
+        fin.setValue('u_running_since', '');
+        fin.setValue('u_claim_token', '');
+        fin.setValue('u_last_result', status);
+        fin.setValue('u_last_message', String(message).substring(0, 4000));
+        // Did anything change while we were syncing? Then those edits are not in this sync.
+        var lastChange = fin.getValue('u_last_change') || '';
+        var changedDuring = lastChange && (!changeWatermark || String(lastChange) > String(changeWatermark));
+        if (status === 'failed') {
+            var failures = (parseInt(fin.getValue('u_consecutive_failures'), 10) || 0) + 1;
+            var backoff = this.RETRY_BACKOFF_MINUTES[Math.min(failures, this.RETRY_BACKOFF_MINUTES.length) - 1];
+            var retryAt = new GlideDateTime();
+            retryAt.addSeconds(backoff * 60);
+            fin.setValue('u_consecutive_failures', failures);
+            fin.setValue('u_retry_after', retryAt.getValue());
+            if (!fin.getValue('u_pending_since')) fin.setValue('u_pending_since', doneAt.getValue()); // keep it queued for the retry
+        } else {
+            if (status === 'success') {
+                fin.setValue('u_last_success', doneAt.getValue());
+                fin.setValue('u_consecutive_failures', 0);
+            }
+            fin.setValue('u_retry_after', '');
+            fin.setValue('u_pending_since', changedDuring ? lastChange : '');
+        }
+        fin.update();
+        return {status: status, message: message};
+    },
+
     _syncOneGroup: function(groupName, asOf, dryRun, collected) {
         var snow = this._loadSnowData(groupName);
         var expiredRotaIds = {};
@@ -265,6 +570,7 @@ PagerDutySync.prototype = {
         if (snow.rotasForGroup().length === 0) {
             gs.warn('PagerDutySync: "' + groupName + '" has no rota left with current coverage (every rota ' +
                 'either was never loaded or has expired); leaving its PagerDuty objects untouched this run');
+            collected.skipped = 'no rota with current coverage; PagerDuty objects left untouched';
             return;
         }
         this._rosterOverrides = this._loadRosterOverrides(groupName, snow, asOf);
@@ -1504,10 +1810,11 @@ PagerDutySync.prototype = {
     // on-call sequence for a forced-new-engine roster (member added, engine
     // upgraded, in the same order the customer's real timeline did it).
     //
-    // As a side effect, this also correctly skips a member whose OWN time-off
-    // makes them not really on call right now (ServiceNow's live computation
-    // already accounts for that), which pure order/date math has no way to
-    // know about either.
+    // Provide-coverage and time-off spans don't move this answer: coverage comes
+    // back as a separate roster_schedule_span row (dropped by the table filter in
+    // _getSpansForRota) and time off as a separate 'timeoff' row, leaving the
+    // member's own cmn_rota_member span in place -- so this reports the NOMINAL
+    // rotation, not a substitute. Tested on both engines; see README.
     //
     // Returns {index, checkInstant, source} -- index into `active` (-1 if
     // unresolvable), checkInstant (a GlideDateTime) is the real instant that
@@ -2180,16 +2487,17 @@ PagerDutySync.prototype = {
         return this.SYNCED_NAME_PREFIX + name;
     },
 
-    // Upserts one v3 schedule by name, with a single rotation holding `events`
-    // (already-built Event request objects). Every sync deletes and recreates every
-    // event this schedule's rotation holds, rather than diffing and PUTting existing
-    // ones in place -- see ASSUMPTION 3 in the file header for why (in short: v3
-    // only allows changing effective_until on an already-"active" event via PUT, so
-    // a plain update can't reliably apply roster/shape changes once an event has
-    // started). This is the v3 analog of the v2 file's _upsertSchedule, which instead
-    // did one PUT replacing the whole schedule_layers array in place (preserving
-    // layer ids by name-matching) -- not possible here since schedule/rotation/event
-    // are separate resources with their own endpoints, not one atomic replace.
+    // Upserts one v3 schedule by name, with one rotation per event in `events`
+    // (already-built Event request objects). Every sync ENDS every active event the
+    // schedule has and creates a replacement per desired event, rather than diffing
+    // and PUTting existing ones in place -- see ASSUMPTION 3 in the file header for
+    // why (in short: v3 only allows changing effective_until on an already-"active"
+    // event via PUT, so a plain update can't reliably apply roster/shape changes
+    // once an event has started). Ending instead of deleting preserves the schedule's
+    // past; see the comment inside for what was confirmed live. This is the v3 analog
+    // of the v2 file's _upsertSchedule, which did one PUT replacing the whole
+    // schedule_layers array in place -- not possible here since schedule/rotation/
+    // event are separate resources with their own endpoints, not one atomic replace.
     _upsertScheduleV3: function(name, tzName, description, events, dryRun, collected) {
         var existing = this._findScheduleV3ByName(name);
         var action = existing ? 'update' : 'create';
@@ -2233,98 +2541,132 @@ PagerDutySync.prototype = {
         // can hold several independent shift patterns at once. Confirmed live:
         // creating a second always-on event in a shared rotation was rejected --
         // "Event with id ... overlaps with this event" (error code 2001) -- even
-        // though the two events' own day/time patterns don't conflict (the two
-        // alternating groups' shapes were already confirmed non-overlapping by
-        // hand). The overlap check is on the event's effective_since/
-        // effective_until window (both open-ended = "forever" = unconditionally
-        // overlapping in PagerDuty's eyes), not on recurrence shape. So this
-        // schedule needs one rotation PER logical event (one per roster row,
-        // alternating group, or every_member group) -- matching v2's
-        // one-layer-per-row structure -- not one shared rotation holding every
-        // event the way this first assumed.
+        // though the two events' own day/time patterns don't conflict. The overlap
+        // check is on the event's effective_since/effective_until window, not on
+        // recurrence shape. So this schedule needs one rotation PER logical event
+        // (one per roster row, alternating group, or every_member group).
         //
-        // Rotations have no name/identifying field of their own (confirmed
-        // against the OpenAPI spec -- just {id, type, events}), so matching an
-        // existing rotation to a desired event goes through the event it
-        // contains: this port only ever puts exactly one event in a rotation it
-        // manages, so that event's name is a reliable proxy for the rotation's
-        // identity across syncs.
+        // Every sync replaces EVERY event, but ENDS the old ones instead of deleting
+        // them, so the schedule keeps its past: an ended event stops producing shifts
+        // from the moment it ends and keeps the ones it already produced. Existing
+        // rotations are not matched to desired events by event name to decide what to
+        // keep -- there is nothing to keep, since an active event can't be edited
+        // anyway -- so a typo, a rename or a duplicate name can't strand a layer. The
+        // name is only a preference when picking which freed rotation a new event
+        // reuses (so a rotation's overrides stay with the same layer).
         //
-        // Fetches the schedule by id rather than the separate .../rotations
-        // endpoint -- confirmed against the OpenAPI spec that GET v3/schedules/{id}
-        // already returns the schedule "including rotations and events" in one
-        // call (ScheduleResponse.schedule.rotations), so there's no need for a
-        // second round trip just to list them.
+        // Confirmed live against PagerDuty (dev domain, 2026-10):
+        //   - PUT .../events/{id} with effective_until ends an active event. PagerDuty
+        //     stores the time it processed the call if the value sent is already in
+        //     the past, so "end now" is just sending now -- there is no window where
+        //     old and new events both produce shifts. The PUT body must be the event
+        //     as GET returns it (effective_since differs by a second between the POST
+        //     response and the stored value, which PagerDuty rejects as a change), and
+        //     effective_until must be after effective_since.
+        //   - Once the old event has ended, a replacement event can be POSTed into the
+        //     SAME rotation, so rotations are reused instead of piling up; a rotation
+        //     held 57 consecutive ended events with no error, and 45 rotations on one
+        //     schedule. Ended events drop out of GET v3/schedules/{id} after a short
+        //     delay (a direct GET of the rotation still lists them).
+        //   - effective_since on any new event is clamped to the time it was created.
+        //   - GET v3/schedules/{id} lists EMPTY rotations. They have no history to
+        //     preserve, so any surplus ones are deleted -- they are the leaked layers
+        //     this replaced name matching to catch.
+        //   - Deleting a rotation does NOT delete its overrides; they are orphaned and
+        //     then can never be deleted (404 "Rotation Not Found"). So a rotation's
+        //     upcoming overrides are deleted BEFORE the rotation is. An override on a
+        //     rotation whose events have all ended CAN still be deleted.
+        var now = new GlideDateTime();
+        var nowIso = now.getValue().replace(' ', 'T') + 'Z';
         var existingRotations = existing
             ? (rest.getRESTThrowable('v3/schedules/' + scheduleId).data.schedule.rotations || [])
             : [];
-        var rotationByEventName = {};
-        for (var r = 0; r < existingRotations.length; r++) {
-            var rotationEvents = existingRotations[r].events || [];
+
+        // Split what is there into events to end and rotations free to reuse. An
+        // event is active unless its effective_until is already in the past.
+        var eventsToEnd = [];
+        var slots = [];
+        var emptyRotationCount = 0;
+        for (var er = 0; er < existingRotations.length; er++) {
+            var rotationEvents = existingRotations[er].events || [];
+            var firstActiveName = null;
             for (var re = 0; re < rotationEvents.length; re++) {
-                rotationByEventName[rotationEvents[re].name] = {rotationId: existingRotations[r].id, event: rotationEvents[re]};
+                var untilValue = rotationEvents[re].effective_until;
+                if (untilValue && untilValue <= nowIso) continue;
+                if (firstActiveName === null) firstActiveName = rotationEvents[re].name;
+                eventsToEnd.push({rotationId: existingRotations[er].id, event: rotationEvents[re]});
+            }
+            if (!rotationEvents.length) emptyRotationCount++;
+            slots.push({rotationId: existingRotations[er].id, name: firstActiveName, empty: !rotationEvents.length, used: false});
+        }
+
+        // Pair each desired event with a rotation to reuse: same event name first,
+        // then any free one; whatever is left over gets a new rotation.
+        var slotForEvent = [];
+        for (var pk = 0; pk < events.length; pk++) {
+            slotForEvent[pk] = null;
+            for (var ps = 0; ps < slots.length; ps++) {
+                if (!slots[ps].used && slots[ps].name === events[pk].name) { slots[ps].used = true; slotForEvent[pk] = slots[ps]; break; }
+            }
+        }
+        for (var pk2 = 0; pk2 < events.length; pk2++) {
+            if (slotForEvent[pk2]) continue;
+            for (var ps2 = 0; ps2 < slots.length; ps2++) {
+                if (!slots[ps2].used) { slots[ps2].used = true; slotForEvent[pk2] = slots[ps2]; break; }
             }
         }
 
-        var desiredNames = {};
-        for (var e = 0; e < events.length; e++) desiredNames[events[e].name] = true;
-
-        // Remove rotations whose event no longer corresponds to anything this
-        // sync produces -- same "replace everything this port manages" semantics
-        // as before.
-        var removedRotations = 0;
-        for (var existingName in rotationByEventName) {
-            if (!rotationByEventName.hasOwnProperty(existingName) || desiredNames.hasOwnProperty(existingName)) continue;
-            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationByEventName[existingName].rotationId, null);
-            removedRotations++;
-        }
-        if (removedRotations) {
-            gs.info('  removed ' + removedRotations + ' rotation(s) from "' + name + '" no longer produced by this sync');
+        if (existing) {
+            gs.info('  "' + name + '": found ' + existingRotations.length + ' existing rotation(s) (' + emptyRotationCount +
+                ' empty) with ' + eventsToEnd.length + ' active event(s); ending them and creating ' + events.length + ' event(s)');
         }
 
-        // PagerDuty rejects DELETE on an event whose effective_until is already in
-        // the past -- confirmed live: HTTP 400, error code 2004, "Schedule contains
-        // events with effective_until in the past." Such an event is already inert
-        // (it stopped producing shifts once effective_until passed) and can't be
-        // removed via this endpoint -- but since it's already ended, its window
-        // doesn't overlap a new one starting now/in the future, so it's safe to
-        // just leave it in place and add the replacement alongside it in the same
-        // rotation.
-        var now = new GlideDateTime();
-        var createdRotationCount = 0, updatedEventCount = 0, skippedEndedCount = 0;
+        // Ended, not deleted: keeps the past. A failed end falls back to deleting that
+        // one event rather than leaving a stale layer producing shifts.
+        var endedCount = 0, endFallbackDeletes = 0;
+        for (var te = 0; te < eventsToEnd.length; te++) {
+            if (this._v3EndEvent(rest, scheduleId, eventsToEnd[te].rotationId, eventsToEnd[te].event, nowIso)) {
+                endedCount++;
+            } else {
+                gs.warn('PagerDutySync: could not end event "' + eventsToEnd[te].event.name + '" (' + eventsToEnd[te].event.id +
+                    ') on "' + name + '"; deleting it instead (its past shifts are lost)');
+                this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/rotations/' + eventsToEnd[te].rotationId + '/events/' + eventsToEnd[te].event.id);
+                endFallbackDeletes++;
+            }
+        }
+
+        // Surplus empty rotations are leaked layers with no history: delete them,
+        // upcoming overrides first (see above).
+        var surplusEmptyIds = [];
+        for (var sx = 0; sx < slots.length; sx++) {
+            if (!slots[sx].used && slots[sx].empty) surplusEmptyIds.push(slots[sx].rotationId);
+        }
+        if (surplusEmptyIds.length) {
+            this._deleteUpcomingOverridesOnRotations(rest, scheduleId, name, surplusEmptyIds, nowIso);
+            for (var sd = 0; sd < surplusEmptyIds.length; sd++) {
+                this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/rotations/' + surplusEmptyIds[sd]);
+            }
+            gs.info('  removed ' + surplusEmptyIds.length + ' surplus empty rotation(s) from "' + name + '"');
+        }
+
         var rotationIdByEventName = {};
+        var reusedCount = 0, newRotationCount = 0;
         for (var k = 0; k < events.length; k++) {
             var desiredEvent = events[k];
-            var match = rotationByEventName[desiredEvent.name];
             var rotationId;
-            if (match) {
-                rotationId = match.rotationId;
-                var alreadyEnded = false;
-                if (match.event.effective_until) {
-                    var effectiveUntilGdt = new GlideDateTime(match.event.effective_until.replace('T', ' ').replace(/Z$/, ''));
-                    alreadyEnded = effectiveUntilGdt.compareTo(now) < 0;
-                }
-                if (alreadyEnded) {
-                    skippedEndedCount++;
-                } else {
-                    this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + match.event.id, null);
-                }
-                updatedEventCount++;
+            if (slotForEvent[k]) {
+                rotationId = slotForEvent[k].rotationId;
+                reusedCount++;
             } else {
-                var newRotation = this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations', {}).data;
-                rotationId = newRotation.rotation.id;
-                createdRotationCount++;
+                rotationId = this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations', {}).data.rotation.id;
+                newRotationCount++;
             }
             this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: desiredEvent});
             rotationIdByEventName[desiredEvent.name] = rotationId;
             gs.info('  created event "' + desiredEvent.name + '" on schedule "' + name + '"');
         }
-        if (createdRotationCount) gs.info('  created ' + createdRotationCount + ' new rotation(s) on "' + name + '"');
-        if (updatedEventCount) gs.info('  updated ' + updatedEventCount + ' existing rotation\'s event on "' + name + '"');
-        if (skippedEndedCount) {
-            gs.info('  ' + skippedEndedCount + ' matched event(s) had already ended (left in place, PagerDuty ' +
-                'won\'t delete them) before adding the replacement alongside them in the same rotation');
-        }
+        gs.info('  "' + name + '": ended ' + endedCount + ' event(s)' + (endFallbackDeletes ? ' (' + endFallbackDeletes + ' deleted instead)' : '') +
+            ', created ' + events.length + ' event(s) (' + reusedCount + ' in reused rotation(s), ' + newRotationCount + ' in new rotation(s))');
 
         // Coverage overrides go on last: they hang off a rotation id, and the delete/
         // recreate of each event above may have removed or truncated old ones. A
@@ -2485,8 +2827,9 @@ PagerDutySync.prototype = {
                 have[ovKey] = true;
                 continue;
             }
-            this._v3WriteOrThrow(rest, 'delete', 'v3/schedules/' + scheduleId + '/overrides/' + ov.id, null);
-            deleted++;
+            // An override orphaned by an earlier run's deleted rotation 404s here and
+            // can never be removed; skip it rather than abort creating the real ones.
+            if (this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/overrides/' + ov.id)) deleted++;
         }
 
         var bodies = [];
@@ -2503,6 +2846,60 @@ PagerDutySync.prototype = {
         }
         if (deleted || created) {
             gs.info('  coverage overrides on "' + scheduleName + '": ' + created + ' created, ' + deleted + ' removed');
+        }
+    },
+
+    // DELETE that treats 404 as "already gone" (returns false) instead of retrying
+    // and throwing the way _v3WriteOrThrow does for a just-created resource. Any
+    // other failure is logged and thrown as usual.
+    _v3DeleteIfPresent: function(rest, endpoint) {
+        var response = rest.deleteREST(endpoint);
+        if (!response.haveError()) return true;
+        if (response.getStatusCode() === 404) return false;
+        gs.error('PagerDutySync: v3 DELETE ' + endpoint + ' failed -- status ' + response.getStatusCode() +
+            ', body: ' + response.getBody());
+        throw new Error('v3 DELETE ' + endpoint + ' failed (status ' + response.getStatusCode() + '): ' + response.getBody());
+    },
+
+    // Ends an active event at `nowIso` by PUTting it back with effective_until set,
+    // which keeps everything it already produced (see _upsertScheduleV3). The body is
+    // the event exactly as read from PagerDuty minus its read-only fields -- PagerDuty
+    // rejects effective_since as "cannot be modified" if it differs even by a second.
+    // effective_until must be after effective_since, so an event created this very
+    // second is ended one second after it started. Returns false instead of throwing
+    // so the caller can fall back.
+    _v3EndEvent: function(rest, scheduleId, rotationId, event, nowIso) {
+        var body = {};
+        for (var key in event) {
+            if (event.hasOwnProperty(key) && key !== 'id' && key !== 'self' && key !== 'html_url' && key !== 'type') body[key] = event[key];
+        }
+        var untilIso = nowIso;
+        if (event.effective_since && untilIso <= event.effective_since) {
+            untilIso = this._addSecondsToUtcIso(event.effective_since, 1);
+        }
+        body.effective_until = untilIso;
+        var response = rest.putREST('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + event.id, {event: body});
+        if (!response.haveError()) return true;
+        gs.warn('PagerDutySync: v3 PUT to end event ' + event.id + ' failed -- status ' + response.getStatusCode() + ', body: ' + response.getBody());
+        return false;
+    },
+
+    // Deletes the not-yet-finished overrides that belong to the given rotations. Must
+    // run BEFORE those rotations are deleted: PagerDuty keeps an override after its
+    // rotation is deleted but then refuses to delete it (404 "Rotation Not Found").
+    _deleteUpcomingOverridesOnRotations: function(rest, scheduleId, scheduleName, rotationIds, nowIso) {
+        var untilIso = this._addSecondsToUtcIso(nowIso, 730 * 86400);
+        var listing = rest.getRESTThrowable('v3/schedules/' + scheduleId + '/overrides?since=' + nowIso + '&until=' + untilIso).data;
+        var existingOverrides = (listing && listing.overrides) || [];
+        var wantedRotation = {};
+        for (var w = 0; w < rotationIds.length; w++) wantedRotation[rotationIds[w]] = true;
+        var deleted = 0;
+        for (var x = 0; x < existingOverrides.length; x++) {
+            if (existingOverrides[x].end_time <= nowIso || !wantedRotation.hasOwnProperty(existingOverrides[x].rotation_id)) continue;
+            if (this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/overrides/' + existingOverrides[x].id)) deleted++;
+        }
+        if (deleted) {
+            gs.info('  removed ' + deleted + ' override(s) on "' + scheduleName + '" ahead of deleting their rotation(s)');
         }
     },
 

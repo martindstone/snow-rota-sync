@@ -3,12 +3,19 @@
 // Event name: pagerduty_sync.requested   <-- must match the Event Registry entry below
 // Active: true
 //
-// This is the ONE place that actually calls into PagerDutySync. Both UI Actions and
-// the (optional, inactive-by-default) Business Rule only ever queue an event -- they
-// never call PagerDutySync directly -- so the actual PagerDuty API calls always run
-// asynchronously on the event queue, off the UI Action's request thread. This is what
-// makes the UI Actions safe from the ~60-90-sequential-API-call timeout risk that a
-// synchronous call would have.
+// This handles MANUAL syncs: the UI Actions only ever queue an event -- they never call
+// PagerDutySync directly -- so the actual PagerDuty API calls run asynchronously on the
+// event queue, off the UI Action's request thread. This is what makes the UI Actions safe
+// from the ~60-90-sequential-API-call timeout risk that a synchronous call would have.
+// (Automatic, edit-driven syncs do NOT come through here: the Business Rules in
+// business_rules_mark_pending.js only mark a group pending, and the scheduled job
+// "PagerDuty Sync - Process Pending" syncs it once edits have gone quiet.)
+//
+// A manual live sync bypasses the debounce but shares the queue's per-group lock and
+// history: the outcome lands in u_last_attempt / u_last_result / u_last_message on the
+// group's u_pagerduty_sync_group row, and a group that is already syncing is marked pending
+// to run again afterwards rather than synced concurrently. If the sync-state columns
+// haven't been added yet it falls back to an untracked sync (logged as a warning).
 //
 // event.parm1 = "all" (sync every group enrolled in u_pagerduty_sync_group) or a
 //               specific group name
@@ -44,17 +51,28 @@
     var sync = new PagerDutySync();
 
     try {
-        if (!groupScope || groupScope === 'all') {
-            sync.syncAll(dryRun);
+        if (dryRun) {
+            // Dry runs never touch PagerDuty, so they skip the lock and leave the
+            // sync history on u_pagerduty_sync_group alone.
+            if (!groupScope || groupScope === 'all') {
+                sync.syncAll(true);
+            } else {
+                sync.syncGroup(groupScope, true);
+            }
+        } else if (!groupScope || groupScope === 'all') {
+            // Live runs go through the same lock + history as the scheduled job
+            // (see PagerDutySync.processPending). A group already syncing is queued
+            // to run again afterwards instead of being synced concurrently.
+            sync.syncAllTracked();
         } else {
-            sync.syncGroup(groupScope, dryRun);
+            sync.syncGroupTracked(groupScope);
         }
     } catch (e) {
         gs.error('pagerduty_sync.requested script action failed for scope="' + groupScope +
             '" mode="' + mode + '": ' + e);
         // Deliberately not re-thrown -- this runs on the event queue with no user
-        // waiting on a response; the gs.error() above is what surfaces the failure
-        // (System Logs > Error, or wire up an Email Notification on this error if
-        // you want to be paged when a sync fails).
+        // waiting on a response. Live syncs already record their own failures on the
+        // group's row (u_last_result = failed, u_last_message); this catch is only for
+        // something unexpected outside that (System Logs > Error shows it).
     }
 })();

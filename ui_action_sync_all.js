@@ -20,9 +20,9 @@
 (function() {
     gs.eventQueue('pagerduty_sync.requested', current, 'all', 'live');
 
-    gs.addInfoMessage('PagerDuty sync for all groups has been queued. Check System Logs ' +
-        '(filter: Source = PagerDutySync, or search "pagerduty_sync.requested") in a ' +
-        'minute or two for the result.');
+    gs.addInfoMessage('PagerDuty sync for all groups has been queued. Each group\'s PagerDuty Sync ' +
+        'Group record shows its result (Last sync result / message); System Logs ' +
+        '(Source = PagerDutySync) has the detail.');
 
     action.setRedirectURL(current);
 })();

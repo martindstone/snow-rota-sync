@@ -27,9 +27,9 @@
 
     gs.eventQueue('pagerduty_sync.requested', current, groupName, 'live');
 
-    gs.addInfoMessage('PagerDuty sync for "' + groupName + '" has been queued. Check System ' +
-        'Logs (filter: Source = PagerDutySync, or search "pagerduty_sync.requested") in a ' +
-        'minute or two for the result.');
+    gs.addInfoMessage('PagerDuty sync for "' + groupName + '" has been queued. In a minute or two ' +
+        'its PagerDuty Sync Group record shows the result (Last sync result / message); System Logs ' +
+        '(Source = PagerDutySync) has the detail.');
 
     action.setRedirectURL(current);
 })();

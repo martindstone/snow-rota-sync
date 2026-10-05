@@ -15,7 +15,8 @@ on an instance that already has that app installed and configured.
 | `pagerduty_sync_script_action.js` | Script Action | System Policy > Events > Script Actions. Also requires an Event Registry entry (see comment at the top of the file) named `pagerduty_sync.requested`. |
 | `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
-| `business_rule_sync_on_change.js` | Business Rule | System Definition > Business Rules, on `cmn_rota`. **Ships inactive.** |
+| `business_rules_mark_pending.js` | Business Rules (x5) | System Definition > Business Rules, one per source table (see the file header). They only mark the group pending -- they never call PagerDuty -- so they're safe to leave active. |
+| `scheduled_job_process_pending_syncs.js` | Scheduled Jobs (x2) | System Definition > Scheduled Jobs. The every-minute job does the actual syncing (**leave inactive until validated**); the nightly one marks every group pending. |
 | `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.txt` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
 | `export_oncall_config.txt` | Standalone script | A Python script saved as `.txt` so mail filters let it through -- rename to `.py` to run it. Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring), the extra `cmn_rota_roster` day-of-week/payload fields, who each span is *for* and what it overrides (`user`/`parent`/`show_as`/`notes`), each rota's `based_on` calendar, an `other_schedules` sweep of everything else attached to the group's rotas/rosters/members, and a `roster_schedule_spans` / `roster_schedule_span_proposals` sweep -- `roster_schedule_span` ("Roster Schedule Entry", a `cmn_schedule_span` subclass keyed by `roster`, or by `group` for time off, and living on the covering *user's* schedule rather than any rota's) is where ServiceNow stores one-off "Provide coverage" shifts (`type=on_call`, shown in its calendar as "<user> (<roster> Coverage)") and time off, so none of the schedule-based queries can see them. PagerDutySync syncs the one-off `type=on_call` coverage spans as v3 overrides (see "Coverage overrides" below); time off is still not synced. That sweep degrades to a warning if the account can't read those tables. Stdlib only, nothing to `pip install`. See its own docstring for usage. |
 
@@ -41,8 +42,60 @@ auto-provisioning fields on `sys_user_group`, which is a different mechanism thi
 port doesn't touch or need to know about.
 
 `PagerDutySync.isEnrolled(groupName)` is the one place that knows what "enrolled"
-means -- the Business Rule and contextual UI Action condition scripts call it
+means -- the Business Rules and contextual UI Action condition scripts call it
 directly, so there's a single source of truth.
+
+## Debounced sync queue
+
+`u_pagerduty_sync_group` also carries the per-group sync state, so there is no
+separate queue table. Add these columns (all Global scope, none mandatory):
+
+| Column | Type | Meaning |
+|---|---|---|
+| `u_pending_since` | Date/Time | When the first un-synced change arrived. Empty = nothing waiting. |
+| `u_last_change` | Date/Time | When the most recent change arrived (what the quiet period waits on). |
+| `u_running_since` | Date/Time | Lock. Empty = not syncing; a lock older than 15 min is treated as stale. |
+| `u_claim_token` | String (40) | Confirms which run won the lock. Hide it from forms. |
+| `u_retry_after` | Date/Time | Backoff after a failure. Empty = no backoff. |
+| `u_last_attempt` | Date/Time | When the last sync started. |
+| `u_last_result` | Choice: `success`, `failed`, `skipped` | Outcome of the last attempt. |
+| `u_last_message` | String (4000) | Error text, or a one-line summary of what was written. |
+| `u_last_success` | Date/Time | When the last successful sync finished. |
+| `u_consecutive_failures` | Integer | Drives the retry backoff. Reset to 0 on success. |
+
+Turn on **Audit** for `u_last_result`, `u_last_message` and `u_last_success` if you
+want a history of syncs for free. `PagerDutySync` logs an error and does nothing if
+any column is missing, rather than silently ignoring writes to it.
+
+How it works:
+
+1. The five Business Rules in `business_rules_mark_pending.js` call
+   `markPendingForRecord(current, previous)`, which sets `u_last_change` (and
+   `u_pending_since`, if empty) on the enrolled group's row. Records of groups that
+   aren't enrolled are ignored.
+2. The every-minute job calls `processPending()`. A group is *due* once its last
+   change is `QUIET_PERIOD_SECONDS` (120) old, or `MAX_WAIT_SECONDS` (600) have
+   passed since the first un-synced change (so continuous edits can't defer a sync
+   forever), and it is not locked or backing off. Due groups are synced one at a time,
+   oldest first, until `MAX_RUN_SECONDS` (240) is used up.
+3. Each sync takes the row's lock, runs a live `syncGroup()` inside a `try/catch`, and
+   writes `u_last_*`. If anything changed *during* the sync the group stays pending
+   and syncs again; otherwise `u_pending_since` is cleared.
+4. A failure leaves the group pending and retries after 5, then 15, then 60 minutes
+   (`RETRY_BACKOFF_MINUTES`). A fresh edit does not shorten a backoff; a manual sync does.
+5. The UI Actions / Script Action (`syncGroupTracked`, `syncAllTracked`) use the same
+   lock and history. If a sync of that group is already running, the request is queued
+   (marked pending) instead of run concurrently. Dry runs skip all of this.
+6. A nightly job marks every enrolled group pending (`markAllPending`) to pick up
+   changes no edit announces: a member's `from`/`to` date arriving, a `repeat_until`
+   expiring.
+
+Limits: the lock is claim-then-confirm, not a true atomic compare-and-set (ServiceNow
+has none), so two runs claiming the same group within a few milliseconds could both
+proceed; syncs are idempotent upserts, so the worst case is a redundant sync. The
+queue does not delete a PagerDuty schedule when a roster or rota is deleted, and
+there are no notifications on failure beyond `u_consecutive_failures` and the system
+log -- wire a notification to `u_consecutive_failures >= 3` if you want one.
 
 ## Naming convention
 
@@ -167,11 +220,19 @@ same table the same way) via `GlideSchedule.isInSchedule`, to find who
 ServiceNow really has on call *right now* (`asOf`, the sync's own run time --
 see below for why not `rotation_start_date`). `_offsetForGroundTruth` then
 back-solves the array rotation that reproduces that member in the matching
-PagerDuty slot. As a side effect this also correctly skips a member who's
-currently on their own time off (ServiceNow's schedule generation already
-routes their turn to the next member for that span -- see
-`_createMemberRotationSchedules`'s excluded-span patching), which plain
-order/date math has no way to know about either.
+PagerDuty slot. Time off and "Provide coverage" do **not** disturb this lookup
+(tested live on a PDI, both engines, with `fix_script_pc_timeoff_ground_truth.txt`):
+the pick stayed the same user at the same instant with a coverage span or a
+time-off span for the on-call member in place. On the 2024 engine a coverage span
+comes back as its own `roster_schedule_span` override row, which the
+`table === 'cmn_rota_member'` filter drops, and time off comes back as a separate
+`timeoff` row while the member's own `cmn_rota_member` span stays in place -- so the
+lookup reports the *nominal* rotation, not a substitute. (ServiceNow does split the
+member's span where the coverage or time-off interval ends; same user, harmless.) On
+the old engine neither showed up in `getSpans()` at all. One gap: a time-off span
+inserted by script did not appear on the old engine even after its schedules were
+regenerated, so time off created through the UI on an old-engine rota is not
+confirmed -- it was not observed to move the pick either.
 
 **Why `asOf` ("now"), not `rotation_start_date`:** after a membership change,
 ServiceNow caps the *old* segment's `repeat_until` at the date of the edit and
@@ -335,19 +396,29 @@ sync (it survives the event delete/recreate), and removed when the span was dele
   `every_member_assignment_strategy` expresses "these people should page together."
 - **Escalation policies stay on the classic v2 API**; only the schedules they target
   are v3, referenced via `type: 'schedule_v3_reference'`.
-- **Every sync deletes and recreates every event this port manages**, rather than
-  patching in place -- v3 only allows changing `effective_until` on an already-active
-  event via `PUT`, so a plain in-place update can't reliably apply a roster/shape
-  change. Tradeoff: no continuity of PagerDuty event id across syncs. An event whose
-  `effective_until` is already in the past is left alone rather than deleted (v3
-  rejects deleting those).
+- **Every sync ends every active event on a schedule and creates a replacement**,
+  rather than patching in place -- v3 only allows changing `effective_until` on an
+  already-active event via `PUT`, so a plain in-place update can't reliably apply a
+  roster/shape change. Ending (not deleting) keeps the schedule's past. Nothing is
+  matched by event name to decide what to keep, so a rename, typo or duplicate name
+  can't strand a layer; the replacement goes into the same rotation when one is free
+  (preferring one that held the same event name), so rotations don't pile up. Empty
+  rotations (leaked layers, no history) are deleted, upcoming overrides first --
+  PagerDuty orphans an override whose rotation is deleted and then won't delete it.
+  Tradeoffs: no continuity of PagerDuty event id across syncs, and each rotation
+  accumulates one ended event per sync (57 in a row worked in testing; no cap found).
+  An event is ended by `PUT` with the event body as `GET` returns it; if that fails
+  the event is deleted instead.
 
 ## One-time setup
 
 1. **Script Include**: create `PagerDutySync` from `PagerDutySync.js`.
-2. **Table**: create `u_pagerduty_sync_group` in Global scope (System Definition >
-   Tables > New) with the single `u_group` field described above, then add one row
-   per group you want this port to manage.
+2. **Table**: run `fix_script_create_sync_group_table.txt` in Scripts - Background
+   (Global scope; it defaults to a dry run -- set `DRY_RUN = false` to apply). It
+   creates `u_pagerduty_sync_group` with `u_group` and every sync-state column below, or
+   adds only the missing columns to a table you already made by hand. It does not create
+   a form/list layout -- configure one, and hide `u_claim_token`. Then add one row per
+   group you want this port to manage.
 3. **Event Registry entry**: `pagerduty_sync.requested` (System Policy > Events >
    Registry). See the comment in `pagerduty_sync_script_action.js` for the exact
    fields.
@@ -355,8 +426,14 @@ sync (it survives the event delete/recreate), and removed when the span was dele
    event above.
 5. **UI Actions**: create both, using the field settings documented in each file's
    header.
-6. **Business Rule**: create from `business_rule_sync_on_change.js`. Leave **Active
-   unchecked** until you've validated the UI Action path.
+6. **Sync-state columns**: already created by step 2's script (the columns are listed
+   under "Debounced sync queue").
+7. **Business Rules** and 8. **Scheduled Jobs**: run
+   `fix_script_create_sync_queue_rules_and_jobs.txt` (dry run by default; set
+   `DRY_RUN = false` to apply), or create them by hand from `business_rules_mark_pending.js`
+   and `scheduled_job_process_pending_syncs.js`. The rules only mark groups pending, so
+   they can be Active straight away. Leave the every-minute job **Inactive** until you've validated the UI Action path and
+   `fix_script_verify_sync_queue.txt`; activating it is what lets edits reach PagerDuty.
 
 ## Recommended verification steps
 
@@ -501,8 +578,10 @@ checkbox is on.
   fencing in this scoped app. A hardcoded `STANDARD_UTC_OFFSET_SECONDS` table
   (standard-time only) is kept as a fallback if it ever throws or misbehaves for a
   given zone.
-- **No debounce** on the Business Rule -- see the note at the bottom of
-  `business_rule_sync_on_change.js`.
+- **Debounce**: handled by the pending-sync queue on `u_pagerduty_sync_group` (see
+  "Debounced sync queue"). A rota moved between groups marks both only if the Business
+  Rule sees `previous`; a record whose group can't be resolved (e.g. already deleted) is
+  not marked.
 - **Event id churn**: every sync gives each managed event a fresh PagerDuty id (see
   "Architecture notes" above) -- nothing downstream should depend on a stable event
   id across syncs.
