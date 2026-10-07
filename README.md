@@ -12,25 +12,80 @@ on an instance that already has that app installed and configured.
 | File | Record type | Where it lives |
 |---|---|---|
 | `PagerDutySync.js` | Script Include | System Definition > Script Includes. Name it `PagerDutySync`, uncheck "Client callable" (server-only), set Accessible from per your scope policy. |
-| `pagerduty_sync_script_action.js` | Script Action | System Policy > Events > Script Actions. Also requires an Event Registry entry (see comment at the top of the file) named `pagerduty_sync.requested`. |
+| `pagerduty_sync_script_action.js` | Script Action | System Policy > Events > Script Actions. Also requires an Event Registry entry (see comment at the top of the file) named `pagerduty_sync.requested`. Handles manual syncs. |
 | `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
 | `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
-| `business_rules_mark_pending.js` | Business Rules (x5) | System Definition > Business Rules, one per source table (see the file header). They only mark the group pending -- they never call PagerDuty -- so they're safe to leave active. |
-| `scheduled_job_process_pending_syncs.js` | Scheduled Jobs (x2) | System Definition > Scheduled Jobs. The every-minute job does the actual syncing (**leave inactive until validated**); the nightly one marks every group pending. |
-| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment, doesn't call `PagerDutySync` at all. A one-click way for a non-technical group owner to hand you their group's full on-call config (all four source tables, raw/unparsed) as a single JSON file attached to their Group record, instead of walking them through table names and dot-walked list filters. **Narrower than `export_oncall_config.txt` below** -- doesn't yet pull `cmn_rota_member.rotation_schedule` or the extra `cmn_rota_roster` day-of-week/payload fields; update it to match if you need those from a UI-Action-driven export too. |
-| `export_oncall_config.txt` | Standalone script | A Python script saved as `.txt` so mail filters let it through -- rename to `.py` to run it. Not installed in ServiceNow at all -- runs on whoever's own machine, against their own instance, with their own credentials (never shared with whoever's asking for the export). Same read-only export as the UI Action above, plus `cmn_rota_member.rotation_schedule` (ServiceNow's own system-generated per-member on-call computation -- see the script's docstring), the extra `cmn_rota_roster` day-of-week/payload fields, who each span is *for* and what it overrides (`user`/`parent`/`show_as`/`notes`), each rota's `based_on` calendar, an `other_schedules` sweep of everything else attached to the group's rotas/rosters/members, and a `roster_schedule_spans` / `roster_schedule_span_proposals` sweep -- `roster_schedule_span` ("Roster Schedule Entry", a `cmn_schedule_span` subclass keyed by `roster`, or by `group` for time off, and living on the covering *user's* schedule rather than any rota's) is where ServiceNow stores one-off "Provide coverage" shifts (`type=on_call`, shown in its calendar as "<user> (<roster> Coverage)") and time off, so none of the schedule-based queries can see them. PagerDutySync syncs the one-off `type=on_call` coverage spans as v3 overrides (see "Coverage overrides" below); time off is still not synced. That sweep degrades to a warning if the account can't read those tables. Stdlib only, nothing to `pip install`. See its own docstring for usage. |
+| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment and doesn't call `PagerDutySync`. A one-click way for a non-technical group owner to hand you their group's on-call config (`cmn_rota`, `cmn_rota_roster`, `cmn_rota_member`, `cmn_schedule_span`; raw, unparsed, raw and display values) as a single JSON file attached to their Group record. |
+| `business_rules_mark_pending.js` | Business Rules (x5) | System Definition > Business Rules, one per source table. Reference copy of the rule script and settings; `fix_script_create_sync_queue_rules_and_jobs.js` creates the same rules. |
+| `scheduled_job_process_pending_syncs.js` | Scheduled Jobs (x2) | System Definition > Scheduled Jobs. Reference copy of the two jobs; the same fix script creates them. |
+| `fix_script_create_sync_group_table.js` | Background script | Creates the enrollment/sync-state table. See "Fix scripts". |
+| `fix_script_create_sync_queue_rules_and_jobs.js` | Background script | Creates the Business Rules and Scheduled Jobs for the debounced queue. See "Fix scripts". |
 
 None of these files are meant to be uploaded/imported directly (there's no Update Set
-here) -- copy each script body into the corresponding record type, using the settings
-documented below and in the script file's header.
+here). The two `fix_script_*` files are pasted into **Scripts - Background** and create
+records for you; for the rest, copy each script body into the corresponding record type,
+using the settings in the file's header comment.
+
+## Fix scripts
+
+Two Scripts - Background (Global scope) scripts create the tables and rules this port
+needs, so none of that is built by hand. Both follow the same conventions:
+
+- **`DRY_RUN = true` by default.** A dry run only prints what it *would* do; set it to
+  `false` at the top of the script and run again to apply.
+- **Safe to re-run.** Every step checks first; something that already exists is reported
+  and left exactly as it is. Neither script edits or deletes anything.
+- Both finish with a verification step (when applied) that confirms the records exist.
+
+### `fix_script_create_sync_group_table.js`
+
+Creates the `u_pagerduty_sync_group` table ("PagerDuty Sync Group"; not extendable, admin-only
+by default -- add ACLs/roles to taste) and every column in the tables below. If the table
+already exists (e.g. you made it by hand with just `u_group`) it adds only the missing columns.
+It also creates a `before` insert/update Business Rule, "PagerDuty Sync Group - Unique Group",
+that rejects a second row for the same group. After applying, it checks that `GlideRecord` can see every column; if it can't, the table cache
+may need a moment -- re-run to re-check.
+
+Not covered: a form/list layout. Configure one (at minimum `u_group` and the `u_last_*`
+columns) and hide `u_claim_token`. Then add one row per group to manage.
+
+### `fix_script_create_sync_queue_rules_and_jobs.js`
+
+Creates the debounced-sync-queue plumbing (see "Debounced sync queue"). Records are matched
+by name.
+
+Business Rules (`sys_script`) -- all `before` insert/update/delete, order 100, Active, advanced.
+They only call `markPendingForRecord(current, previous)`, never PagerDuty, so they are safe to
+leave active:
+
+| Name | Table | Condition |
+|---|---|---|
+| PagerDuty Sync Pending - Rota | `cmn_rota` | |
+| PagerDuty Sync Pending - Roster | `cmn_rota_roster` | |
+| PagerDuty Sync Pending - Member | `cmn_rota_member` | |
+| PagerDuty Sync Pending - Schedule Span | `cmn_schedule_span` | |
+| PagerDuty Sync Pending - Coverage | `roster_schedule_span` | `type=on_call` |
+
+Scheduled Jobs (`sysauto_script`):
+
+| Name | Runs | Script | Created |
+|---|---|---|---|
+| PagerDuty Sync - Process Pending | every minute | `new PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
+| PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new PagerDutySync().markAllPending();` | Active (only marks groups pending) |
+
+Requires `PagerDutySync` (v23+) and the sync-state columns to exist before the rules are
+useful, though creating the records doesn't depend on them.
 
 ## Which groups get managed
 
 Enrollment is indicated by the presence of a `sys_user_group` in a small table:
 
-| Table | `u_pagerduty_sync_group` (Global scope) |
+| Table | `u_pagerduty_sync_group` ("PagerDuty Sync Group", Global scope) |
 |---|---|
-| Field | `u_group` -- Reference to `sys_user_group`, **Mandatory**, **Unique** |
+
+| Column | Label | Type | Notes |
+|---|---|---|---|
+| `u_group` | Group | Reference to `sys_user_group` | **Mandatory**, display column. Kept unique by the Business Rule "PagerDuty Sync Group - Unique Group" (see "Fix scripts"), not a unique index -- ServiceNow won't set the Unique flag over a reference column's automatic index. |
 
 One row per group whose PagerDuty on-call config should be sourced from ServiceNow.
 Presence in this table means `PagerDutySync` owns that group's schedules/escalation
@@ -48,28 +103,29 @@ directly, so there's a single source of truth.
 ## Debounced sync queue
 
 `u_pagerduty_sync_group` also carries the per-group sync state, so there is no
-separate queue table. Add these columns (all Global scope, none mandatory):
+separate queue table. `fix_script_create_sync_group_table.js` creates these columns
+(all Global scope, none mandatory):
 
-| Column | Type | Meaning |
-|---|---|---|
-| `u_pending_since` | Date/Time | When the first un-synced change arrived. Empty = nothing waiting. |
-| `u_last_change` | Date/Time | When the most recent change arrived (what the quiet period waits on). |
-| `u_running_since` | Date/Time | Lock. Empty = not syncing; a lock older than 15 min is treated as stale. |
-| `u_claim_token` | String (40) | Confirms which run won the lock. Hide it from forms. |
-| `u_retry_after` | Date/Time | Backoff after a failure. Empty = no backoff. |
-| `u_last_attempt` | Date/Time | When the last sync started. |
-| `u_last_result` | Choice: `success`, `failed`, `skipped` | Outcome of the last attempt. |
-| `u_last_message` | String (4000) | Error text, or a one-line summary of what was written. |
-| `u_last_success` | Date/Time | When the last successful sync finished. |
-| `u_consecutive_failures` | Integer | Drives the retry backoff. Reset to 0 on success. |
+| Column | Label | Type | Meaning |
+|---|---|---|---|
+| `u_pending_since` | Pending since | Date/Time | When the first un-synced change arrived. Empty = nothing waiting. |
+| `u_last_change` | Last change | Date/Time | When the most recent change arrived (what the quiet period waits on). |
+| `u_running_since` | Running since | Date/Time | Lock. Empty = not syncing; a lock older than `STALE_LOCK_SECONDS` (15 min) is treated as stale. |
+| `u_claim_token` | Claim token | String (40) | Confirms which run won the lock. Internal -- hide it from forms. |
+| `u_retry_after` | Retry after | Date/Time | Backoff after a failure. Empty = no backoff. |
+| `u_last_attempt` | Last sync attempt | Date/Time | When the last sync started. |
+| `u_last_result` | Last sync result | String (40) with choice list: `success`, `failed`, `skipped` | Outcome of the last attempt. Audited. |
+| `u_last_message` | Last sync message | String (4000) | Error text, or a one-line summary of what was written. Audited. |
+| `u_last_success` | Last successful sync | Date/Time | When the last successful sync finished. Audited. |
+| `u_consecutive_failures` | Consecutive failures | Integer | Drives the retry backoff. Reset to 0 on success. |
 
-Turn on **Audit** for `u_last_result`, `u_last_message` and `u_last_success` if you
-want a history of syncs for free. `PagerDutySync` logs an error and does nothing if
+The script turns on **Audit** for `u_last_result`, `u_last_message` and `u_last_success`,
+which gives a history of syncs for free. `PagerDutySync` logs an error and does nothing if
 any column is missing, rather than silently ignoring writes to it.
 
 How it works:
 
-1. The five Business Rules in `business_rules_mark_pending.js` call
+1. The five Business Rules (see "Fix scripts") call
    `markPendingForRecord(current, previous)`, which sets `u_last_change` (and
    `u_pending_since`, if empty) on the enrolled group's row. Records of groups that
    aren't enrolled are ignored.
@@ -158,8 +214,7 @@ Validated two ways before deploying: isolated unit tests against known values
 caught a second bug in an earlier version of the local-date resolution), and an
 exhaustive check against a real 8-group/68-roster customer export, using each
 member's own `rotation_schedule` (ServiceNow's own system-generated per-member
-on-call computation -- see `export_oncall_config.txt`'s docstring) as independent
-ground truth: 0 regressions, 15 confirmed real fixes (only 2 of which had been
+on-call computation) as independent ground truth: 0 regressions, 15 confirmed real fixes (only 2 of which had been
 reported; the rest were latent). The remaining unrotated cases in that export
 were all accounted for, not just unverified -- 17 resolved to the
 `_buildAlternatingEvent` path (confirmed via matching coverage-window shapes at
@@ -179,139 +234,65 @@ all-zero *date* means unset.
 
 ### Ground-truth on-call lookup
 
-The array-rotation approach above (`_rotationMemberOffset`/the date-math branches
-in `_rotationAlignment`) estimates who's first by recomputing occurrence-count
-from `rotation_start_date` using the roster's *current* member count and order
-values -- implicitly assuming that count has never changed. **It isn't a safe
-assumption.** Reported live by a customer: after adding a member to Major
-Incident's NA/EMEA Primary rosters and resyncing, the new member showed up in
-PagerDuty "in a different order" than ServiceNow.
+The array-rotation approach above (the date-math branches in `_rotationAlignment`)
+estimates who's first by recomputing occurrence-count from `rotation_start_date`
+using the roster's *current* member count and order values -- implicitly assuming
+that count has never changed. **It isn't a safe assumption.** Reported live by a
+customer: after adding a member to Major Incident's NA/EMEA Primary rosters and
+resyncing, the new member showed up in PagerDuty "in a different order" than
+ServiceNow.
 
 Read ServiceNow's actual on-call engine to understand why
 (`OnCallRosterSNC.getActiveMembersOrdered`, fired synchronously by a business
-rule -- `Update Rotation Schedules (Member)`/`(Roster)` -- whenever roster
-membership changes): it does **not** recompute the whole rotation's history when
-a member is added or removed. It finds whoever was on call the day before, then
-continues the round-robin from there -- the next member is whichever remaining
-member has the next-higher `order` value, wrapping around. Nothing before the
-edit is touched. That's a fundamentally different algorithm from "occurrence-count
-mod current N," and the two only coincide when the roster's member count has been
-constant since `rotation_start_date` -- which a real "someone joined/left" edit
-is, by definition, exactly the case where it hasn't.
-
-Confirmed live on a PDI both ways: adding a 3rd member to a static 2-member
-weekly roster (Hardware US Primary, unchanged since 2018) happened to coincide
-with what the date-math estimate would have predicted (a coincidence of that
-roster's specific parity, not a general guarantee) -- and, separately, a unit
-test that deliberately forces the two to disagree, plus a full live rerun of the
-same 3rd-member experiment through the real deployed sync, confirmed the fix
-reproduces ServiceNow's actual answer (`David` through Sep 27, `Fred` Sep
-28-Oct 4, `Beth` Oct 5-11, `David` again from Oct 12) rather than the old
-estimate.
+rule whenever roster membership changes): on the older engine it does **not**
+recompute the whole rotation's history when a member is added or removed. It finds
+whoever was on call the day before, then continues the round-robin from there --
+the next member is whichever remaining member has the next-higher `order`, wrapping
+around. That's a fundamentally different algorithm from "occurrence-count mod
+current N," and the two only coincide when the member count has been constant since
+`rotation_start_date`. (The 2024 engine behaves differently again: it hands off to
+"next by order" immediately at the moment of the edit, truncating whoever was
+mid-turn.) Either way, date-math alone can't be trusted.
 
 **The fix**: before falling back to date-math, `_rotationAlignment` asks
-ServiceNow directly, via whichever of its two on-call engines the rota is
-actually on (see "The 2024 schedule engine" below for the second one).
-On the older engine, `_groundTruthMemberIndex` checks each active member's own
-`cmn_rota_member.rotation_schedule` (the same live, system-computed schedule
-already used as this file's own validation ground truth, and by ServiceNow's own
-resolver -- `OnCallRotationSNC._checkForOverrideMemberByRoster` evaluates the
-same table the same way) via `GlideSchedule.isInSchedule`, to find who
-ServiceNow really has on call *right now* (`asOf`, the sync's own run time --
-see below for why not `rotation_start_date`). `_offsetForGroundTruth` then
-back-solves the array rotation that reproduces that member in the matching
-PagerDuty slot. Time off and "Provide coverage" do **not** disturb this lookup
-(tested live on a PDI, both engines, with `fix_script_pc_timeoff_ground_truth.txt`):
-the pick stayed the same user at the same instant with a coverage span or a
-time-off span for the on-call member in place. On the 2024 engine a coverage span
-comes back as its own `roster_schedule_span` override row, which the
-`table === 'cmn_rota_member'` filter drops, and time off comes back as a separate
-`timeoff` row while the member's own `cmn_rota_member` span stays in place -- so the
-lookup reports the *nominal* rotation, not a substitute. (ServiceNow does split the
-member's span where the coverage or time-off interval ends; same user, harmless.) On
-the old engine neither showed up in `getSpans()` at all. One gap: a time-off span
-inserted by script did not appear on the old engine even after its schedules were
-regenerated, so time off created through the UI on an old-engine rota is not
-confirmed -- it was not observed to move the pick either.
+ServiceNow directly, via `_groundTruthMemberIndex`, who it has on call. That calls
+`OCRotationV2.getSpans()` (the same live computation ServiceNow's own on-call
+calendar uses, via `_getSpansForRota`) at `asOf` -- the sync's own run time -- and
+keeps the `cmn_rota_member` entries. `OCRotationV2` decides internally which
+schedule engine the rota is on, so this code never has to. If nothing is on call at
+that exact instant (e.g. regions whose coverage windows leave a daily gap),
+`_getSpansForRotaForward` searches the nearest *future* occurrence instead -- forward
+only, since a past read risks predating a membership change, while anything ServiceNow
+reports about the future is computed fresh. `_offsetForGroundTruth` then back-solves
+the array rotation that reproduces that member in the matching PagerDuty slot.
+Results are memoized per (rota, instant) per `PagerDutySync` instance.
 
-**Why `asOf` ("now"), not `rotation_start_date`:** after a membership change,
-ServiceNow caps the *old* segment's `repeat_until` at the date of the edit and
-starts a new, open-ended segment from there -- so a historical anchor date can
-fall inside a since-capped segment that no longer evaluates as "on call" at
-all, while "now" is always inside whichever segment is currently open.
+Two earlier approaches were tried and dropped: reading each member's
+`cmn_rota_member.rotation_schedule` through `GlideSchedule` (can silently answer
+wrong, and is permanently `null` on 2024-engine rotas), and reading
+`cmn_rota_roster.rotation_payload` (a write-on-compute cache that isn't durably
+persisted, so a cold read usually sees it blank).
 
-**Falls back** to the pre-existing date-math estimate when no ground-truth
-source resolves anything -- a brand-new roster ServiceNow hasn't computed a
-schedule for yet, a `GlideSchedule`/JSON-parse error, or (old engine only) no
-active member has an evaluable `rotation_schedule` -- logged, not silent. When
-ground truth *is* found but disagrees with what the date-math estimate would
-have said, that disagreement is logged too (a useful signal that a roster's
-membership has changed since `rotation_start_date`).
+Time off and "Provide coverage" do **not** disturb this lookup (tested live on a PDI,
+both engines): the pick stayed the same user at the same instant with a coverage
+span or a time-off span for the on-call member in place. Coverage comes back as its
+own `roster_schedule_span` row, which the `table === 'cmn_rota_member'` filter drops,
+and time off as a separate `timeoff` row while the member's own `cmn_rota_member`
+span stays in place -- so the lookup reports the *nominal* rotation, not a
+substitute. One gap: on the old engine a time-off span inserted by script did not
+appear even after its schedules were regenerated, so time off created through the UI
+on an old-engine rota is not confirmed -- it was not observed to move the pick either.
 
-**Scope**: only the plain one-roster-per-event path (`_buildEvent`, used by
-every classification shape for an ordinary roster). Deliberately not applied to
-`_buildAlternatingEvent` or `_buildEveryMemberEvent` -- both already build their
-member order from something other than a single roster's own rotation math (see
-above for why `_buildAlternatingEvent` doesn't use `rotation_start_date` at
-all), so there's no single roster's ground truth that would be the right one to
-check.
+**Falls back** to the date-math estimate when `getSpans()` resolves nothing for the
+roster (a brand-new roster with no computed schedule, an error, or an on-call user who
+isn't among the roster's active members) -- logged, not silent. When ground truth
+*is* found but disagrees with the date-math estimate, that disagreement is logged too
+(a useful signal that membership has changed since `rotation_start_date`).
 
-#### The 2024 schedule engine
-
-ServiceNow has **two** separate on-call computation systems, selected per rota
-by `cmn_rota.schedule_engine`. The older one (blank/`old_schedule_engine`,
-everything above this subsection) materializes each member's own turns into
-`cmn_rota_member.rotation_schedule`. The newer one (`2024_schedule_engine`)
-**never populates that field at all** -- confirmed against a real customer
-instance: every member of every roster in an entire group (`Major Incident
-(Global)`) had `rotation_schedule` permanently `null`, even though ServiceNow's
-own on-call calendar for those rosters clearly rendered a working rotation.
-Its ground truth lives in `cmn_rota_roster.rotation_payload` instead -- a JSON
-field with no public ServiceNow documentation; its shape here was
-reverse-engineered from a real customer's own live payload and confirmed
-correct against three dates they independently reported seeing on ServiceNow's
-own calendar:
-
-```
-{ "memberPlans": {
-    "member_sys_ids": [<cmn_rota_member sys_id>, ...],
-    "plans": [{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"|null,
-               "members_in_order": [<index into member_sys_ids>, ...]}, ...] },
-  "memberSpanCache": { "spans": [
-    ["YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM:SS", <index into member_sys_ids>], ...
-  ] } }
-```
-
-`_groundTruthMemberIndexNewEngine`/`_newEngineMemberSysIdAt` read this in two
-tiers: **(1)** `memberSpanCache.spans` is a literal, ServiceNow-computed
-day-by-day answer covering roughly the next ~10 days -- exact, used whenever it
-covers `asOf`. **(2)** past the cache's end, extrapolate forward in whole
-shift-blocks from the *start* of the cache's final member's block (not its last
-cached day -- the cache is per-day, so its last entry can land exactly on a
-block's last day, which undercounts by a whole block if used directly as the
-anchor; found and fixed via a unit test built from the real payload below)
-through whichever `plans[]` entry currently applies.
-
-**Confirmed by decoding a real customer's actual `rotation_payload`** (Major
-Incident (Global) / NA / Primary, captured live) against what they
-independently reported ServiceNow's calendar showing after adding a member
-(Bruno starting Sep 28, Miguel Oct 5, Eduardo Oct 12 -- both tiers reproduce all
-three exactly) that this engine's real algorithm, unlike the old engine's, does
-**not** let a member's current turn run to its natural end before inserting a
-newly-added member -- it hands off to "next by order" *immediately* at the
-moment of the edit, truncating whoever was mid-turn, and only settles into a
-clean, full-length round-robin from the next block boundary onward. That's a
-genuinely different algorithm from the old engine's continuity rule above, not
-a variant of it -- confirmed by hand-decoding the real payload's two `plans[]`
-entries (a 4-day truncated first block, then a 3-day makeup block, then clean
-7-day blocks from there), not inferred.
-
-Which engine a rota is on isn't visible from `cmn_rota.schedule_engine` alone
-if an instance-wide property forces one engine for everything --
-`isShiftOnOldEngine`/`isShiftOnNewEngine` in ServiceNow's own
-`OnCallRotationSNC` check `gs.getProperty('com.snc.on_call_rotation.
-force_use_schedule_engine')` before falling back to the field. Not read by this
-port; `rotaRow.schedule_engine` reflects the field only.
+**Scope**: only the plain one-roster-per-event path (`_buildEvent`). Deliberately not
+applied to `_buildAlternatingEvent` or `_buildEveryMemberEvent` -- both build member
+order from something other than a single roster's own rotation math, so there is no
+single roster's ground truth that would be the right one to check.
 
 ### Handoff weekday (`dow_for_rotate`)
 
@@ -410,10 +391,33 @@ sync (it survives the event delete/recreate), and removed when the span was dele
   An event is ended by `PUT` with the event body as `GET` returns it; if that fails
   the event is deleted instead.
 
+## Packaging as an update set
+
+Everything is Global scope. The update set **"PagerDuty Sync v24"** carries the
+`u_pagerduty_sync_group` table (dictionary, labels, choice list, ACLs, role, menu/module and
+layouts), the Script Include, the Script Action and Event Registry entry, the six Business
+Rules (five mark-pending rules plus the unique-group rule), and the four UI Actions (Sync All, Sync This on `cmn_rota` and on `sys_user_group`,
+Export On-Call Config).
+
+**Scheduled Jobs are not captured by update sets on this instance**, so they ship separately:
+after committing the update set, run `fix_script_create_sync_queue_rules_and_jobs.js` with
+`DRY_RUN = false`. It reports the rules that already exist and creates the two jobs, with
+"Process Pending" **Inactive**. Activate it only after validating a manual live sync
+(and `sync.syncAll(true)` dry runs) on the target instance.
+
+After importing the update set, also create the enrollment rows (one per group in
+`u_pagerduty_sync_group`) -- update sets carry the table, not its data.
+
+The exported XML is committed as `update_set/pagerduty_sync_v24.xml` (import it via System Update Sets > Retrieved Update Sets > Import Update Set from XML, then Preview and Commit).
+
+Source of truth is this repo; the update set is built from a dev instance whose records are
+pushed from these files. When a file changes, re-paste it into the dev record (it is then
+re-captured in the update set) before exporting.
+
 ## One-time setup
 
 1. **Script Include**: create `PagerDutySync` from `PagerDutySync.js`.
-2. **Table**: run `fix_script_create_sync_group_table.txt` in Scripts - Background
+2. **Table**: run `fix_script_create_sync_group_table.js` in Scripts - Background
    (Global scope; it defaults to a dry run -- set `DRY_RUN = false` to apply). It
    creates `u_pagerduty_sync_group` with `u_group` and every sync-state column below, or
    adds only the missing columns to a table you already made by hand. It does not create
@@ -429,11 +433,11 @@ sync (it survives the event delete/recreate), and removed when the span was dele
 6. **Sync-state columns**: already created by step 2's script (the columns are listed
    under "Debounced sync queue").
 7. **Business Rules** and 8. **Scheduled Jobs**: run
-   `fix_script_create_sync_queue_rules_and_jobs.txt` (dry run by default; set
-   `DRY_RUN = false` to apply), or create them by hand from `business_rules_mark_pending.js`
-   and `scheduled_job_process_pending_syncs.js`. The rules only mark groups pending, so
-   they can be Active straight away. Leave the every-minute job **Inactive** until you've validated the UI Action path and
-   `fix_script_verify_sync_queue.txt`; activating it is what lets edits reach PagerDuty.
+   `fix_script_create_sync_queue_rules_and_jobs.js` (dry run by default; set
+   `DRY_RUN = false` to apply). The rules only mark groups pending, so they can be Active
+   straight away. Leave the every-minute job **Inactive** until you've validated the UI
+   Action path with a dry run and a manual live sync; activating it is what lets edits
+   reach PagerDuty.
 
 ## Recommended verification steps
 
@@ -592,25 +596,8 @@ checkbox is on.
   `[`/`]`** (every name this port creates has brackets, per the naming convention
   above) -- `_findByName`/`_findScheduleV3ByName` don't use it; they page through
   the full list and rely on an exact client-side match instead.
-- **Ground-truth on-call lookup adds one `GlideSchedule` evaluation per active
-  member per roster per sync** (see "Ground-truth on-call lookup" above) -- not
-  expected to be significant next to the PagerDuty API calls a sync already
-  makes, but not separately measured against a large roster (e.g. Americas'
-  14-member Primary/Secondary) either.
-- **2024-schedule-engine ground truth (`rotation_payload`) doesn't check the
-  `com.snc.on_call_rotation.force_use_schedule_engine` system property** -- if
-  an instance forces every rota onto one engine regardless of its own
-  `schedule_engine` field, `rotaRow.schedule_engine` (read from the field only)
-  can disagree with which engine actually computed that rota, and ground truth
-  is tried against the wrong one (falls back to date-math either way, not
-  silently wrong, but not the fix either). Not known to be the case on the one
-  customer instance this was built against.
-- **`rotation_payload`'s tier-2 extrapolation (past `memberSpanCache`'s ~10-day
-  window) assumes a clean, unchanging round-robin from the last cached block
-  onward** -- correct once the transition period a membership change causes is
-  over (which the cache itself, built after the edit, already covers), but a
-  *second* membership change made after the last sync -- and after
-  `rotation_payload`'s own cache goes stale -- before the next one runs would
-  not be reflected; the extrapolation has no way to know about it. Re-running
-  the sync soon after such a change (so `asOf` falls inside ServiceNow's own
-  freshly-rebuilt cache window, tier 1) sidesteps this.
+- **Ground-truth on-call lookup adds one `OCRotationV2.getSpans()` call per rota per
+  sync** (memoized across that rota's rosters; a second call per roster only when
+  nothing is on call at the exact instant) -- not expected to be significant next to the
+  PagerDuty API calls a sync already makes, but not separately measured against a large
+  rota either.

@@ -7,8 +7,8 @@
 // PagerDutySync directly -- so the actual PagerDuty API calls run asynchronously on the
 // event queue, off the UI Action's request thread. This is what makes the UI Actions safe
 // from the ~60-90-sequential-API-call timeout risk that a synchronous call would have.
-// (Automatic, edit-driven syncs do NOT come through here: the Business Rules in
-// business_rules_mark_pending.js only mark a group pending, and the scheduled job
+// (Automatic, edit-driven syncs do NOT come through here: the "PagerDuty Sync Pending - *"
+// Business Rules (created by fix_script_create_sync_queue_rules_and_jobs.js) only mark a group pending, and the scheduled job
 // "PagerDuty Sync - Process Pending" syncs it once edits have gone quiet.)
 //
 // A manual live sync bypasses the debounce but shares the queue's per-group lock and

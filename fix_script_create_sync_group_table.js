@@ -11,6 +11,9 @@
     // form sections, so configure one (Form Layout / List Layout, or "Configure > Form
     // Layout" on the table) -- at minimum u_group and the u_last_* columns -- and hide
     // u_claim_token, which is internal.
+    // u_group is kept unique by a Business Rule (UNIQUE_RULE below), not a unique index:
+    // ServiceNow won't set the dictionary Unique flag over a reference column's automatic
+    // index (a unique index has to be built separately with IndexCreator).
     var DRY_RUN = true;
 
     var TABLE = 'u_pagerduty_sync_group';
@@ -18,7 +21,7 @@
 
     // type: sys_dictionary.internal_type. choices: [value, label] pairs (stored as a string column with a choice list).
     var COLUMNS = [
-        {name: 'u_group', label: 'Group', type: 'reference', reference: 'sys_user_group', mandatory: true, unique: true, display: true},
+        {name: 'u_group', label: 'Group', type: 'reference', reference: 'sys_user_group', mandatory: true, display: true},
         {name: 'u_pending_since', label: 'Pending since', type: 'glide_date_time'},
         {name: 'u_last_change', label: 'Last change', type: 'glide_date_time'},
         {name: 'u_running_since', label: 'Running since', type: 'glide_date_time'},
@@ -31,6 +34,26 @@
         {name: 'u_last_success', label: 'Last successful sync', type: 'glide_date_time', audit: true},
         {name: 'u_consecutive_failures', label: 'Consecutive failures', type: 'integer'}
     ];
+
+    var UNIQUE_RULE = {
+        name: 'PagerDuty Sync Group - Unique Group',
+        script: [
+            '(function executeRule(current, previous /*null when async*/) {',
+            '',
+            '    // One enrollment row per group.',
+            "    var dup = new GlideRecord('u_pagerduty_sync_group');",
+            "    dup.addQuery('u_group', current.getValue('u_group'));",
+            "    dup.addQuery('sys_id', '!=', current.getUniqueValue());",
+            '    dup.setLimit(1);',
+            '    dup.query();',
+            '    if (dup.next()) {',
+            "        gs.addErrorMessage('That group is already enrolled in PagerDuty Sync.');",
+            '        current.setAbortAction(true);',
+            '    }',
+            '',
+            '})(current, previous);'
+        ].join('\n')
+    };
 
     function say(msg) { gs.print((DRY_RUN ? '[dry run] ' : '') + msg); }
 
@@ -64,7 +87,7 @@
 
     function createColumn(c) {
         say('add column ' + c.name + ' (' + c.type + (c.length ? ' ' + c.length : '') +
-            (c.reference ? ' -> ' + c.reference : '') + (c.unique ? ', unique' : '') + (c.mandatory ? ', mandatory' : '') +
+            (c.reference ? ' -> ' + c.reference : '') + (c.mandatory ? ', mandatory' : '') +
             (c.audit ? ', audited' : '') + (c.choices ? ', choice list' : '') + ')');
         if (DRY_RUN) return;
         var d = new GlideRecord('sys_dictionary');
@@ -77,7 +100,6 @@
         if (c.length) d.setValue('max_length', c.length);
         if (c.reference) d.setValue('reference', c.reference);
         if (c.mandatory) d.setValue('mandatory', true);
-        if (c.unique) d.setValue('unique', true);
         if (c.display) d.setValue('display', true);
         if (c.audit) d.setValue('audit', true);
         if (c.choices) d.setValue('choice', 1); // sys_dictionary.choice: 1 = dropdown with a "-- None --" entry
@@ -109,6 +131,32 @@
             if (existed && dictionaryRowExists(COLUMNS[i].name)) { present++; say('column ' + COLUMNS[i].name + ' already exists; leaving it alone'); continue; }
             createColumn(COLUMNS[i]);
             added++;
+        }
+        var ruleExists = new GlideRecord('sys_script');
+        ruleExists.addQuery('name', UNIQUE_RULE.name);
+        ruleExists.query();
+        if (ruleExists.next()) {
+            say('business rule "' + UNIQUE_RULE.name + '" already exists; leaving it alone');
+        } else {
+            say('create business rule "' + UNIQUE_RULE.name + '" on ' + TABLE + ' (before insert/update, active)');
+            if (!DRY_RUN) {
+                var br = new GlideRecord('sys_script');
+                br.initialize();
+                br.setValue('name', UNIQUE_RULE.name);
+                br.setValue('collection', TABLE);
+                br.setValue('when', 'before');
+                br.setValue('order', 100);
+                br.setValue('active', true);
+                br.setValue('advanced', true);
+                br.setValue('action_insert', true);
+                br.setValue('action_update', true);
+                br.setValue('action_delete', false);
+                br.setValue('action_query', false);
+                br.setValue('condition', 'current.isNewRecord() || current.u_group.changes()');
+                br.setValue('description', 'Rejects a second enrollment row for the same group (u_group cannot carry a unique index).');
+                br.setValue('script', UNIQUE_RULE.script);
+                if (!br.insert()) throw 'could not create business rule "' + UNIQUE_RULE.name + '"';
+            }
         }
         gs.print('');
         gs.print((DRY_RUN ? 'DRY RUN: would add ' : 'Added ') + added + ' column(s)' + (existed ? '' : ' to a new table') +

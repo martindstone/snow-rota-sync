@@ -1,0 +1,4 @@
+
+# local credentials -- never commit
+.env
+__pycache__/

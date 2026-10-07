@@ -1,7 +1,7 @@
 (function() {
     // Scripts - Background (Global scope). Creates the debounced-sync-queue plumbing:
-    //   - five Business Rules that mark a group pending (business_rules_mark_pending.js)
-    //   - two Scheduled Jobs (scheduled_job_process_pending_syncs.js):
+    //   - five Business Rules that mark a group pending (RULE_SCRIPT / RULES below)
+    //   - two Scheduled Jobs (JOBS below):
     //       "PagerDuty Sync - Process Pending"   every minute, created INACTIVE (it is the
     //                                             switch that lets edits reach PagerDuty)
     //       "PagerDuty Sync - Nightly Catch-All"  daily at NIGHTLY_RUN_TIME, active (it only
@@ -10,7 +10,7 @@
     // DRY_RUN = true (default) only prints what it WOULD do. Set it to false to apply.
     // Safe to re-run: a record with the same name is left exactly as it is (the script
     // reports it); it never edits or deletes anything. Requires PagerDutySync (v23+) and the
-    // sync-state columns (fix_script_create_sync_group_table.txt) to exist before the
+    // sync-state columns (fix_script_create_sync_group_table.js) to exist before the
     // rules are useful, but creating the records does not depend on them.
     var DRY_RUN = true;
     var NIGHTLY_RUN_TIME = '1970-01-01 02:00:00'; // time of day; interpreted in the job's time zone setting (blank = system default)

@@ -953,8 +953,9 @@ PagerDutySync.prototype = {
         // every Nth week, not every week -- cyclePhase/anchorUtcIso let
         // _detectAlternatingGroups() recognize two rotas with an identical shape
         // (e.g. Wintel's "1a"/"1b") as alternating partners on disjoint weeks of
-        // the same cycle, rather than a same-week conflict. Confirmed via
-        // fix_script_q6_q7.txt Q7 (in ../servicenow/) -- see _detectAlternatingGroups.
+        // the same cycle, rather than a same-week conflict. Confirmed against
+        // real span rows (Wintel 1a/1b both have repeat_count=2, anchors one week apart)
+        // -- see _detectAlternatingGroups.
         result.repeatCount = repeatCount;
         result.cyclePhase = (repeatCount > 1 && earliestAnchor) ? this._weekPhase(earliestAnchor) : null;
         result.anchorUtcIso = earliestAnchor ? (earliestAnchor.replace(' ', 'T') + 'Z') : null;
@@ -1438,8 +1439,8 @@ PagerDutySync.prototype = {
     // Builds ONE rotating v3 event from a detected alternating group of roster rows
     // (see _detectAlternatingGroups) whose rotas share an identical coverage shape
     // but sit on disjoint weeks of a shared repeat_count cycle -- e.g. Wintel's "On
-    // shift 1a"/"On shift 1b", confirmed via fix_script_q6_q7.txt Q7 (repeat_count=2
-    // on both, anchors one week apart, in ../servicenow/).
+    // shift 1a"/"On shift 1b", confirmed against real span rows (repeat_count=2
+    // on both, anchors one week apart).
     //
     // This is the payoff for the v3 rewrite: the v2 file needed a hand-rolled
     // interleaved-users/rotation_turn_length_seconds hack (_buildAlternatingLayer,
@@ -2169,8 +2170,8 @@ PagerDutySync.prototype = {
     // datetime string ("1970-01-01 00:15:00") whose HH:MM:SS is the actual duration,
     // not a plain seconds count. A bare parseInt() on that string reads only the
     // leading "1970" (stops at the first "-"), which is where a uniform, bogus
-    // "33 minute" delay came from on every row -- 1970/60 rounded. Confirmed via
-    // fix_script_q6_q7.txt Q6 (../servicenow/); real values are 15/30 minutes
+    // "33 minute" delay came from on every row -- 1970/60 rounded. Confirmed against
+    // real cmn_rota_roster.time_before_escalation values; real values are 15/30 minutes
     // depending on role.
     _parseDelayMinutes: function(raw) {
         var m = /^\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})$/.exec(raw || '');
@@ -3422,9 +3423,8 @@ PagerDutySync.prototype = {
     // time-of-day + duration). A shape shared by exactly N rows, all with
     // repeat_count=N and N distinct phases within that cycle (see
     // _computeCoverageWindow's cyclePhase/repeatCount), is a clean N-way
-    // alternation -- e.g. Wintel's "On shift 1a"/"On shift 1b" pair, confirmed via
-    // fix_script_q6_q7.txt Q7 (repeat_count=2 on both, anchors one week apart, in
-    // ../servicenow/). Anything less clean (uneven phase coverage, mismatched
+    // alternation -- e.g. Wintel's "On shift 1a"/"On shift 1b" pair, confirmed
+    // against real span rows (repeat_count=2 on both, anchors one week apart). Anything less clean (uneven phase coverage, mismatched
     // repeat_count, more/fewer rows than the cycle length) is left in remainingRows
     // rather than guessed at.
     //
