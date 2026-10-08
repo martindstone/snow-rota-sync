@@ -48,7 +48,7 @@
     var mode = String(event.parm2 || '');
     var dryRun = (mode !== 'live');
 
-    var sync = new PagerDutySync();
+    var sync = new global.PagerDutySync();
 
     try {
         if (dryRun) {

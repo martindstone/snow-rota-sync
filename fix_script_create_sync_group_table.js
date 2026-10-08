@@ -142,6 +142,7 @@
             if (!DRY_RUN) {
                 var br = new GlideRecord('sys_script');
                 br.initialize();
+                br.setValue('sys_scope', 'global');
                 br.setValue('name', UNIQUE_RULE.name);
                 br.setValue('collection', TABLE);
                 br.setValue('when', 'before');

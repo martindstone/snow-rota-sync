@@ -70,8 +70,10 @@ Scheduled Jobs (`sysauto_script`):
 
 | Name | Runs | Script | Created |
 |---|---|---|---|
-| PagerDuty Sync - Process Pending | every minute | `new PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
-| PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new PagerDutySync().markAllPending();` | Active (only marks groups pending) |
+| PagerDuty Sync - Process Pending | every minute | `new global.PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
+| PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new global.PagerDutySync().markAllPending();` | Active (only marks groups pending) |
+
+The scripts call `global.PagerDutySync` and the records are created explicitly in Global scope, so they work whatever application scope your session is in (a job created while the PagerDuty app's scope was selected fails with "PagerDutySync undefined, maybe missing global qualifier").
 
 Requires `PagerDutySync` (v23+) and the sync-state columns to exist before the rules are
 useful, though creating the records doesn't depend on them.

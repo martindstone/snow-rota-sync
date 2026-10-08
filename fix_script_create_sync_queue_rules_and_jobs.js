@@ -21,7 +21,7 @@
         '    // Resolves the enrolled group(s) this record belongs to and stamps them pending.',
         "    // A record belonging to a group that isn't in u_pagerduty_sync_group is ignored.",
         '    // `previous` is also checked so a rota moved between groups marks both.',
-        '    new PagerDutySync().markPendingForRecord(current, previous);',
+        '    new global.PagerDutySync().markPendingForRecord(current, previous);',
         '',
         '})(current, previous);'
     ].join('\n');
@@ -36,10 +36,10 @@
 
     var JOBS = [
         {name: 'PagerDuty Sync - Process Pending', active: false, runType: 'periodically', runPeriod: '1970-01-01 00:01:00',
-            script: 'new PagerDutySync().processPending();',
+            script: 'new global.PagerDutySync().processPending();',
             description: 'Syncs enrolled groups whose on-call changes have gone quiet (see PagerDutySync README). INACTIVE until validated: activating it lets pending changes write to PagerDuty.'},
         {name: 'PagerDuty Sync - Nightly Catch-All', active: true, runType: 'daily', runTime: NIGHTLY_RUN_TIME,
-            script: 'new PagerDutySync().markAllPending();',
+            script: 'new global.PagerDutySync().markAllPending();',
             description: 'Marks every enrolled group pending so time-based changes (member from/to dates, expiring repeat_until) are picked up. Does not sync by itself.'}
     ];
 
@@ -63,6 +63,7 @@
             if (DRY_RUN) continue;
             var br = new GlideRecord('sys_script');
             br.initialize();
+            br.setValue('sys_scope', 'global'); // never inherit whatever application scope the session happens to be in
             br.setValue('name', rule.name);
             br.setValue('collection', rule.table);
             br.setValue('when', 'before');
@@ -87,6 +88,7 @@
             if (DRY_RUN) continue;
             var sj = new GlideRecord('sysauto_script');
             sj.initialize();
+            sj.setValue('sys_scope', 'global');
             sj.setValue('name', job.name);
             sj.setValue('active', job.active);
             sj.setValue('run_type', job.runType);

@@ -7,7 +7,7 @@
 //            switch that lets pending changes actually write to PagerDuty)
 //
 //    Script:
-//      new PagerDutySync().processPending();
+//      new global.PagerDutySync().processPending();
 //
 //    Syncs each group on u_pagerduty_sync_group that has pending changes once they've
 //    gone quiet for 2 minutes (or 10 minutes after the first one). Skips a group that is
@@ -21,7 +21,7 @@
 //    Active: true (it only marks groups pending; job 1 decides when they sync)
 //
 //    Script:
-//      new PagerDutySync().markAllPending();
+//      new global.PagerDutySync().markAllPending();
 //
 //    Picks up changes that no edit announces: a member's from/to date arriving or
 //    passing, a repeat_until expiring, a rotation reaching its next phase.

@@ -2,3 +2,4 @@
 # local credentials -- never commit
 .env
 __pycache__/
+pdi-backup/
