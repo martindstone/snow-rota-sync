@@ -1,0 +1,80 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  $:
+    display_value: Global
+  _: global
+category: customer
+comments: ""
+name: sysauto_script_85f87a963bf1e38ba64b928a4847bc3c
+payload:
+  record_update:
+    $:
+      table: sysauto_script
+    sysauto_script:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "false"
+      advanced: "false"
+      business_calendar: ""
+      condition: ""
+      conditional: "false"
+      entered_run_end: ""
+      entered_run_start: ""
+      entered_time: ""
+      max_drift: ""
+      name: PagerDuty Sync - Process Pending
+      offset: ""
+      offset_type: "0"
+      repeat_every: ""
+      run_as:
+        $:
+          display_value: ""
+      run_as_tz: ""
+      run_dayofmonth: "1"
+      run_dayofweek: "1"
+      run_daysofweek: ""
+      run_end: ""
+      run_month: ""
+      run_period: 1970-01-01 00:01:00
+      run_start: ""
+      run_time: ""
+      run_type: periodically
+      run_weekinmonth: ""
+      script:
+        $ref: PagerDuty Sync - Process Pending.js
+      description: "Syncs enrolled groups whose on-call changes have gone quiet. INACTIVE until validated: activating it lets pending changes write to PagerDuty."
+      sys_class_name: sysauto_script
+      sys_created_by: admin
+      sys_created_on: 2026-10-08 17:30:00
+      sys_id: 85f87a963bf1e38ba64b928a4847bc3c
+      sys_mod_count: "0"
+      sys_name: PagerDuty Sync - Process Pending
+      sys_package:
+        $:
+          display_value: Global
+          source: global
+        _: global
+      sys_policy: ""
+      sys_scope:
+        $:
+          display_value: Global
+        _: global
+      sys_update_name: sysauto_script_85f87a963bf1e38ba64b928a4847bc3c
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-08 17:30:00
+      time_zone: ""
+      upgrade_safe: "false"
+replace_on_upgrade: "false"
+sys_mod_count: "0"
+table: ""
+target_name: PagerDuty Sync - Process Pending
+type: Scheduled Script Execution
+update_domain: global
+update_guid: 803371ab9d95975e0c03b6d76ed2339d
+update_guid_history: 803371ab9d95975e0c03b6d76ed2339d:0
+update_set:
+  $:
+    display_value: ""
+view: ""

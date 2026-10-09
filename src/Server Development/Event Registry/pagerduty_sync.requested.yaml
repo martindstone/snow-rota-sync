@@ -1,0 +1,56 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sysevent_register_4f6f2cb88323c3106531c4e0deaad3c5
+payload:
+  record_update:
+    $:
+      table: sysevent_register
+    sysevent_register:
+      $:
+        action: INSERT_OR_UPDATE
+      caller_access: ""
+      derived_priority: "100"
+      description: ""
+      event_name: pagerduty_sync.requested
+      fired_by: ""
+      priority: "100"
+      queue: ""
+      suffix: ""
+      sys_class_name: sysevent_register
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:15:33
+      sys_id: 4f6f2cb88323c3106531c4e0deaad3c5
+      sys_mod_count: "0"
+      sys_name: pagerduty_sync.requested
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sysevent_register_4f6f2cb88323c3106531c4e0deaad3c5
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:15:33
+      table: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: ""
+target_name: pagerduty_sync.requested
+type: Event Registration
+update_domain: global
+update_guid: bf9f24b82423c3103c880bee0d9bbc97
+update_guid_history: bf9f24b82423c3103c880bee0d9bbc97:-1668307476
+view: ""

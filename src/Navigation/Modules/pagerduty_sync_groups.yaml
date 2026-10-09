@@ -1,0 +1,64 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_ui_module_e51fac788323c3106531c4e0deaad394
+payload:
+  record_update:
+    $:
+      sys_domain: global
+      table: sys_ui_module
+    sys_ui_module:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "true"
+      application:
+        _: 691fac788323c3106531c4e0deaad38e
+        $:
+          display_value: u_pagerduty_sync
+      filter: ""
+      name: pagerduty_sync_groups
+      order: ""
+      path: ""
+      path_relative_to_root: "false"
+      roles: u_pagerduty_sync_group_user
+      sys_class_name: sys_ui_module
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:13
+      sys_domain: global
+      sys_domain_path: /
+      sys_id: e51fac788323c3106531c4e0deaad394
+      sys_mod_count: "0"
+      sys_name: pagerduty_sync_groups
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_ui_module_e51fac788323c3106531c4e0deaad394
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:13:13
+      table: u_pagerduty_sync_group
+      uncancelable: "false"
+      view_name: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_groups
+type: Module
+update_domain: global
+update_guid: 211fac78a023c310788245bd6e1ab2b2
+update_guid_history: 211fac78a023c310788245bd6e1ab2b2:1618080984
+view: ""

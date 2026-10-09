@@ -1,0 +1,192 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_ui_list_u_pagerduty_sync_group_null
+payload:
+  record_update:
+    sys_ui_list:
+      $:
+        parent: ""
+        relationship: ""
+        sys_domain: global
+        table: u_pagerduty_sync_group
+        version: "2"
+        view: ""
+      sys_ui_list_element:
+        - $:
+            action: INSERT_OR_UPDATE
+          average_value: "false"
+          element: u_group
+          list_id:
+            _: e62cf5bc8377c3906531c4e0deaad302
+            $:
+              display_value: u_pagerduty_sync_group
+              element: "NULL"
+              name: u_pagerduty_sync_group
+              parent: "NULL"
+              relationship: "NULL"
+              sys_domain: global
+              view: Default view
+          max_value: "false"
+          min_value: "false"
+          position: "0"
+          sum: "false"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 16:05:40
+          sys_id: ee2cf5bc8377c3906531c4e0deaad303
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 16:05:40
+        - $:
+            action: INSERT_OR_UPDATE
+          average_value: "false"
+          element: u_last_attempt
+          list_id:
+            _: e62cf5bc8377c3906531c4e0deaad302
+            $:
+              display_value: u_pagerduty_sync_group
+              element: "NULL"
+              name: u_pagerduty_sync_group
+              parent: "NULL"
+              relationship: "NULL"
+              sys_domain: global
+              view: Default view
+          max_value: "false"
+          min_value: "false"
+          position: "1"
+          sum: "false"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 16:05:40
+          sys_id: 6e2cf5bc8377c3906531c4e0deaad304
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 16:05:40
+        - $:
+            action: INSERT_OR_UPDATE
+          average_value: "false"
+          element: u_last_result
+          list_id:
+            _: e62cf5bc8377c3906531c4e0deaad302
+            $:
+              display_value: u_pagerduty_sync_group
+              element: "NULL"
+              name: u_pagerduty_sync_group
+              parent: "NULL"
+              relationship: "NULL"
+              sys_domain: global
+              view: Default view
+          max_value: "false"
+          min_value: "false"
+          position: "2"
+          sum: "false"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 16:05:40
+          sys_id: e22cf5bc8377c3906531c4e0deaad305
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 16:05:40
+        - $:
+            action: INSERT_OR_UPDATE
+          average_value: "false"
+          element: u_last_message
+          list_id:
+            _: e62cf5bc8377c3906531c4e0deaad302
+            $:
+              display_value: u_pagerduty_sync_group
+              element: "NULL"
+              name: u_pagerduty_sync_group
+              parent: "NULL"
+              relationship: "NULL"
+              sys_domain: global
+              view: Default view
+          max_value: "false"
+          min_value: "false"
+          position: "3"
+          sum: "false"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 16:05:41
+          sys_id: 6a2cf5bc8377c3906531c4e0deaad305
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 16:05:41
+        - $:
+            action: INSERT_OR_UPDATE
+          average_value: "false"
+          element: u_last_success
+          list_id:
+            _: e62cf5bc8377c3906531c4e0deaad302
+            $:
+              display_value: u_pagerduty_sync_group
+              element: "NULL"
+              name: u_pagerduty_sync_group
+              parent: "NULL"
+              relationship: "NULL"
+              sys_domain: global
+              view: Default view
+          max_value: "false"
+          min_value: "false"
+          position: "4"
+          sum: "false"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 16:05:41
+          sys_id: ee2cf5bc8377c3906531c4e0deaad305
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 16:05:41
+      sys_ui_list:
+        $:
+          action: INSERT_OR_UPDATE
+        average_value: "false"
+        element: ""
+        max_value: "false"
+        min_value: "false"
+        name: u_pagerduty_sync_group
+        parent: ""
+        position: ""
+        relationship: ""
+        sum: "false"
+        sys_class_name: sys_ui_list
+        sys_created_by: admin
+        sys_created_on: 2026-10-05 16:05:40
+        sys_domain: global
+        sys_domain_path: /
+        sys_id: e62cf5bc8377c3906531c4e0deaad302
+        sys_mod_count: "0"
+        sys_name: u_pagerduty_sync_group
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_ui_list_u_pagerduty_sync_group_null
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-05 16:05:40
+        sys_user: ""
+        view:
+          _: Default view
+          $:
+            display_value: Default view
+            name: "NULL"
+        view_name: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group
+type: List Layout
+update_domain: global
+update_guid: 262cf5bc0977c390a4b9a09d370ebd22
+update_guid_history: 262cf5bc0977c390a4b9a09d370ebd22:-1092121617,bd2fe0b8f523c310dbbac7359700239c:254972728
+view: Default view

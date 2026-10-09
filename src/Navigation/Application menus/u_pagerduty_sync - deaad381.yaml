@@ -1,0 +1,64 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_app_application_e11fac788323c3106531c4e0deaad381
+payload:
+  record_update:
+    $:
+      sys_domain: global
+      table: sys_app_application
+    sys_app_application:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "true"
+      category:
+        _: e0355b31ef303000a61d5a3615c0fb78
+        $:
+          display_value: Custom Applications
+      description: ""
+      device_type: browser
+      hint: ""
+      name: u_pagerduty_sync
+      order: "100"
+      roles: u_pagerduty_sync_group_user
+      sys_class_name: sys_app_application
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:13
+      sys_domain: global
+      sys_domain_path: /
+      sys_id: e11fac788323c3106531c4e0deaad381
+      sys_mod_count: "0"
+      sys_name: u_pagerduty_sync
+      sys_overrides: ""
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_app_application_e11fac788323c3106531c4e0deaad381
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:13:13
+      title: u_pagerduty_sync
+      view_name: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: ""
+target_name: u_pagerduty_sync
+type: Application Menu
+update_domain: global
+update_guid: e91fac78b723c3107b507fe93b70df85
+update_guid_history: e91fac78b723c3107b507fe93b70df85:1089791599
+view: ""

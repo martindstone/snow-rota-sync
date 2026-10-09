@@ -1,0 +1,115 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_dictionary_u_pagerduty_sync_group_u_group
+payload:
+  record_update:
+    sys_dictionary:
+      $:
+        action: INSERT_OR_UPDATE
+        element: u_group
+        table: u_pagerduty_sync_group
+      active: "true"
+      array: "false"
+      attributes: ""
+      audit: "false"
+      calculation: |-
+        (function calculatedFieldValue(current) {
+
+        	// Add your code here
+        	return '';  // return the calculated value
+
+        })(current);
+      choice: ""
+      choice_field: ""
+      choice_table: ""
+      column_label: Group
+      comments: ""
+      create_roles: ""
+      default_value: ""
+      defaultsort: ""
+      delete_roles: ""
+      dependent: ""
+      dependent_on_field: ""
+      display: "true"
+      dynamic_creation: "false"
+      dynamic_creation_script: ""
+      dynamic_default_value: ""
+      dynamic_ref_qual: ""
+      element: u_group
+      element_reference: "false"
+      foreign_database: ""
+      formula: ""
+      function_definition: ""
+      function_field: "false"
+      internal_type:
+        _: reference
+        $:
+          display_value: Reference
+      mandatory: "true"
+      max_length: "32"
+      name: u_pagerduty_sync_group
+      next_element: ""
+      primary: "false"
+      read_only: "false"
+      read_only_option: ""
+      read_roles: ""
+      reference:
+        _: sys_user_group
+        $:
+          display_value: ""
+          name: sys_user_group
+      reference_cascade_rule: ""
+      reference_floats: "false"
+      reference_key: ""
+      reference_qual: ""
+      reference_qual_condition: ""
+      reference_type: ""
+      spell_check: "false"
+      staged: "false"
+      sys_class_name: sys_dictionary
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:12
+      sys_id: 8bae68388323c3106531c4e0deaad32d
+      sys_name: Group
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_dictionary_u_pagerduty_sync_group_u_group
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-07 21:02:15
+      table_reference: "false"
+      text_index: "false"
+      unique: "false"
+      use_dependent_field: "false"
+      use_dynamic_default: "false"
+      use_reference_qualifier: simple
+      virtual: "false"
+      virtual_type: script
+      widget: ""
+      write_roles: ""
+      xml_view: "false"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Group
+type: Dictionary
+update_domain: global
+update_guid: 62331d6505ff0b9041fc272a0c8921fa
+update_guid_history: 62331d6505ff0b9041fc272a0c8921fa:-778446229,d91fac78d623c31078c08df50df8e97a:1759390515
+view: ""

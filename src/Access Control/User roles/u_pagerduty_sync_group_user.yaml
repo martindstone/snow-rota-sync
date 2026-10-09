@@ -1,0 +1,57 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_user_role_451facf08323c3106531c4e0deaad36f
+payload:
+  record_update:
+    $:
+      table: sys_user_role
+    sys_user_role:
+      $:
+        action: INSERT_OR_UPDATE
+      assignable_by: ""
+      can_delegate: "true"
+      description: ""
+      elevated_privilege: "false"
+      federated_id: ""
+      grantable: "true"
+      includes_roles: ""
+      name: u_pagerduty_sync_group_user
+      scoped_admin: "false"
+      suffix: ""
+      sys_class_name: sys_user_role
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:12
+      sys_id: 451facf08323c3106531c4e0deaad36f
+      sys_mod_count: "0"
+      sys_name: u_pagerduty_sync_group_user
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_user_role_451facf08323c3106531c4e0deaad36f
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:13:12
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: ""
+target_name: u_pagerduty_sync_group_user
+type: Role
+update_domain: global
+update_guid: 951fac781f23c310bad9d39ace8dc769
+update_guid_history: 951fac781f23c310bad9d39ace8dc769:1033175838
+view: ""

@@ -395,26 +395,23 @@ sync (it survives the event delete/recreate), and removed when the span was dele
 
 ## Packaging as an update set
 
-Everything is Global scope. The update set **"PagerDuty Sync v24"** carries the
-`u_pagerduty_sync_group` table (dictionary, labels, choice list, ACLs, role, menu/module and
-layouts), the Script Include, the Script Action and Event Registry entry, the six Business
-Rules (five mark-pending rules plus the unique-group rule), and the four UI Actions (Sync All, Sync This on `cmn_rota` and on `sys_user_group`,
-Export On-Call Config).
+Everything is Global scope. The update set is **built from this repo** by the packager (`packager/`, see
+`packager/PACKAGER.md`): `npm install` once, then `npm run package` writes `update_set/PagerDuty Sync v<version>.xml`.
+Import it via System Update Sets > Retrieved Update Sets > Import Update Set from XML, then Preview and Commit.
 
-**Scheduled Jobs are not captured by update sets on this instance**, so they ship separately:
-after committing the update set, run `fix_script_create_sync_queue_rules_and_jobs.js` with
-`DRY_RUN = false`. It reports the rules that already exist and creates the two jobs, with
-"Process Pending" **Inactive**. Activate it only after validating a manual live sync
-(and `sync.syncAll(true)` dry runs) on the target instance.
+It carries the `u_pagerduty_sync_group` table (dictionary, labels, choice list, ACLs, role, menu/module and layouts), the Script
+Include, the Script Action and Event Registry entry, six Business Rules (five mark-pending rules plus the unique-group rule), the four
+UI Actions (Sync All, Sync This on `cmn_rota` and on `sys_user_group`, Export On-Call Config), and the two Scheduled Jobs
+("Process Pending" **Inactive**, "Nightly Catch-All" Active).
 
-After importing the update set, also create the enrollment rows (one per group in
-`u_pagerduty_sync_group`) -- update sets carry the table, not its data.
-
-The exported XML is committed as `update_set/pagerduty_sync_v24.xml` (import it via System Update Sets > Retrieved Update Sets > Import Update Set from XML, then Preview and Commit).
-
-Source of truth is this repo; the update set is built from a dev instance whose records are
-pushed from these files. When a file changes, re-paste it into the dev record (it is then
-re-captured in the update set) before exporting.
+- **Scripts** are taken from the top-level `.js` files (`npm run sync-src` copies them into `src/`; `npm test` fails if `src/` is stale).
+- **Other settings** live in `src/**/*.yaml`; bump `version` in `src/defaults.yaml` for each release.
+- The scheduled-job records are new in the packaged set and **not yet proven by an import**: the earlier export taken from a dev instance
+  contained no jobs. If they don't arrive, `fix_script_create_sync_queue_rules_and_jobs.js` (`DRY_RUN = false`) creates them by name.
+- After importing, add the enrollment rows (one per group in `u_pagerduty_sync_group`) -- update sets carry the table, not its data.
+- `update_set/pagerduty_sync_v24.xml` is the earlier instance-exported set that was already imported successfully on a clean instance;
+  keep it until `PagerDuty Sync v24.1.xml` has been imported the same way.
+- Activate "Process Pending" only after validating a manual live sync (and `sync.syncAll(true)` dry runs) on the target instance.
 
 ## One-time setup
 

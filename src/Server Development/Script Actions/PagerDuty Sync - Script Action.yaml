@@ -1,0 +1,72 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sysevent_script_action_21cfe4f88323c3106531c4e0deaad3ca
+payload:
+  record_update:
+    $:
+      sys_domain: global
+      table: sysevent_script_action
+    sysevent_script_action:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "true"
+      condition_script: ""
+      description: ""
+      event_name: pagerduty_sync.requested
+      name: PagerDuty Sync - Script Action
+      order: "100"
+      script:
+        $ref: PagerDuty Sync - Script Action.js
+      synchronous: "false"
+      sys_class_name: sysevent_script_action
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:16:53
+      sys_domain: global
+      sys_domain_path: /
+      sys_id: 21cfe4f88323c3106531c4e0deaad3ca
+      sys_mod_count: "2"
+      sys_name: PagerDuty Sync - Script Action
+      sys_overrides: ""
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sysevent_script_action_21cfe4f88323c3106531c4e0deaad3ca
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-07 20:27:22
+    sys_es_latest_script:
+      $:
+        action: INSERT_OR_UPDATE
+      id: 21cfe4f88323c3106531c4e0deaad3ca
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:16:53
+      sys_id: 5bef6cb88323c3106531c4e0deaad315
+      sys_mod_count: "0"
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:16:53
+      table: sysevent_script_action
+      use_es_latest: "true"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: pagerduty_sync.requested
+target_name: PagerDuty Sync - Script Action
+type: Script Action
+update_domain: global
+update_guid: 273b81a594bf0b901378a7596d0ab661
+update_guid_history: 273b81a594bf0b901378a7596d0ab661:1391350395,e21730b81863c310187ecb8a1078c68e:333647402,53ef6cb82023c31049d2cdb5b774581a:911376150
+view: ""

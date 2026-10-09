@@ -1,0 +1,111 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_dictionary_u_pagerduty_sync_group_u_last_message
+payload:
+  record_update:
+    sys_dictionary:
+      $:
+        action: INSERT_OR_UPDATE
+        element: u_last_message
+        table: u_pagerduty_sync_group
+      active: "true"
+      array: "false"
+      attributes: ""
+      audit: "true"
+      calculation: |-
+        (function calculatedFieldValue(current) {
+
+        	// Add your code here
+        	return '';  // return the calculated value
+
+        })(current);
+      choice: ""
+      choice_field: ""
+      choice_table: ""
+      column_label: Last sync message
+      comments: ""
+      create_roles: ""
+      default_value: ""
+      defaultsort: ""
+      delete_roles: ""
+      dependent: ""
+      dependent_on_field: ""
+      display: "false"
+      dynamic_creation: "false"
+      dynamic_creation_script: ""
+      dynamic_default_value: ""
+      dynamic_ref_qual: ""
+      element: u_last_message
+      element_reference: "false"
+      foreign_database: ""
+      formula: ""
+      function_definition: ""
+      function_field: "false"
+      internal_type:
+        _: string
+        $:
+          display_value: String
+      mandatory: "false"
+      max_length: "4000"
+      name: u_pagerduty_sync_group
+      next_element: ""
+      primary: "false"
+      read_only: "false"
+      read_only_option: ""
+      read_roles: ""
+      reference: ""
+      reference_cascade_rule: ""
+      reference_floats: "false"
+      reference_key: ""
+      reference_qual: ""
+      reference_qual_condition: ""
+      reference_type: ""
+      spell_check: "false"
+      staged: "false"
+      sys_class_name: sys_dictionary
+      sys_created_by: admin
+      sys_created_on: 2026-10-05 15:58:58
+      sys_id: 98aa7db88377c3906531c4e0deaad3fd
+      sys_name: Last sync message
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_dictionary_u_pagerduty_sync_group_u_last_message
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-05 15:58:58
+      table_reference: "false"
+      text_index: "false"
+      unique: "false"
+      use_dependent_field: "false"
+      use_dynamic_default: "false"
+      use_reference_qualifier: simple
+      virtual: "false"
+      virtual_type: script
+      widget: ""
+      write_roles: ""
+      xml_view: "false"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Last sync message
+type: Dictionary
+update_domain: global
+update_guid: 94aabdb86577c39064e4acf5152daa15
+update_guid_history: 94aabdb86577c39064e4acf5152daa15:-738117605
+view: ""

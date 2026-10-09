@@ -1,0 +1,75 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_db_object_f2aea0788323c3106531c4e0deaad30a
+payload:
+  record_update:
+    $:
+      table: sys_db_object
+    sys_db_object:
+      $:
+        action: INSERT_OR_UPDATE
+      access: public
+      actions_access: "false"
+      alter_access: "false"
+      caller_access: ""
+      client_scripts_access: "false"
+      configuration_access: "false"
+      create_access: "false"
+      create_access_controls: "true"
+      delete_access: "false"
+      filter_extension: ""
+      is_data_interface: "false"
+      is_df_table: "false"
+      is_extendable: "false"
+      label: PagerDuty Sync Group
+      live_feed_enabled: "false"
+      name: u_pagerduty_sync_group
+      number_ref: ""
+      provider_class: ""
+      read_access: "true"
+      scriptable_table: "false"
+      super_class: ""
+      sys_class_name: sys_db_object
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:13
+      sys_id: f2aea0788323c3106531c4e0deaad30a
+      sys_mod_count: "1"
+      sys_name: PagerDuty Sync Group
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_db_object_f2aea0788323c3106531c4e0deaad30a
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-07 21:02:16
+      update_access: "false"
+      user_role:
+        _: 451facf08323c3106531c4e0deaad36f
+        $:
+          display_value: u_pagerduty_sync_group_user
+          name: u_pagerduty_sync_group_user
+      ws_access: "true"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: PagerDuty Sync Group
+type: Table
+update_domain: global
+update_guid: 36335d6571ff0b905f643431ba137a25
+update_guid_history: 36335d6571ff0b905f643431ba137a25:437589005,8e1fec789c23c310e4851fffd5233877:77116109
+view: ""

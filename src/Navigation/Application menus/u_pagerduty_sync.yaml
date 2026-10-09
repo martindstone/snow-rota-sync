@@ -1,0 +1,56 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_ui_application_691fac788323c3106531c4e0deaad38e
+payload:
+  record_update:
+    $:
+      sys_domain: global
+      table: sys_ui_application
+    sys_ui_application:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "true"
+      hint: ""
+      name: u_pagerduty_sync
+      order: ""
+      roles: u_pagerduty_sync_group_user
+      sys_class_name: sys_ui_application
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:13
+      sys_domain: global
+      sys_domain_path: /
+      sys_id: 691fac788323c3106531c4e0deaad38e
+      sys_mod_count: "0"
+      sys_name: u_pagerduty_sync
+      sys_overrides: ""
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_ui_application_691fac788323c3106531c4e0deaad38e
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:13:13
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: ""
+target_name: u_pagerduty_sync
+type: Application Menu
+update_domain: global
+update_guid: e51fac783623c310d4ded85ede6b6892
+update_guid_history: e51fac783623c310d4ded85ede6b6892:31252940
+view: ""

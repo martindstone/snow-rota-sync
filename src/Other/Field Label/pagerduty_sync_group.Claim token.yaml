@@ -1,0 +1,60 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_documentation_u_pagerduty_sync_group_u_claim_token_en
+payload:
+  record_update:
+    sys_documentation:
+      $:
+        element: u_claim_token
+        label: Claim token
+        language: en
+        table: u_pagerduty_sync_group
+      sys_documentation:
+        $:
+          action: INSERT_OR_UPDATE
+        element: u_claim_token
+        help: ""
+        hint: ""
+        label: Claim token
+        language: en
+        name: u_pagerduty_sync_group
+        plural: Claim tokens
+        sys_class_name: sys_documentation
+        sys_created_by: admin
+        sys_created_on: 2026-10-05 15:58:56
+        sys_id: ff9a7db88377c3906531c4e0deaad328
+        sys_mod_count: "0"
+        sys_name: Claim token
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_documentation_u_pagerduty_sync_group_u_claim_token_en
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-05 15:58:56
+        url: ""
+        url_target: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Claim token
+type: Field Label
+update_domain: global
+update_guid: f79a7db81477c3905d6afc314b140e37
+update_guid_history: f79a7db81477c3905d6afc314b140e37:1953100411
+view: ""

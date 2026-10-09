@@ -1,0 +1,60 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_documentation_u_pagerduty_sync_group_u_last_success_en
+payload:
+  record_update:
+    sys_documentation:
+      $:
+        element: u_last_success
+        label: Last successful sync
+        language: en
+        table: u_pagerduty_sync_group
+      sys_documentation:
+        $:
+          action: INSERT_OR_UPDATE
+        element: u_last_success
+        help: ""
+        hint: ""
+        label: Last successful sync
+        language: en
+        name: u_pagerduty_sync_group
+        plural: Last successful syncs
+        sys_class_name: sys_documentation
+        sys_created_by: admin
+        sys_created_on: 2026-10-05 15:58:59
+        sys_id: d8aabdb88377c3906531c4e0deaad328
+        sys_mod_count: "0"
+        sys_name: Last successful sync
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_documentation_u_pagerduty_sync_group_u_last_success_en
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-05 15:58:59
+        url: ""
+        url_target: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Last successful sync
+type: Field Label
+update_domain: global
+update_guid: 60aabdb8cc77c390e089f9d52b7bce50
+update_guid_history: 60aabdb8cc77c390e089f9d52b7bce50:794583121
+view: ""

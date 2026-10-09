@@ -1,0 +1,67 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_security_acl_a51fac788323c3106531c4e0deaad3e3
+payload:
+  record_update:
+    $:
+      table: sys_security_acl
+    sys_security_acl:
+      $:
+        action: INSERT_OR_UPDATE
+      active: "true"
+      admin_overrides: "true"
+      advanced: "false"
+      applies_to: ""
+      condition: ""
+      controlled_by_refs: ""
+      decision_type: allow
+      description: Default access control on u_pagerduty_sync_group
+      local_or_existing: Existing
+      name: u_pagerduty_sync_group
+      operation:
+        _: read
+        $:
+          display_value: read
+      script: ""
+      security_attribute: ""
+      sys_class_name: sys_security_acl
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:13:14
+      sys_id: a51fac788323c3106531c4e0deaad3e3
+      sys_mod_count: "0"
+      sys_name: u_pagerduty_sync_group
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_security_acl_a51fac788323c3106531c4e0deaad3e3
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:13:14
+      type:
+        _: record
+        $:
+          display_value: record
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: u_pagerduty_sync_group
+type: Access Control
+update_domain: global
+update_guid: a91fac78ee23c310a9425394d061d7e7
+update_guid_history: a91fac78ee23c310a9425394d061d7e7:2097480272
+view: ""

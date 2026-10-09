@@ -1,0 +1,70 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_script_include_214ea0388323c3106531c4e0deaad307
+payload:
+  record_update:
+    $:
+      table: sys_script_include
+    sys_script_include:
+      $:
+        action: INSERT_OR_UPDATE
+      access: public
+      active: "true"
+      api_name: global.PagerDutySync
+      caller_access: ""
+      client_callable: "false"
+      description: ""
+      mobile_callable: "false"
+      name: PagerDutySync
+      sandbox_callable: "false"
+      script:
+        $ref: PagerDutySync.js
+      sys_class_name: sys_script_include
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:10:56
+      sys_id: 214ea0388323c3106531c4e0deaad307
+      sys_mod_count: "22"
+      sys_name: PagerDutySync
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_script_include_214ea0388323c3106531c4e0deaad307
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-07 20:27:21
+    sys_es_latest_script:
+      $:
+        action: INSERT_OR_UPDATE
+      id: 214ea0388323c3106531c4e0deaad307
+      sys_created_by: admin
+      sys_created_on: 2026-09-23 00:10:56
+      sys_id: cc9ea8388323c3106531c4e0deaad33f
+      sys_mod_count: "0"
+      sys_updated_by: admin
+      sys_updated_on: 2026-09-23 00:10:56
+      table: sys_script_include
+      use_es_latest: "true"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: ""
+target_name: PagerDutySync
+type: Script Include
+update_domain: global
+update_guid: 133b81a590bf0b90c1a5e66cbb801545
+update_guid_history: 133b81a590bf0b90c1a5e66cbb801545:1630079324,304d6630253fc3906777ea77f5557724:1538725495,bd7bf93c8c77c3901dd9df909905247c:191863772,abe075b49e37c3902048ce79522b72b2:1692743035,0fc2030778ef4750568b3816ee870a89:-314728322,a00514cb826b075073fc833b8b32783e:2045572352,662bb33a5fa70750cb83e2b9a4ca143f:-861876961,4570bfb23d6707502dd8ef548ab847e4:1863648621,4ca6ba7246afc350c03071a0cdccbb77:-440286238,813046b6e6e7c350a57722c56efac277:-1746673942,799eec126caf8f10b64a311585bdb17e:893807979,be4cc66124eb4b10919245f888cada19:-1293308547,f5caededcaa74b10264f957b6d9eb211:-1336427906,51e765a9d5a74b1005d6a7ec6d5d7b03:1949823833,01a72d6983a74b10f0f33b41134587f1:-1823207678,7efec9297ee34b1092801d9c823a5269:-2124886807,bef545c13ce34710666e058122c29761:-1093067064,cd858581f8e34710d7db36d06ee4555a:-21067361,2b8d0005922f0710fe06766e7bb75187:23699639,ce080df89ce3c3108cf2bc66de70bcc1:1043471487,8cc309f0b6e3c310de68aa504046988a:525098578,6176fc381063c310c0495ee89588ebcc:-1330452887,409ea0386923c310cbc336705cdaa940:1043087120
+view: ""

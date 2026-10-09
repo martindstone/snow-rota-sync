@@ -1,0 +1,45 @@
+$:
+  action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+application_name: Global
+application_scope: global
+application_version: ""
+collisions: ""
+commit_date: ""
+deleted: ""
+description: "PagerDuty Sync: ServiceNow-native on-call sync. Contains the
+  u_pagerduty_sync_group table, Script Include, Script Action + event, UI
+  Actions, and Business Rules. Scheduled Jobs are NOT captured by update sets
+  here -- create them with fix_script_create_sync_queue_rules_and_jobs.js
+  (Process Pending ships inactive)."
+inserted: ""
+name: PagerDuty Sync v24
+origin_sys_id: ""
+parent:
+  $:
+    display_value: ""
+release_date: ""
+remote_base_update_set:
+  $:
+    display_value: ""
+remote_parent_id: ""
+remote_sys_id: 765a9f92447f42a036bdbd544bb78072
+state: loaded
+summary: ""
+sys_class_name: sys_remote_update_set
+sys_created_by: admin
+sys_created_on: 2026-10-07 23:38:32
+sys_id: 42686c36d72e69c78b31b91d0671b9a3
+sys_mod_count: "0"
+sys_updated_by: admin
+sys_updated_on: 2026-10-07 23:38:32
+update_set:
+  $:
+    display_value: ""
+update_source:
+  $:
+    display_value: ""
+updated: ""

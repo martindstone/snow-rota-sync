@@ -1,0 +1,241 @@
+{
+  "atf_input_variable": [
+    "Input Variables"
+  ],
+  "catalog_script_client": [
+    "Catalog Client Scripts"
+  ],
+  "catalog_ui_policy": [
+    "Catalog UI Policy"
+  ],
+  "catalog_ui_policy_action": [
+    "Catalog UI Policy Action"
+  ],
+  "db_image": [
+    "Images"
+  ],
+  "fx_price": [
+    "Question Choice",
+    "Record Producer",
+    "Variable"
+  ],
+  "oauth_entity": [
+    "Application Registries"
+  ],
+  "oauth_entity_profile": [
+    "OAuth Entity Profile"
+  ],
+  "oauth_entity_profile_scope": [
+    "OAuth Entity Profile Scope"
+  ],
+  "oauth_entity_scope": [
+    "OAuth Entity Scope"
+  ],
+  "sys_app": [
+    "Custom Application"
+  ],
+  "sys_app_application": [
+    "Application Menu"
+  ],
+  "sys_app_module": [
+    "Module"
+  ],
+  "sys_atf_parameter_set": [
+    "Test Run Data Set"
+  ],
+  "sys_atf_parameter_variable": [
+    "Parameter Variable"
+  ],
+  "sys_atf_step": [
+    "Test Step"
+  ],
+  "sys_atf_step_config": [
+    "Test Step Config"
+  ],
+  "sys_atf_test": [
+    "Test"
+  ],
+  "sys_atf_test_suite": [
+    "Test Suite"
+  ],
+  "sys_atf_test_suite_test": [
+    "Test Suite Test"
+  ],
+  "sys_atf_test_template": [
+    "Test Template"
+  ],
+  "sys_auto_flush": [
+    "Auto Flush"
+  ],
+  "sys_choice": [
+    "Choice list"
+  ],
+  "sys_db_object": [
+    "Table"
+  ],
+  "sys_db_view": [
+    "Database View"
+  ],
+  "sys_db_view_table": [
+    "View Table"
+  ],
+  "sys_db_view_table_field": [
+    "View Field"
+  ],
+  "sys_dictionary": [
+    "Dictionary"
+  ],
+  "sys_documentation": [
+    "Field Label"
+  ],
+  "sys_filter": [
+    "Filter"
+  ],
+  "sys_index": [
+    "Indexes"
+  ],
+  "sys_metadata_link": [
+    "Metadata Snapshot"
+  ],
+  "sys_number": [
+    "Number"
+  ],
+  "sys_properties": [
+    "System Property"
+  ],
+  "sys_properties_category": [
+    "System Property Category"
+  ],
+  "sys_properties_category_m2m": [
+    "Category Property"
+  ],
+  "sys_relationship": [
+    "Relationship"
+  ],
+  "sys_scope_privilege": [
+    "Cross scope privilege"
+  ],
+  "sys_scope_script_access": [
+    "Scope Script Access"
+  ],
+  "sys_scope_table_access": [
+    "Scope Table Access"
+  ],
+  "sys_script": [
+    "Business Rule"
+  ],
+  "sys_script_client": [
+    "Client Script"
+  ],
+  "sys_script_fix": [
+    "Fix Script"
+  ],
+  "sys_script_include": [
+    "Script Include"
+  ],
+  "sys_security_acl": [
+    "Access Control"
+  ],
+  "sys_security_acl_role": [
+    "Access Roles"
+  ],
+  "sys_transform_entry": [
+    "Field Map"
+  ],
+  "sys_transform_map": [
+    "Table Transform Map"
+  ],
+  "sys_transform_script": [
+    "Transform Script"
+  ],
+  "sys_ui_action": [
+    "UI Action"
+  ],
+  "sys_ui_action_role": [
+    "UI Action Role"
+  ],
+  "sys_ui_annotation_type": [
+    "Form Annotation Type"
+  ],
+  "sys_ui_application": [
+    "Application Menu"
+  ],
+  "sys_ui_form_sections": [
+    "Form Sections"
+  ],
+  "sys_ui_list": [
+    "List Layout"
+  ],
+  "sys_ui_list_control": [
+    "List Control"
+  ],
+  "sys_ui_macro": [
+    "Macro"
+  ],
+  "sys_ui_module": [
+    "Module"
+  ],
+  "sys_ui_page": [
+    "UI Page"
+  ],
+  "sys_ui_policy": [
+    "UI Policy"
+  ],
+  "sys_ui_policy_action": [
+    "UI Policy Action"
+  ],
+  "sys_ui_script": [
+    "UI Script"
+  ],
+  "sys_ui_section": [
+    "Form Layout"
+  ],
+  "sys_ui_style": [
+    "Style"
+  ],
+  "sys_ui_view": [
+    "UI View"
+  ],
+  "sys_user": [
+    "User"
+  ],
+  "sys_user_has_role": [
+    "User Role"
+  ],
+  "sys_user_role": [
+    "Role"
+  ],
+  "sys_user_role_contains": [
+    "Contained Role"
+  ],
+  "sys_ws_definition": [
+    "Scripted REST API"
+  ],
+  "sys_ws_operation": [
+    "Scripted REST Resource"
+  ],
+  "sys_ws_query_parameter": [
+    "Scripted REST Query Parameter"
+  ],
+  "sys_ws_query_parameter_map": [
+    "Scripted REST Query Parameter Associatio"
+  ],
+  "sys_ws_version": [
+    "Scripted REST Version"
+  ],
+  "sysauto_script": [
+    "Scheduled Script Execution"
+  ],
+  "sysevent_register": [
+    "Event Registration"
+  ],
+  "sysevent_script_action": [
+    "Script Action"
+  ],
+  "ua_table_licensing_config": [
+    "Table Subscription Configuration"
+  ],
+  "x_pd_integration_pagerduty_inbound_field_rule": [
+    "PagerDuty Inbound Field Rule"
+  ]
+}

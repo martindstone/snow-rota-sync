@@ -1,0 +1,279 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_ui_section_222f24b88323c3106531c4e0deaad353
+payload:
+  record_update:
+    sys_ui_section:
+      $:
+        caption: ""
+        section_id: 222f24b88323c3106531c4e0deaad353
+        sys_domain: global
+        table: u_pagerduty_sync_group
+        version: "3"
+        view: ""
+      sys_ui_element:
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_group
+          position: "0"
+          sys_created_by: admin
+          sys_created_on: 2026-09-23 00:13:34
+          sys_id: a22f24b88323c3106531c4e0deaad35d
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-09-23 00:13:34
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_pending_since
+          position: "1"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:54
+          sys_id: 939a3db88377c3906531c4e0deaad39e
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:54
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_last_change
+          position: "2"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:55
+          sys_id: 279a3db88377c3906531c4e0deaad3cf
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:55
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_running_since
+          position: "3"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:55
+          sys_id: 679a7db88377c3906531c4e0deaad305
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:55
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_retry_after
+          position: "5"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:56
+          sys_id: 739a7db88377c3906531c4e0deaad340
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:56
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_last_attempt
+          position: "6"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:57
+          sys_id: 84aa7db88377c3906531c4e0deaad38f
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:57
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_last_result
+          position: "7"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:57
+          sys_id: 88aa7db88377c3906531c4e0deaad3b9
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:57
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_last_message
+          position: "8"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:58
+          sys_id: dcaabdb88377c3906531c4e0deaad303
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:58
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_last_success
+          position: "9"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:58
+          sys_id: 1caabdb88377c3906531c4e0deaad321
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:58
+          sys_user: ""
+          type: ""
+        - $:
+            action: INSERT_OR_UPDATE
+          element: u_consecutive_failures
+          position: "10"
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:59
+          sys_id: 68aabdb88377c3906531c4e0deaad371
+          sys_mod_count: "0"
+          sys_ui_formatter: ""
+          sys_ui_section:
+            _: 222f24b88323c3106531c4e0deaad353
+            $:
+              caption: "NULL"
+              display_value: ""
+              name: u_pagerduty_sync_group
+              sys_domain: global
+              view: Default view
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:59
+          sys_user: ""
+          type: ""
+      sys_ui_section:
+        $:
+          action: INSERT_OR_UPDATE
+        caption: ""
+        header: "false"
+        name: u_pagerduty_sync_group
+        roles: ""
+        sys_class_name: sys_ui_section
+        sys_created_by: admin
+        sys_created_on: 2026-09-23 00:13:34
+        sys_domain: global
+        sys_domain_path: /
+        sys_id: 222f24b88323c3106531c4e0deaad353
+        sys_mod_count: "2"
+        sys_name: u_pagerduty_sync_group
+        sys_overrides: ""
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_ui_section_222f24b88323c3106531c4e0deaad353
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-07 21:04:01
+        sys_user: ""
+        title: "true"
+        view:
+          _: Default view
+          $:
+            display_value: Default view
+            name: "NULL"
+        view_name: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: PagerDuty Sync Group
+type: Form Layout
+update_domain: global
+update_guid: 98a399a521ff0b90bcc60a375c8114e2
+update_guid_history: 98a399a521ff0b90bcc60a375c8114e2:1832364143,54a399a5d0ff0b9027c6f3ea10b235be:-293495695,24aabdb81377c390facedf0c29a12475:-1741241512,54aabdb82f77c390976c48822d610425:-629136204,94aabdb86477c390392835ad6be77d07:-1717844202,ccaa7db8b477c39001227e1921e9b7bc:847209043,48aa7db83f77c390be64add833b01d92:-2046171615,b39a7db85077c3903306acfb78bec343:-1535192426,7b9a7db86277c390e993bbe15b802b25:-1761571905,a39a7db8e977c390913cecde417c9808:1447144712,ef9a3db8f777c3907915cd45d55e09d1:-1877435996,9f9a3db80477c390ae883ea457ea06a2:192677608,ee2f24b84923c31094807e52b406ca5f:1113228830,222f24b81823c310aba89cbe2fa52958:-1815455754
+view: ""

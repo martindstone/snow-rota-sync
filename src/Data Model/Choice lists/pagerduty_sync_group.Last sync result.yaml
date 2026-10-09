@@ -1,0 +1,114 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_choice_u_pagerduty_sync_group_u_last_result
+payload:
+  record_update:
+    sys_choice:
+      $:
+        action: INSERT_OR_UPDATE
+        field: u_last_result
+        table: u_pagerduty_sync_group
+        version: "3"
+      sys_choice_set:
+        $:
+          action: INSERT_OR_UPDATE
+        element: u_last_result
+        name: u_pagerduty_sync_group
+        sys_class_name: sys_choice_set
+        sys_created_by: admin
+        sys_created_on: 2026-10-05 15:58:57
+        sys_id: c4aa7db88377c3906531c4e0deaad3d2
+        sys_mod_count: "0"
+        sys_name: u_last_result
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_choice_u_pagerduty_sync_group_u_last_result
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-05 15:58:57
+      sys_choice:
+        - $:
+            action: INSERT_OR_UPDATE
+          dependent_value: ""
+          element: u_last_result
+          hint: ""
+          inactive: "false"
+          label: Success
+          language: en
+          name: u_pagerduty_sync_group
+          sequence: "100"
+          synonyms: ""
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:57
+          sys_domain: global
+          sys_domain_path: /
+          sys_id: 0caa7db88377c3906531c4e0deaad3d0
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:57
+          value: success
+        - $:
+            action: INSERT_OR_UPDATE
+          dependent_value: ""
+          element: u_last_result
+          hint: ""
+          inactive: "false"
+          label: Failed
+          language: en
+          name: u_pagerduty_sync_group
+          sequence: "200"
+          synonyms: ""
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:58
+          sys_domain: global
+          sys_domain_path: /
+          sys_id: 50aa7db88377c3906531c4e0deaad3e6
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:58
+          value: failed
+        - $:
+            action: INSERT_OR_UPDATE
+          dependent_value: ""
+          element: u_last_result
+          hint: ""
+          inactive: "false"
+          label: Skipped
+          language: en
+          name: u_pagerduty_sync_group
+          sequence: "300"
+          synonyms: ""
+          sys_created_by: admin
+          sys_created_on: 2026-10-05 15:58:58
+          sys_domain: global
+          sys_domain_path: /
+          sys_id: 58aa7db88377c3906531c4e0deaad3eb
+          sys_mod_count: "0"
+          sys_updated_by: admin
+          sys_updated_on: 2026-10-05 15:58:58
+          value: skipped
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Last sync result
+type: Choice list
+update_domain: global
+update_guid: 54aa7db86377c390ce64844c1ddde8ee
+update_guid_history: 54aa7db86377c390ce64844c1ddde8ee:1991262467,5caa7db85777c390054e770d52830be8:731398,4caa7db81777c3908d595f7ff7c594d6:-195252784
+view: ""

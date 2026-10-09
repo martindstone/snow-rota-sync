@@ -1,0 +1,60 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_documentation_u_pagerduty_sync_group_u_retry_after_en
+payload:
+  record_update:
+    sys_documentation:
+      $:
+        element: u_retry_after
+        label: Retry after
+        language: en
+        table: u_pagerduty_sync_group
+      sys_documentation:
+        $:
+          action: INSERT_OR_UPDATE
+        element: u_retry_after
+        help: ""
+        hint: ""
+        label: Retry after
+        language: en
+        name: u_pagerduty_sync_group
+        plural: Retry afters
+        sys_class_name: sys_documentation
+        sys_created_by: admin
+        sys_created_on: 2026-10-05 15:58:56
+        sys_id: 3b9a7db88377c3906531c4e0deaad346
+        sys_mod_count: "0"
+        sys_name: Retry after
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_documentation_u_pagerduty_sync_group_u_retry_after_en
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-05 15:58:56
+        url: ""
+        url_target: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: pagerduty_sync_group.Retry after
+type: Field Label
+update_domain: global
+update_guid: 339a7db8db77c390152ffd95d321d055
+update_guid_history: 339a7db8db77c390152ffd95d321d055:1161972767
+view: ""

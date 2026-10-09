@@ -1,0 +1,13 @@
+{
+  "name": "snow-rota-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ServiceNow-native on-call sync to PagerDuty: source, packager and update set.",
+  "scripts": {
+    "sync-src": "node packager/sync-to-src.js",
+    "package": "node packager/sync-to-src.js && node packager/package.js",
+    "test": "mocha --reporter spec packager/test/*.test.js"
+  },
+  "devDependencies": { "mocha": "^10.7.3" },
+  "dependencies": { "xml2js": "0.5.0", "yaml": "1.10.2" }
+}

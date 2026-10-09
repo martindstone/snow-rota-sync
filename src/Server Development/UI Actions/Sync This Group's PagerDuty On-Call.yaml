@@ -1,0 +1,92 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_ui_action_ec4bc1a583bf0b906531c4e0deaad32f
+payload:
+  record_update:
+    $:
+      sys_domain: global
+      table: sys_ui_action
+    sys_ui_action:
+      $:
+        action: INSERT_OR_UPDATE
+      action_name: sync_this_pagerduty_oncall
+      active: "true"
+      client: "false"
+      client_script_v2: ""
+      comments: ""
+      condition: (new global.PagerDutySync()).isEnrolled(current.name.toString())
+      form_action: "true"
+      form_button: "true"
+      form_button_icon: ""
+      form_button_v2: "false"
+      form_context_menu: "false"
+      form_link: "false"
+      form_menu_button_v2: "false"
+      form_style: ""
+      format_for_configurable_workspace: "false"
+      hint: ""
+      isolate_script: "false"
+      list_action: "false"
+      list_banner_button: "false"
+      list_button: "false"
+      list_button_icon: ""
+      list_choice: "false"
+      list_context_menu: "false"
+      list_link: "false"
+      list_save_with_form_button: "false"
+      list_style: ""
+      messages: ""
+      name: Sync This Group's PagerDuty On-Call
+      onclick: ""
+      order: "100"
+      script:
+        $ref: Sync This Group's PagerDuty On-Call.js
+      show_form_icon_only: "false"
+      show_insert: "false"
+      show_list_icon_only: "false"
+      show_multiple_update: "false"
+      show_query: "false"
+      show_update: "true"
+      sys_class_name: sys_ui_action
+      sys_created_by: admin
+      sys_created_on: 2026-10-07 20:27:27
+      sys_domain: global
+      sys_domain_path: /
+      sys_id: ec4bc1a583bf0b906531c4e0deaad32f
+      sys_mod_count: "0"
+      sys_name: Sync This Group's PagerDuty On-Call
+      sys_overrides: ""
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_ui_action_ec4bc1a583bf0b906531c4e0deaad32f
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-07 20:27:27
+      table: sys_user_group
+      ui11_compatible: "true"
+      ui16_compatible: "false"
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: sys_user_group
+target_name: Sync This Group's PagerDuty On-Call
+type: UI Action
+update_domain: global
+update_guid: 684bc1a5babf0b9083f3e22ea7cdc932
+update_guid_history: 684bc1a5babf0b9083f3e22ea7cdc932:-134491638
+view: ""

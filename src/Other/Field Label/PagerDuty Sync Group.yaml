@@ -1,0 +1,60 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_documentation_u_pagerduty_sync_group__en
+payload:
+  record_update:
+    sys_documentation:
+      $:
+        element: ""
+        label: PagerDuty Sync Group
+        language: en
+        table: u_pagerduty_sync_group
+      sys_documentation:
+        $:
+          action: INSERT_OR_UPDATE
+        element: ""
+        help: ""
+        hint: ""
+        label: PagerDuty Sync Group
+        language: en
+        name: u_pagerduty_sync_group
+        plural: PagerDuty Sync Groups
+        sys_class_name: sys_documentation
+        sys_created_by: admin
+        sys_created_on: 2026-09-23 00:13:14
+        sys_id: 391fec788323c3106531c4e0deaad329
+        sys_mod_count: "1"
+        sys_name: PagerDuty Sync Group
+        sys_package:
+          _: global
+          $:
+            display_value: Global
+            source: global
+        sys_policy: ""
+        sys_scope:
+          _: global
+          $:
+            display_value: Global
+        sys_update_name: sys_documentation_u_pagerduty_sync_group__en
+        sys_updated_by: admin
+        sys_updated_on: 2026-10-07 21:02:16
+        url: ""
+        url_target: ""
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: u_pagerduty_sync_group
+target_name: PagerDuty Sync Group
+type: Field Label
+update_domain: global
+update_guid: fe335d6589ff0b907c4b32336e2fa71e
+update_guid_history: fe335d6589ff0b907c4b32336e2fa71e:1932370183,821fec78f023c310ba13914e40c5ec72:289090503
+view: ""
