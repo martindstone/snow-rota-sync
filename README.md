@@ -1,84 +1,348 @@
-# PagerDuty Sync -- ServiceNow-native port
+# PagerDuty Sync -- ServiceNow-native on-call sync
 
-Reads on-call config (`cmn_rota`/`cmn_rota_roster`/`cmn_rota_member`/`cmn_schedule_span`)
-for enrolled groups and pushes it to PagerDuty as schedules + escalation policies,
-built against PagerDuty's v3 "shift-based schedules" API (`schedules` -> `rotations`
--> `events`, RFC 5545 recurrence). All outbound HTTP goes through the officially
-installed app's `x_pd_integration.PagerDuty_REST` Script Include, so this only works
-on an instance that already has that app installed and configured.
+Reads on-call configuration from ServiceNow's On-Call Scheduling tables (`cmn_rota`, `cmn_rota_roster`,
+`cmn_rota_member`, `cmn_schedule_span`, `roster_schedule_span`) for the groups you enroll, and writes it to
+PagerDuty as **schedules and escalation policies**, using PagerDuty's v3 "shift-based schedules" API
+(`schedules` -> `rotations` -> `events`, RFC 5545 recurrence). Edits in ServiceNow are collected, debounced, and
+pushed automatically; a manual sync button is available on the rota and group forms.
 
-## What's in this repo
+All outbound HTTP goes through the PagerDuty integration app's `x_pd_integration.PagerDuty_REST` Script Include, so this
+runs only on an instance that already has that app installed and configured.
 
-| File | Record type | Where it lives |
+**Contents:** [How it works](#how-it-works) · [Requirements](#requirements) · [Installation](#installation) ·
+[Day-to-day use](#day-to-day-use) · [Troubleshooting](#troubleshooting) · [Maintenance](#maintenance) ·
+[Developing and releasing](#developing-and-releasing) · [Reference](#reference)
+
+## How it works
+
+### The pieces and how they relate
+
+```mermaid
+flowchart TB
+  subgraph SN["ServiceNow instance (Global scope)"]
+    SRC["On-call tables<br/>cmn_rota / roster / member<br/>cmn_schedule_span<br/>roster_schedule_span"]
+    BR["5 Business Rules<br/>'PagerDuty Sync Pending - *'<br/>mark the group pending"]
+    ENR[("u_pagerduty_sync_group<br/>enrollment + sync state")]
+    JOB["Scheduled Job<br/>Process Pending (every minute)<br/>Nightly Catch-All"]
+    UIA["UI Actions<br/>Sync All / Sync This"]
+    EVT["Event pagerduty_sync.requested<br/>+ Script Action"]
+    SI["Script Include<br/>PagerDutySync"]
+    APP["PagerDuty app<br/>x_pd_integration.PagerDuty_REST"]
+  end
+  PD["PagerDuty<br/>schedules (v3) +<br/>escalation policies"]
+
+  SRC -- "insert / update / delete" --> BR
+  BR -- "markPendingForRecord()" --> ENR
+  JOB -- "processPending() / markAllPending()" --> SI
+  UIA -- "gs.eventQueue" --> EVT
+  EVT -- "syncGroupTracked() / syncAllTracked()" --> SI
+  SI <-->|"lock, history,<br/>enrolled groups"| ENR
+  SI -- "reads config" --> SRC
+  SI -- "REST" --> APP
+  APP -- "HTTPS" --> PD
+```
+
+Only groups with a row in `u_pagerduty_sync_group` are ever touched. The Business Rules never call PagerDuty; they only
+stamp the group as pending. Syncing happens in the scheduled job or from a manual button.
+
+### Data the sync reads
+
+```mermaid
+erDiagram
+  sys_user_group ||--o{ cmn_rota : "has rotas (regions / shifts)"
+  sys_user_group ||--o| u_pagerduty_sync_group : "enrolled by"
+  cmn_rota ||--o{ cmn_rota_roster : "has rosters (escalation levels)"
+  cmn_rota ||--o{ cmn_schedule_span : "coverage window (via schedule)"
+  cmn_rota_roster ||--o{ cmn_rota_member : "has members, in order"
+  sys_user ||--o{ cmn_rota_member : "is"
+  cmn_rota_roster ||--o{ roster_schedule_span : "Provide coverage (override)"
+  sys_user ||--o{ roster_schedule_span : "covers"
+  u_pagerduty_sync_group {
+    reference u_group "mandatory, one row per group"
+    datetime u_pending_since
+    datetime u_last_change
+    datetime u_running_since "lock"
+    datetime u_retry_after "backoff"
+    string u_last_result "success / failed / skipped"
+    string u_last_message
+    integer u_consecutive_failures
+  }
+```
+
+Each **rota** becomes the coverage window (a region or shift); each **roster** is an escalation level; **members** become the
+rotation; one-off `roster_schedule_span` (type `on_call`) rows become PagerDuty overrides. See [Reference](#reference) for how
+shapes are classified (`single_region`, `follow_the_sun`, `needs_review`) and the exact mapping.
+
+### From an edit to PagerDuty (debounced)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Ed as On-call admin
+  participant Src as On-call tables
+  participant BR as Business Rules
+  participant Row as u_pagerduty_sync_group row
+  participant Job as Process Pending (1 min)
+  participant Sync as PagerDutySync
+  participant PD as PagerDuty
+  Ed->>Src: edit a rota, roster, member, span or coverage
+  Src->>BR: before insert / update / delete
+  BR->>Row: set u_last_change (u_pending_since if empty)
+  loop every minute
+    Job->>Row: is any group due?
+    Note over Job,Row: due = quiet for 120 s, or 600 s since first change,<br/>not locked, not backing off
+  end
+  Job->>Row: take lock (u_running_since + u_claim_token)
+  Job->>Sync: syncGroup(name, live)
+  Sync->>Src: load rotas, rosters, members, spans, coverage
+  Sync->>PD: upsert schedules, policy, overrides
+  alt success
+    Sync-->>Row: u_last_result=success, clear pending, failures=0
+  else failure
+    Sync-->>Row: u_last_result=failed, retry after 5 / 15 / 60 min
+  end
+```
+
+### Sync status of one group
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Pending: an edit, the nightly job, or a manual request
+  Pending --> Pending: more edits (timer restarts, capped at 10 min)
+  Pending --> Running: due and not locked, lock taken
+  Running --> Idle: success (nothing changed during the run)
+  Running --> Pending: success but edits arrived during the run
+  Running --> Backoff: failed (5, then 15, then 60 minutes)
+  Backoff --> Running: retry time reached, or a manual sync
+```
+
+## Requirements
+
+| | |
+|---|---|
+| ServiceNow | A release with On-Call Scheduling (`cmn_rota*`, `OCRotationV2`), and an admin to import the update set. Everything is installed in **Global** scope. |
+| PagerDuty integration app | The PagerDuty app (`x_pd_integration`) installed and **configured** (valid API token): this port calls `x_pd_integration.PagerDuty_REST`. |
+| Fallback user | The app's property `x_pd_integration.default_user` set to a PagerDuty user id. Members who can't be matched fall back to it; if it is blank, PagerDuty rejects those events and the log warns. |
+| PagerDuty users | Each on-call person needs a PagerDuty user with the **same email** (case-insensitive) as their ServiceNow user. Unmatched people are replaced by the fallback user; unmatched people on a coverage override are skipped with a warning. |
+| PagerDuty account | One that supports v3 shift-based schedules. |
+
+## Installation
+
+Install from a **built update set** (published in this repo under [`update_set/`](update_set/) and on the GitHub Releases page):
+`PagerDuty Sync v<version>.xml`. You don't need Node or the repo to install.
+
+1. **Check the prerequisites** above, in particular that the PagerDuty app works (for example, its own provisioning
+   screens reach PagerDuty).
+2. **Download** the XML for the version you want.
+3. **Import it:** System Update Sets > Retrieved Update Sets > *Import Update Set from XML* > choose the file > Upload.
+4. **Preview it:** open the retrieved update set > *Preview Update Set*. It should preview with no errors. If the preview
+   lists problems, see [the import preview](#the-import-preview-lists-problems).
+5. **Commit it:** *Commit Update Set*.
+6. **Check what landed** (all Global scope):
+
+   | What | Where | Expect |
+   |---|---|---|
+   | Table `u_pagerduty_sync_group` ("PagerDuty Sync Group"), 11 columns | System Definition > Tables | role `u_pagerduty_sync_group_user` can read/write |
+   | Script Include `PagerDutySync` | System Definition > Script Includes | Accessible from: **All application scopes**; not client callable |
+   | Event `pagerduty_sync.requested` + Script Action "PagerDuty Sync - Script Action" | System Policy > Events | active |
+   | UI Actions: Sync All (list banner on `sys_user_group`), Sync This (form button on `cmn_rota` and `sys_user_group`), Export On-Call Config (`sys_user_group`) | System Definition > UI Actions | active |
+   | 6 Business Rules: five "PagerDuty Sync Pending - *" and "PagerDuty Sync Group - Unique Group" | System Definition > Business Rules | active |
+   | Scheduled Jobs: "PagerDuty Sync - Process Pending" and "PagerDuty Sync - Nightly Catch-All" | System Definition > Scheduled Jobs | Process Pending **Inactive**, Nightly Active |
+   | Application menu "PagerDuty Sync" > "PagerDuty Sync Groups" | left navigator | opens the enrollment list |
+
+   If the Scheduled Jobs are missing, run `fix_script_create_sync_queue_rules_and_jobs.js` (see [Fix scripts](#fix-scripts)).
+7. **Enroll one pilot group** (see [Enrolling groups](#enrolling-groups)).
+8. **Dry run.** In System Definition > Scripts - Background (Global scope):
+   ```javascript
+   var sync = new PagerDutySync();
+   var result = sync.syncGroup('<exact group name>', true); // true = dry run, never touches PagerDuty
+   gs.info(JSON.stringify(result, null, 2));
+   ```
+   Check the log lines and the JSON: which schedules and escalation policies it would create or update, and the shape it
+   classified the group as. When a dry run looks right for every enrolled group, `sync.syncAll(true)` does them all.
+9. **Live sync.** Open the group or one of its rotas and click **Sync This Group's PagerDuty On-Call**. A minute or two later the
+   group's enrollment row shows *Last sync result* / *message*, and the schedules and policy (named
+   `[ServiceNow Sync v3] ...`) are in PagerDuty. Compare who is on call in both systems.
+10. **Turn on automatic syncing.** Activate the scheduled job **PagerDuty Sync - Process Pending**. From now on, edits reach
+    PagerDuty a couple of minutes after they stop. (Until it is active, edits are only recorded as pending.)
+
+Optionally wire a notification to `u_consecutive_failures >= 3` on `u_pagerduty_sync_group`; nothing else alerts on failure.
+
+## Day-to-day use
+
+### Enrolling groups
+
+Open **PagerDuty Sync > PagerDuty Sync Groups > New** and pick a group (one row per group; a second row for the same group is rejected).
+Enrollment means PagerDutySync **owns** that group's PagerDuty schedules and escalation policies and overwrites them on every
+sync; a group that isn't enrolled is never touched. To stop managing a group, delete its row: nothing else is removed, and
+its objects stay in PagerDuty (find them by the `[ServiceNow Sync v3]` prefix and delete them there if you want them gone).
+
+### What triggers a sync
+
+| Trigger | Effect |
+|---|---|
+| Edit to a rota, roster, member, schedule span or "Provide coverage" span of an enrolled group | Group marked pending; synced once edits have been quiet for 2 minutes (or 10 minutes after the first edit) |
+| Nightly Catch-All job (02:00 by default) | Marks every enrolled group pending, to pick up changes no edit announces (a member's from/to date arriving, a `repeat_until` expiring) |
+| **Sync This** / **Sync All** buttons | Live sync now, bypassing the quiet period and any failure backoff; shares the same lock and history |
+| `new PagerDutySync().syncGroup(name, true)` in Scripts - Background | Dry run: shows what would happen, changes nothing |
+
+### Reading the result
+
+Each enrollment row records the outcome of its last sync:
+
+| Column | Meaning |
+|---|---|
+| Last sync result | `success`; `failed` (see message; retried automatically); `skipped` (not enrolled, or no rota with current coverage) |
+| Last sync message | One-line summary of what was written, or the error text |
+| Pending since / Last change | Un-synced changes are waiting (and since when) |
+| Running since | A sync is in progress (a lock older than 15 minutes is treated as stale) |
+| Retry after / Consecutive failures | Backoff after failures: 5, then 15, then 60 minutes |
+
+Detail is in **System Logs** (filter *Message* starting with `PagerDutySync`). Every run begins with a line giving the
+version of `PagerDutySync` that actually ran and the server time, which tells you unambiguously which copy executed.
+
+### Rules of the road
+
+- **Don't edit synced objects in PagerDuty.** Schedules, rotations, events and overrides on a managed schedule are rebuilt on
+  every sync, and an override added by hand is removed.
+- Each sync **ends** the live events on a schedule and creates replacements (see [Architecture notes](#architecture-notes)), so a
+  PagerDuty schedule's history shows one ended event per sync.
+- Time off isn't synced; one-off "Provide coverage" shifts are.
+
+## Troubleshooting
+
+Start with the enrollment row (*Last sync result* / *message*) and then System Logs, filtered on `PagerDutySync`.
+
+| Symptom | Likely cause | What to do |
 |---|---|---|
-| `PagerDutySync.js` | Script Include | System Definition > Script Includes. Name it `PagerDutySync`, uncheck "Client callable" (server-only), set Accessible from per your scope policy. |
-| `pagerduty_sync_script_action.js` | Script Action | System Policy > Events > Script Actions. Also requires an Event Registry entry (see comment at the top of the file) named `pagerduty_sync.requested`. Handles manual syncs. |
-| `ui_action_sync_all.js` | UI Action | System Definition > UI Actions. See the comment header in the file for exact field settings. |
-| `ui_action_sync_this.js` | UI Action | Same, but create it on `cmn_rota` and (optionally) again on `sys_user_group`. |
-| `ui_action_export_oncall_config.js` | UI Action | System Definition > UI Actions, on `sys_user_group`. Independent of the rest of this port -- doesn't require enrollment and doesn't call `PagerDutySync`. A one-click way for a non-technical group owner to hand you their group's on-call config (`cmn_rota`, `cmn_rota_roster`, `cmn_rota_member`, `cmn_schedule_span`; raw, unparsed, raw and display values) as a single JSON file attached to their Group record. |
-| `business_rules_mark_pending.js` | Business Rules (x5) | System Definition > Business Rules, one per source table. Reference copy of the rule script and settings; `fix_script_create_sync_queue_rules_and_jobs.js` creates the same rules. |
-| `scheduled_job_process_pending_syncs.js` | Scheduled Jobs (x2) | System Definition > Scheduled Jobs. Reference copy of the two jobs; the same fix script creates them. |
-| `fix_script_create_sync_group_table.js` | Background script | Creates the enrollment/sync-state table. See "Fix scripts". |
-| `fix_script_create_sync_queue_rules_and_jobs.js` | Background script | Creates the Business Rules and Scheduled Jobs for the debounced queue. See "Fix scripts". |
+| Job or rule fails: `PagerDutySync undefined, maybe missing global qualifier` | The record was created in a scoped application (for example while the PagerDuty app's scope was selected) | Open the record, set **Application** to *Global* and call `new global.PagerDutySync()...`. The shipped records already do both |
+| Edits never reach PagerDuty | "Process Pending" is **Inactive**; or the group isn't enrolled; or it is backing off | Activate the job; check the enrollment row (*Pending since*, *Retry after*) |
+| Group stays pending for a few minutes | Normal: waiting for the quiet period (2 min) or the max wait (10 min) | Click **Sync This** to go now |
+| Log: `<group> is not enrolled in u_pagerduty_sync_group; nothing to do` | Name typed wrong in a script, or no enrollment row | Use the exact group name; add the row |
+| Log: `u_pagerduty_sync_group is missing column(s) ...` | The table is incomplete | Run `fix_script_create_sync_group_table.js` with `DRY_RUN = false`; it adds only what's missing |
+| *Last sync result* = `failed` | See *Last sync message* and the log (look for `v3 ... failed -- status ...`) | Fix the cause (token, permissions, a rejected payload); it retries after 5/15/60 min, or click **Sync This** |
+| `failed` with PagerDuty 401/403 | The PagerDuty app's token is invalid or lacks rights | Fix it in the PagerDuty app's configuration; the sync uses the app's connection |
+| `failed` with 429 | Rate limit (a full sync makes about 10 sequential calls per group). The REST wrapper already retries 3 times | Usually clears on its own on the next retry |
+| *Running since* is set for a long time | A run died holding the lock | A lock older than 15 minutes is ignored automatically. To clear it now, empty *Running since* and *Claim token* |
+| *Last sync result* = `skipped`, message "no rota with current coverage..." | Every rota of the group has expired (`repeat_until` in the past) or was never loaded | Fix the rota's coverage; PagerDuty objects are left untouched meanwhile |
+| Log: `x_pd_integration.default_user is not set` | Fallback user missing | Set the property to a PagerDuty user id |
+| Someone shows as the fallback user in PagerDuty | No PagerDuty user with that email | Create or fix the PagerDuty user's email (case-insensitive match) |
+| A coverage span isn't applied; log warns about it | Covering user has no PagerDuty match; or it is a repeating, group-wide, or time-off span | See [Coverage overrides](#coverage-overrides-provide-coverage) |
+| Group classified `needs_review` | Regions have different numbers of escalation levels, or a rota has no usable coverage window | Still synced best-effort, flagged "NEEDS REVIEW" in the policy description. Align the levels or give each rota a coverage span |
+| On-call order in PagerDuty differs from ServiceNow | Rotation alignment fell back to date math | Look for `ground-truth check` in the log; see [Rotation phase alignment](#rotation-phase-alignment) |
+| Sync buttons do nothing | Event or Script Action missing/inactive, or event queue latency (seconds) | Check Event Registry `pagerduty_sync.requested` and the Script Action; check System Logs > Events |
+| Saving an enrollment row fails: "already enrolled" | The unique-group rule doing its job | Edit the existing row |
+| A manual sync logs `UNTRACKED (no lock, no history)` | The sync-state columns are missing | Same as the "missing column(s)" row |
 
-None of these files are meant to be uploaded/imported directly (there's no Update Set
-here). The two `fix_script_*` files are pasted into **Scripts - Background** and create
-records for you; for the rest, copy each script body into the corresponding record type,
-using the settings in the file's header comment.
+### The import preview lists problems
 
-## Fix scripts
+*Found a local update that is newer than this one* appears when the same records were installed before and then backed out
+or deleted by hand: the instance keeps local `DELETE` updates for them. In the preview's problem list, select all and choose
+**Accept remote update**; the errors clear and Commit becomes available. A preview on an instance that never had the records
+is clean. Any other collision means someone customized one of the records: *Compare with local* before accepting.
 
-Two Scripts - Background (Global scope) scripts create the tables and rules this port
-needs, so none of that is built by hand. Both follow the same conventions:
+## Maintenance
 
-- **`DRY_RUN = true` by default.** A dry run only prints what it *would* do; set it to
-  `false` at the top of the script and run again to apply.
-- **Safe to re-run.** Every step checks first; something that already exists is reported
-  and left exactly as it is. Neither script edits or deletes anything.
-- Both finish with a verification step (when applied) that confirms the records exist.
+### Upgrading
 
-### `fix_script_create_sync_group_table.js`
+1. Download the new `PagerDuty Sync v<version>.xml` from `update_set/` or the GitHub release.
+2. Import, **Preview**, review any collisions (a collision on a record means it was changed locally; use *Compare with local*),
+   and **Commit**. Records are matched by their stable ids, so an upgrade updates them in place.
+3. Run a dry run for each enrolled group, then a live **Sync This** on a pilot group.
+4. Check that the first log line of the next run shows the new `PagerDutySync` version.
 
-Creates the `u_pagerduty_sync_group` table ("PagerDuty Sync Group"; not extendable, admin-only
-by default -- add ACLs/roles to taste) and every column in the tables below. If the table
-already exists (e.g. you made it by hand with just `u_group`) it adds only the missing columns.
-It also creates a `before` insert/update Business Rule, "PagerDuty Sync Group - Unique Group",
-that rejects a second row for the same group. After applying, it checks that `GlideRecord` can see every column; if it can't, the table cache
-may need a moment -- re-run to re-check.
+The Process Pending job's *Active* flag is part of the update set record: re-committing an update set may set it back to
+what the package says (**Inactive**). After an upgrade, check that it is Active again if it was before.
 
-Not covered: a form/list layout. Configure one (at minimum `u_group` and the `u_last_*`
-columns) and hide `u_claim_token`. Then add one row per group to manage.
+### Routine care
 
-### `fix_script_create_sync_queue_rules_and_jobs.js`
+| Task | How |
+|---|---|
+| Pause all syncing | Deactivate the "Process Pending" job. Business Rules can stay active; they only record pending changes |
+| Force a full resync | Click **Sync All**, or `new PagerDutySync().markAllPending()` (picked up by the next minute's run) |
+| Watch health | List *PagerDuty Sync Groups* with *Last sync result*, *Last successful sync*, *Consecutive failures*; add a notification on failures >= 3 |
+| Clear a stuck lock | Empty *Running since* and *Claim token* on the row |
+| Rotate the PagerDuty token | Change it in the PagerDuty app's configuration; this port has no credentials of its own |
+| Remove a group | Delete its enrollment row, then delete its `[ServiceNow Sync v3]` objects in PagerDuty |
+| Tune timings | `QUIET_PERIOD_SECONDS` (120), `MAX_WAIT_SECONDS` (600), `MAX_RUN_SECONDS` (240), `STALE_LOCK_SECONDS` (900), `RETRY_BACKOFF_MINUTES` ([5, 15, 60]) in `PagerDutySync.initialize()` |
+| Uninstall | Deactivate the two jobs and the six Business Rules; delete enrollment rows; delete the `[ServiceNow Sync v3]` schedules and policies in PagerDuty (the sync never deletes them) |
 
-Creates the debounced-sync-queue plumbing (see "Debounced sync queue"). Records are matched
-by name.
+### Things that grow
 
-Business Rules (`sys_script`) -- all `before` insert/update/delete, order 100, Active, advanced.
-They only call `markPendingForRecord(current, previous)`, never PagerDuty, so they are safe to
-leave active:
+Each sync adds one ended event per rotation to a PagerDuty schedule (57 consecutive syncs worked in testing; no cap was found).
+`u_pagerduty_sync_group` rows are the only data this port stores in ServiceNow.
 
-| Name | Table | Condition |
-|---|---|---|
-| PagerDuty Sync Pending - Rota | `cmn_rota` | |
-| PagerDuty Sync Pending - Roster | `cmn_rota_roster` | |
-| PagerDuty Sync Pending - Member | `cmn_rota_member` | |
-| PagerDuty Sync Pending - Schedule Span | `cmn_schedule_span` | |
-| PagerDuty Sync Pending - Coverage | `roster_schedule_span` | `type=on_call` |
+## Developing and releasing
 
-Scheduled Jobs (`sysauto_script`):
+### Repository layout
 
-| Name | Runs | Script | Created |
-|---|---|---|---|
-| PagerDuty Sync - Process Pending | every minute | `new global.PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
-| PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new global.PagerDutySync().markAllPending();` | Active (only marks groups pending) |
+| Path | What it is |
+|---|---|
+| `PagerDutySync.js` | The Script Include. Where nearly all the logic lives (about 3,500 lines) |
+| `pagerduty_sync_script_action.js`, `ui_action_*.js`, `business_rules_mark_pending.js`, `scheduled_job_process_pending_syncs.js` | The other scripts, each with a header comment documenting its record settings |
+| `fix_script_create_sync_group_table.js`, `fix_script_create_sync_queue_rules_and_jobs.js` | Scripts - Background scripts that create the table, rules and jobs by hand (see [Fix scripts](#fix-scripts)) |
+| `src/` | One Update Set record per YAML file (table, columns, ACLs, rules, UI Actions, jobs) plus **generated** copies of the scripts |
+| `packager/` | The Update Set builder and its tests (see `packager/PACKAGER.md`) |
+| `update_set/` | Built update sets. The ones you publish are committed here |
+| `README.md` | This file |
 
-The scripts call `global.PagerDutySync` and the records are created explicitly in Global scope, so they work whatever application scope your session is in (a job created while the PagerDuty app's scope was selected fails with "PagerDutySync undefined, maybe missing global qualifier").
+The top-level `.js` files are the **source of truth for every script**. `src/**/*.js` are generated from them; don't edit those.
 
-Requires `PagerDutySync` (v23+) and the sync-state columns to exist before the rules are
-useful, though creating the records doesn't depend on them.
+### How a release is built and shipped
 
-## Which groups get managed
+```mermaid
+flowchart TB
+  A["Edit top-level .js<br/>or src/**/*.yaml"] --> B["npm test<br/>(src in sync, packager checks)"]
+  B --> C["npm run package<br/>sync-to-src + build"]
+  C --> D["update_set/<br/>PagerDuty Sync v24.1.xml"]
+  D --> E["Import on a clean instance<br/>Preview, Commit, dry run, live sync"]
+  E --> F["git commit + tag<br/>push to GitHub"]
+  F --> G["GitHub release<br/>attach the XML"]
+  G --> H["Customer: download,<br/>Retrieved Update Sets,<br/>Preview, Commit"]
+```
+
+### Day-to-day development
+
+1. `npm install` (once).
+2. Change a script in its top-level file, or a record setting in `src/**/*.yaml`.
+3. `npm test` runs the packager tests and checks that `src/` matches the top-level scripts.
+4. `npm run package` rebuilds the update set into `update_set/`.
+5. Import it on a dev instance (or paste the changed script into the dev record), then test with a **dry run** and a live
+   sync of a test group. Background scripts and the enrollment table make this quick: enroll a test group, run
+   `new PagerDutySync().syncGroup('<group>', true)`, read the log.
+6. Code style: `PagerDutySync.js` is plain ES5 in `Class.create()` prototype style, global scope, no external dependencies other
+   than `x_pd_integration.PagerDuty_REST` and ServiceNow's own APIs. Match it. Every behaviour that was confirmed against a real
+   instance has its evidence in a comment next to the code; keep that habit.
+
+Adding a record that is easier to set up in the UI (a new ACL, form layout, and so on): build it on the dev instance in an update
+set, export that, and pull it into `src/` with `node packager/xml-to-src.js <export.xml> --out=src` (existing files are kept
+unless `--force`). If it has a script, add its source mapping in `packager/sync-to-src.js`.
+
+### Releasing
+
+1. Bump `VERSION` in `PagerDutySync.initialize()` (it appears in every run's first log line) and `version` in `src/defaults.yaml`
+   (it names the update set: `PagerDuty Sync v<version>`).
+2. `npm test && npm run package`.
+3. **Test the built XML on a clean instance** with the PagerDuty app installed: import, preview (no problems), commit, check the
+   table in the installation checklist, dry run, live sync of a pilot group. Don't ship an update set that hasn't been imported.
+4. Commit the new XML in `update_set/` along with the source changes; tag the commit (`v<version>`); push.
+5. Create a GitHub release for the tag and **attach the XML**. Release notes: what changed, whether any record or column changed
+   (customers who customized it will see a collision at preview), and anything to do after committing (for example, re-activating
+   the job).
+
+### Notes for contributors
+
+- The enrollment table and its Business Rule are created by the update set. The fix scripts exist as a repair path and for creating
+  records piece by piece, so keep them consistent with `src/` (`packager/sync-to-src.js --check` verifies the rule and job scripts they embed).
+- The `rotation_schedule`/`rotation_payload` fields are **not** read for ground truth; `OCRotationV2.getSpans()` is. See
+  [Ground-truth on-call lookup](#ground-truth-on-call-lookup).
+
+## Reference
+
+Design notes and the evidence behind them.
+
+### Enrollment
 
 Enrollment is indicated by the presence of a `sys_user_group` in a small table:
 
@@ -87,7 +351,7 @@ Enrollment is indicated by the presence of a `sys_user_group` in a small table:
 
 | Column | Label | Type | Notes |
 |---|---|---|---|
-| `u_group` | Group | Reference to `sys_user_group` | **Mandatory**, display column. Kept unique by the Business Rule "PagerDuty Sync Group - Unique Group" (see "Fix scripts"), not a unique index -- ServiceNow won't set the Unique flag over a reference column's automatic index. |
+| `u_group` | Group | Reference to `sys_user_group` | **Mandatory**, display column. Kept unique by the Business Rule "PagerDuty Sync Group - Unique Group" (see [Fix scripts](#fix-scripts)), not a unique index -- ServiceNow won't set the Unique flag over a reference column's automatic index. |
 
 One row per group whose PagerDuty on-call config should be sourced from ServiceNow.
 Presence in this table means `PagerDutySync` owns that group's schedules/escalation
@@ -102,7 +366,7 @@ port doesn't touch or need to know about.
 means -- the Business Rules and contextual UI Action condition scripts call it
 directly, so there's a single source of truth.
 
-## Debounced sync queue
+### Debounced sync queue
 
 `u_pagerduty_sync_group` also carries the per-group sync state, so there is no
 separate queue table. `fix_script_create_sync_group_table.js` creates these columns
@@ -127,7 +391,7 @@ any column is missing, rather than silently ignoring writes to it.
 
 How it works:
 
-1. The five Business Rules (see "Fix scripts") call
+1. The five Business Rules (see [Fix scripts](#fix-scripts)) call
    `markPendingForRecord(current, previous)`, which sets `u_last_change` (and
    `u_pending_since`, if empty) on the enrolled group's row. Records of groups that
    aren't enrolled are ignored.
@@ -155,7 +419,7 @@ queue does not delete a PagerDuty schedule when a roster or rota is deleted, and
 there are no notifications on failure beyond `u_consecutive_failures` and the system
 log -- wire a notification to `u_consecutive_failures >= 3` if you want one.
 
-## Naming convention
+### Naming convention
 
 Every schedule and escalation policy this port creates or updates gets a
 `[ServiceNow Sync v3] ` name prefix and a `description` noting it's managed by this
@@ -179,7 +443,7 @@ covered by this:** follow_the_sun names them by role (`<group> - Primary`), best
 by level (`<group> - level 100`), so a classification flip still forks a second set of
 schedules -- it just no longer forks the policy or (for expired rotas) happens at all.
 
-## Rotation phase alignment
+### Rotation phase alignment
 
 `cmn_rota_roster.rotation_start_date`/`rotation_start_time` is sent to PagerDuty as
 an event's `effective_since`, on the assumption that field controls which member
@@ -234,7 +498,7 @@ out exactly one shift-block off because of it -- 14 rosters in that export had t
 same shape, and correcting it took the confirmed-fix count from 7 to 15. Only an
 all-zero *date* means unset.
 
-### Ground-truth on-call lookup
+#### Ground-truth on-call lookup
 
 The array-rotation approach above (the date-math branches in `_rotationAlignment`)
 estimates who's first by recomputing occurrence-count from `rotation_start_date`
@@ -296,7 +560,7 @@ applied to `_buildAlternatingEvent` or `_buildEveryMemberEvent` -- both build me
 order from something other than a single roster's own rotation math, so there is no
 single roster's ground truth that would be the right one to check.
 
-### Handoff weekday (`dow_for_rotate`)
+#### Handoff weekday (`dow_for_rotate`)
 
 Rotating the array changes who is first, not which weekday a handoff lands on --
 that comes from `start_time`'s weekday. The roster form's **"Day of week for
@@ -325,7 +589,7 @@ configured `dow_for_rotate` differed from the window's anchor weekday (Global
 Middleware Support) had its `start_time` weekday moved from Monday to Thursday to
 match, with member/turn agreement unchanged.
 
-## Coverage overrides ("Provide coverage")
+### Coverage overrides ("Provide coverage")
 
 ServiceNow stores a one-off "Provide coverage" shift as a `roster_schedule_span`
 (`type=on_call`, `roster` + `user` set, living on the covering user's own schedule),
@@ -365,7 +629,7 @@ sync (it survives the event delete/recreate), and removed when the span was dele
   roster folded into a simultaneous (every_member) event, where an override would
   have to say which member it replaces.
 
-## Architecture notes
+### Architecture notes
 
 - **One schedule per escalation tier, one rotation per logical event within it.** A
   v3 rotation can only hold a single event (one timeline) -- PagerDuty rejects a
@@ -393,79 +657,7 @@ sync (it survives the event delete/recreate), and removed when the span was dele
   An event is ended by `PUT` with the event body as `GET` returns it; if that fails
   the event is deleted instead.
 
-## Packaging as an update set
-
-Everything is Global scope. The update set is **built from this repo** by the packager (`packager/`, see
-`packager/PACKAGER.md`): `npm install` once, then `npm run package` writes `update_set/PagerDuty Sync v<version>.xml`.
-Import it via System Update Sets > Retrieved Update Sets > Import Update Set from XML, then Preview and Commit.
-
-It carries the `u_pagerduty_sync_group` table (dictionary, labels, choice list, ACLs, role, menu/module and layouts), the Script
-Include, the Script Action and Event Registry entry, six Business Rules (five mark-pending rules plus the unique-group rule), the four
-UI Actions (Sync All, Sync This on `cmn_rota` and on `sys_user_group`, Export On-Call Config), and the two Scheduled Jobs
-("Process Pending" **Inactive**, "Nightly Catch-All" Active).
-
-- **Scripts** are taken from the top-level `.js` files (`npm run sync-src` copies them into `src/`; `npm test` fails if `src/` is stale).
-- **Other settings** live in `src/**/*.yaml`; bump `version` in `src/defaults.yaml` for each release.
-- The scheduled-job records are new in the packaged set and **not yet proven by an import**: the earlier export taken from a dev instance
-  contained no jobs. If they don't arrive, `fix_script_create_sync_queue_rules_and_jobs.js` (`DRY_RUN = false`) creates them by name.
-- After importing, add the enrollment rows (one per group in `u_pagerduty_sync_group`) -- update sets carry the table, not its data.
-- `update_set/pagerduty_sync_v24.xml` is the earlier instance-exported set that was already imported successfully on a clean instance;
-  keep it until `PagerDuty Sync v24.1.xml` has been imported the same way.
-- Activate "Process Pending" only after validating a manual live sync (and `sync.syncAll(true)` dry runs) on the target instance.
-
-## One-time setup
-
-1. **Script Include**: create `PagerDutySync` from `PagerDutySync.js`.
-2. **Table**: run `fix_script_create_sync_group_table.js` in Scripts - Background
-   (Global scope; it defaults to a dry run -- set `DRY_RUN = false` to apply). It
-   creates `u_pagerduty_sync_group` with `u_group` and every sync-state column below, or
-   adds only the missing columns to a table you already made by hand. It does not create
-   a form/list layout -- configure one, and hide `u_claim_token`. Then add one row per
-   group you want this port to manage.
-3. **Event Registry entry**: `pagerduty_sync.requested` (System Policy > Events >
-   Registry). See the comment in `pagerduty_sync_script_action.js` for the exact
-   fields.
-4. **Script Action**: create from `pagerduty_sync_script_action.js`, wired to the
-   event above.
-5. **UI Actions**: create both, using the field settings documented in each file's
-   header.
-6. **Sync-state columns**: already created by step 2's script (the columns are listed
-   under "Debounced sync queue").
-7. **Business Rules** and 8. **Scheduled Jobs**: run
-   `fix_script_create_sync_queue_rules_and_jobs.js` (dry run by default; set
-   `DRY_RUN = false` to apply). The rules only mark groups pending, so they can be Active
-   straight away. Leave the every-minute job **Inactive** until you've validated the UI
-   Action path with a dry run and a manual live sync; activating it is what lets edits
-   reach PagerDuty.
-
-## Recommended verification steps
-
-1. Confirm `u_pagerduty_sync_group` has a row for the group you're about to test --
-   `syncGroup()`/`syncAll()` silently skip anything not enrolled.
-2. From a Background Script (System Definition > Scripts - Background), run a dry
-   run directly, bypassing the event queue for fast iteration:
-   ```javascript
-   var sync = new PagerDutySync();
-   var result = sync.syncGroup('Global OracleDBA ADMIN', true); // true = dry run
-   gs.info(JSON.stringify(result, null, 2));
-   ```
-3. Examine the shape of that output -- which schedules/EPs it says it would
-   create vs. update, and the rotations/events/escalation rules inside them.
-4. Once a dry run looks right for every group you've enrolled (`sync.syncAll(true)`),
-   test the UI Actions end-to-end.
-
-**Every run logs its own version and exact server start time** (`PagerDutySync
-syncGroup(...) starting -- version vN-..., server time ...`) as the very first
-line, before anything else executes -- so a run's own log always says
-unambiguously which copy of this file actually ran and when, independent of a
-Script Include's `sys_updated_on` (which reflects when it was last *saved*, not
-which version a given run actually executed -- the two can diverge if there's a
-stale duplicate Script Include, or a run was kicked off before an edit was
-actually saved). `VERSION` (in `initialize()`) is bumped by hand on every real
-change to this file -- there's no other version control visible from inside a
-customer's instance to check against.
-
-## Coverage window repeat types
+### Coverage window repeat types
 
 `cmn_schedule_span.repeat_type` is a choice field with 10 real values; only some are
 readable by `_computeCoverageWindow`'s `days_of_week`/weekly-BYDAY translation, since
@@ -534,7 +726,7 @@ by `_upsertScheduleV3`'s "no longer produced by this sync" cleanup. If every rot
 in a group has expired, the group is left untouched that run (logged as a warning)
 rather than pushing an empty policy.
 
-## Custom escalation
+### Custom escalation
 
 `cmn_rota.use_custom_escalation` is read and honored (skip that rota's `catch_all`
 entirely when computing `_buildCatchAllRule`), but there is no additional data
@@ -552,7 +744,7 @@ best it can do, and now does, is not apply a stale/irrelevant `catch_all` value
 that ServiceNow's own form no longer surfaces as active configuration once that
 checkbox is on.
 
-## Known limitations
+### Known limitations
 
 - **`cmn_rota.catch_all`**: `group_manager` and `individual` are implemented.
   `all` ("Notify All") is detected and logged but not yet built into a rule -- it
@@ -600,3 +792,57 @@ checkbox is on.
   nothing is on call at the exact instant) -- not expected to be significant next to the
   PagerDuty API calls a sync already makes, but not separately measured against a large
   rota either.
+
+### Fix scripts
+
+The update set already contains everything these scripts create. They are a repair path (for example, if the scheduled jobs didn't arrive) and a way to install the pieces by hand. Run them in **Scripts - Background in Global scope** (check the application picker).
+
+Two Scripts - Background (Global scope) scripts create the tables and rules this port
+needs, so none of that is built by hand. Both follow the same conventions:
+
+- **`DRY_RUN = true` by default.** A dry run only prints what it *would* do; set it to
+  `false` at the top of the script and run again to apply.
+- **Safe to re-run.** Every step checks first; something that already exists is reported
+  and left exactly as it is. Neither script edits or deletes anything.
+- Both finish with a verification step (when applied) that confirms the records exist.
+
+#### `fix_script_create_sync_group_table.js`
+
+Creates the `u_pagerduty_sync_group` table ("PagerDuty Sync Group"; not extendable, admin-only
+by default -- add ACLs/roles to taste) and every column in the tables below. If the table
+already exists (e.g. you made it by hand with just `u_group`) it adds only the missing columns.
+It also creates a `before` insert/update Business Rule, "PagerDuty Sync Group - Unique Group",
+that rejects a second row for the same group. After applying, it checks that `GlideRecord` can see every column; if it can't, the table cache
+may need a moment -- re-run to re-check.
+
+Not covered: a form/list layout. Configure one (at minimum `u_group` and the `u_last_*`
+columns) and hide `u_claim_token`. Then add one row per group to manage.
+
+#### `fix_script_create_sync_queue_rules_and_jobs.js`
+
+Creates the debounced-sync-queue plumbing (see "Debounced sync queue"). Records are matched
+by name.
+
+Business Rules (`sys_script`) -- all `before` insert/update/delete, order 100, Active, advanced.
+They only call `markPendingForRecord(current, previous)`, never PagerDuty, so they are safe to
+leave active:
+
+| Name | Table | Condition |
+|---|---|---|
+| PagerDuty Sync Pending - Rota | `cmn_rota` | |
+| PagerDuty Sync Pending - Roster | `cmn_rota_roster` | |
+| PagerDuty Sync Pending - Member | `cmn_rota_member` | |
+| PagerDuty Sync Pending - Schedule Span | `cmn_schedule_span` | |
+| PagerDuty Sync Pending - Coverage | `roster_schedule_span` | `type=on_call` |
+
+Scheduled Jobs (`sysauto_script`):
+
+| Name | Runs | Script | Created |
+|---|---|---|---|
+| PagerDuty Sync - Process Pending | every minute | `new global.PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
+| PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new global.PagerDutySync().markAllPending();` | Active (only marks groups pending) |
+
+The scripts call `global.PagerDutySync` and the records are created explicitly in Global scope, so they work whatever application scope your session is in (a job created while the PagerDuty app's scope was selected fails with "PagerDutySync undefined, maybe missing global qualifier").
+
+Requires `PagerDutySync` (v23+) and the sync-state columns to exist before the rules are
+useful, though creating the records doesn't depend on them.

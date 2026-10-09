@@ -22,7 +22,7 @@ payload:
         $:
           display_value: u_pagerduty_sync
       filter: ""
-      name: pagerduty_sync_groups
+      name: PagerDuty Sync Groups
       order: ""
       path: ""
       path_relative_to_root: "false"

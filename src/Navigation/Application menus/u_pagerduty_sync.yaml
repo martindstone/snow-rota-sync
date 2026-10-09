@@ -18,7 +18,7 @@ payload:
         action: INSERT_OR_UPDATE
       active: "true"
       hint: ""
-      name: u_pagerduty_sync
+      name: PagerDuty Sync
       order: ""
       roles: u_pagerduty_sync_group_user
       sys_class_name: sys_ui_application
