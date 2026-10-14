@@ -23,7 +23,7 @@ flowchart TB
     SRC["On-call tables<br/>cmn_rota / roster / member<br/>cmn_schedule_span<br/>roster_schedule_span"]
     BR["5 Business Rules<br/>'PagerDuty Sync Pending - *'<br/>mark the group pending"]
     ENR[("u_pagerduty_sync_group<br/>enrollment + sync state")]
-    JOB["Scheduled Job<br/>Process Pending (every minute)<br/>Nightly Catch-All"]
+    JOB["Scheduled Job<br/>Process Pending (every hour)<br/>Nightly Catch-All"]
     UIA["UI Actions<br/>Sync All / Sync This"]
     EVT["Event pagerduty_sync.requested<br/>+ Script Action"]
     SI["Script Include<br/>PagerDutySync"]
@@ -82,13 +82,13 @@ sequenceDiagram
   participant Src as On-call tables
   participant BR as Business Rules
   participant Row as u_pagerduty_sync_group row
-  participant Job as Process Pending (1 min)
+  participant Job as Process Pending (1 hour)
   participant Sync as PagerDutySync
   participant PD as PagerDuty
   Ed->>Src: edit a rota, roster, member, span or coverage
   Src->>BR: before insert / update / delete
   BR->>Row: set u_last_change (u_pending_since if empty)
-  loop every minute
+  loop every hour
     Job->>Row: is any group due?
     Note over Job,Row: due = quiet for 120 s, or 600 s since first change,<br/>not locked, not backing off
   end
@@ -126,6 +126,7 @@ stateDiagram-v2
 | Fallback user | The app's property `x_pd_integration.default_user` set to a PagerDuty user id. Members who can't be matched fall back to it; if it is blank, PagerDuty rejects those events and the log warns. |
 | PagerDuty users | Each on-call person needs a PagerDuty user with the **same email** (case-insensitive) as their ServiceNow user. Unmatched people are replaced by the fallback user; unmatched people on a coverage override are skipped with a warning. |
 | PagerDuty account | One that supports v3 shift-based schedules. |
+| Roles | The PagerDuty app's role `x_pd_integration.admin`. The **Sync This** and **Sync All** buttons are visible only to users with it (and to `admin`, which passes every role check). To use a different role, edit the Condition on those UI Actions. |
 
 ## Installation
 
@@ -136,8 +137,8 @@ Install from a **built update set** (published in this repo under [`update_set/`
    screens reach PagerDuty).
 2. **Download** the XML for the version you want.
 3. **Import it:** System Update Sets > Retrieved Update Sets > *Import Update Set from XML* > choose the file > Upload.
-4. **Preview it:** open the retrieved update set > *Preview Update Set*. It should preview with no errors. If the preview
-   lists problems, see [the import preview](#the-import-preview-lists-problems).
+4. **Preview it:** open the retrieved update set > *Preview Update Set*. It should preview with no errors; if it lists problems on a record,
+   use *Compare with local* to see what differs before you accept anything.
 5. **Commit it:** *Commit Update Set*.
 6. **Check what landed** (all Global scope):
 
@@ -146,9 +147,11 @@ Install from a **built update set** (published in this repo under [`update_set/`
    | Table `u_pagerduty_sync_group` ("PagerDuty Sync Group"), 11 columns | System Definition > Tables | role `u_pagerduty_sync_group_user` can read/write |
    | Script Include `PagerDutySync` | System Definition > Script Includes | Accessible from: **All application scopes**; not client callable |
    | Event `pagerduty_sync.requested` + Script Action "PagerDuty Sync - Script Action" | System Policy > Events | active |
-   | UI Actions: Sync All (list banner on `sys_user_group`), Sync This (form button on `cmn_rota` and `sys_user_group`), Export On-Call Config (`sys_user_group`) | System Definition > UI Actions | active |
+   | UI Actions: Sync All (list banner on `sys_user_group`) and Sync This (form button on `cmn_rota` and `sys_user_group`) | System Definition > UI Actions | active; Condition requires role `x_pd_integration.admin` (Sync This also requires the group to be enrolled) |
+   | UI Action: Export On-Call Config (`sys_user_group`) | System Definition > UI Actions | **Inactive** (a diagnostic; Condition also requires `x_pd_integration.admin` if you turn it on) |
+   | System Property `x_pd_integration.sync_escalation_delay_override` | System Properties > All Properties | integer, **blank** (see [Escalation delay override](#escalation-delay-override)) |
    | 6 Business Rules: five "PagerDuty Sync Pending - *" and "PagerDuty Sync Group - Unique Group" | System Definition > Business Rules | active |
-   | Scheduled Jobs: "PagerDuty Sync - Process Pending" and "PagerDuty Sync - Nightly Catch-All" | System Definition > Scheduled Jobs | Process Pending **Inactive**, Nightly Active |
+   | Scheduled Jobs: "PagerDuty Sync - Process Pending" and "PagerDuty Sync - Nightly Catch-All" | System Definition > Scheduled Jobs | Process Pending **Inactive** (every hour), Nightly Active (daily at 02:00) |
    | Application menu "PagerDuty Sync" > "PagerDuty Sync Groups" | left navigator | opens the enrollment list |
 
    If the Scheduled Jobs are missing, run `fix_script_create_sync_queue_rules_and_jobs.js` (see [Fix scripts](#fix-scripts)).
@@ -164,8 +167,11 @@ Install from a **built update set** (published in this repo under [`update_set/`
 9. **Live sync.** Open the group or one of its rotas and click **Sync This Group's PagerDuty On-Call**. A minute or two later the
    group's enrollment row shows *Last sync result* / *message*, and the schedules and policy (named
    `[ServiceNow Sync v3] ...`) are in PagerDuty. Compare who is on call in both systems.
-10. **Turn on automatic syncing.** Activate the scheduled job **PagerDuty Sync - Process Pending**. From now on, edits reach
-    PagerDuty a couple of minutes after they stop. (Until it is active, edits are only recorded as pending.)
+10. **Optional: set the escalation delay override** (see [Escalation delay override](#escalation-delay-override)). It takes effect on
+    the next sync of each group.
+11. **Turn on automatic syncing.** Activate the scheduled job **PagerDuty Sync - Process Pending**. It runs every hour, so edits reach
+    PagerDuty at the first run after they have stopped (or immediately with **Sync This**/**Sync All**). (Until it is active, edits
+    are only recorded as pending.)
 
 Optionally wire a notification to `u_consecutive_failures >= 3` on `u_pagerduty_sync_group`; nothing else alerts on failure.
 
@@ -182,10 +188,29 @@ its objects stay in PagerDuty (find them by the `[ServiceNow Sync v3]` prefix an
 
 | Trigger | Effect |
 |---|---|
-| Edit to a rota, roster, member, schedule span or "Provide coverage" span of an enrolled group | Group marked pending; synced once edits have been quiet for 2 minutes (or 10 minutes after the first edit) |
+| Edit to a rota, roster, member, schedule span or "Provide coverage" span of an enrolled group | Group marked pending; synced by the next hourly run once edits have been quiet for 2 minutes (or 10 minutes after the first edit) |
 | Nightly Catch-All job (02:00 by default) | Marks every enrolled group pending, to pick up changes no edit announces (a member's from/to date arriving, a `repeat_until` expiring) |
-| **Sync This** / **Sync All** buttons | Live sync now, bypassing the quiet period and any failure backoff; shares the same lock and history |
+| **Sync This** / **Sync All** buttons (role `x_pd_integration.admin`) | Live sync now, bypassing the hourly job, the quiet period and any failure backoff; shares the same lock and history. If that group is already syncing, the request is queued to run again afterwards |
 | `new PagerDutySync().syncGroup(name, true)` in Scripts - Background | Dry run: shows what would happen, changes nothing |
+
+### Escalation delay override
+
+By default the delay between escalation levels comes from each ServiceNow roster's *Time before escalation*, and from the rota's
+*Catch-all wait time* for the catch-all step (30 minutes when that is blank). The system property
+**`x_pd_integration.sync_escalation_delay_override`** replaces all of them at once:
+
+| Property value | Effect |
+|---|---|
+| blank (shipped default) | Each escalation rule uses the delay configured in ServiceNow |
+| a whole number of minutes, 1 or more (for example `5`) | Every escalation rule the sync builds, **including catch-all rules**, uses that many minutes, in every enrolled group |
+| anything else (`0`, negative, decimal, text) | Ignored: one warning is logged (`x_pd_integration.sync_escalation_delay_override is "..."`) and the rota delays are used |
+
+- It applies when a group is next synced. Groups already in PagerDuty keep their old delays until then; click **Sync All** to
+  update every group now. Clearing the property and syncing again restores the rota delays.
+- It is read once per sync run, so changing it mid-run has no effect on that run.
+- Read and write access is `admin` and `x_pd_integration.admin`.
+- Re-committing a v24.x update set resets the property to blank (the package carries it with an empty value). Re-apply your value after
+  an upgrade.
 
 ### Reading the result
 
@@ -218,7 +243,7 @@ Start with the enrollment row (*Last sync result* / *message*) and then System L
 |---|---|---|
 | Job or rule fails: `PagerDutySync undefined, maybe missing global qualifier` | The record was created in a scoped application (for example while the PagerDuty app's scope was selected) | Open the record, set **Application** to *Global* and call `new global.PagerDutySync()...`. The shipped records already do both |
 | Edits never reach PagerDuty | "Process Pending" is **Inactive**; or the group isn't enrolled; or it is backing off | Activate the job; check the enrollment row (*Pending since*, *Retry after*) |
-| Group stays pending for a few minutes | Normal: waiting for the quiet period (2 min) or the max wait (10 min) | Click **Sync This** to go now |
+| Group stays pending for up to an hour | Normal: the job runs hourly, and the group must also be past the quiet period (2 min) or the max wait (10 min) | Click **Sync This** to go now |
 | Log: `<group> is not enrolled in u_pagerduty_sync_group; nothing to do` | Name typed wrong in a script, or no enrollment row | Use the exact group name; add the row |
 | Log: `u_pagerduty_sync_group is missing column(s) ...` | The table is incomplete | Run `fix_script_create_sync_group_table.js` with `DRY_RUN = false`; it adds only what's missing |
 | *Last sync result* = `failed` | See *Last sync message* and the log (look for `v3 ... failed -- status ...`) | Fix the cause (token, permissions, a rejected payload); it retries after 5/15/60 min, or click **Sync This** |
@@ -231,16 +256,12 @@ Start with the enrollment row (*Last sync result* / *message*) and then System L
 | A coverage span isn't applied; log warns about it | Covering user has no PagerDuty match; or it is a repeating, group-wide, or time-off span | See [Coverage overrides](#coverage-overrides-provide-coverage) |
 | Group classified `needs_review` | Regions have different numbers of escalation levels, or a rota has no usable coverage window | Still synced best-effort, flagged "NEEDS REVIEW" in the policy description. Align the levels or give each rota a coverage span |
 | On-call order in PagerDuty differs from ServiceNow | Rotation alignment fell back to date math | Look for `ground-truth check` in the log; see [Rotation phase alignment](#rotation-phase-alignment) |
+| Sync buttons are missing | You don't have role `x_pd_integration.admin`; or (Sync This) the group isn't enrolled | Grant the role (or change the UI Actions' Condition); enroll the group |
 | Sync buttons do nothing | Event or Script Action missing/inactive, or event queue latency (seconds) | Check Event Registry `pagerduty_sync.requested` and the Script Action; check System Logs > Events |
+| Escalation delays in PagerDuty are all the same, and not what the rotas say | `x_pd_integration.sync_escalation_delay_override` is set | Clear the property and sync again, or leave it if that is intended |
+| Log: `x_pd_integration.sync_escalation_delay_override is "..."` | The property holds something other than a whole number of minutes >= 1 | Fix the value; until then the rota delays are used |
 | Saving an enrollment row fails: "already enrolled" | The unique-group rule doing its job | Edit the existing row |
 | A manual sync logs `UNTRACKED (no lock, no history)` | The sync-state columns are missing | Same as the "missing column(s)" row |
-
-### The import preview lists problems
-
-*Found a local update that is newer than this one* appears when the same records were installed before and then backed out
-or deleted by hand: the instance keeps local `DELETE` updates for them. In the preview's problem list, select all and choose
-**Accept remote update**; the errors clear and Commit becomes available. A preview on an instance that never had the records
-is clean. Any other collision means someone customized one of the records: *Compare with local* before accepting.
 
 ## Maintenance
 
@@ -252,21 +273,27 @@ is clean. Any other collision means someone customized one of the records: *Comp
 3. Run a dry run for each enrolled group, then a live **Sync This** on a pilot group.
 4. Check that the first log line of the next run shows the new `PagerDutySync` version.
 
-The Process Pending job's *Active* flag is part of the update set record: re-committing an update set may set it back to
-what the package says (**Inactive**). After an upgrade, check that it is Active again if it was before.
+Two settings are part of the update set and are reset when it is re-committed, so check them after an upgrade:
+
+- The Process Pending job's *Active* flag goes back to what the package says (**Inactive**), and its interval to every hour.
+  Check that it is Active again if it was before.
+- The `x_pd_integration.sync_escalation_delay_override` property goes back to blank. Set it again if you use it.
+- Also re-check the Condition on the Sync UI Actions if you changed it to a different role.
 
 ### Routine care
 
 | Task | How |
 |---|---|
 | Pause all syncing | Deactivate the "Process Pending" job. Business Rules can stay active; they only record pending changes |
-| Force a full resync | Click **Sync All**, or `new PagerDutySync().markAllPending()` (picked up by the next minute's run) |
+| Force a full resync | Click **Sync All**, or `new PagerDutySync().markAllPending()` (picked up by the next hourly run) |
 | Watch health | List *PagerDuty Sync Groups* with *Last sync result*, *Last successful sync*, *Consecutive failures*; add a notification on failures >= 3 |
 | Clear a stuck lock | Empty *Running since* and *Claim token* on the row |
 | Rotate the PagerDuty token | Change it in the PagerDuty app's configuration; this port has no credentials of its own |
 | Remove a group | Delete its enrollment row, then delete its `[ServiceNow Sync v3]` objects in PagerDuty |
-| Tune timings | `QUIET_PERIOD_SECONDS` (120), `MAX_WAIT_SECONDS` (600), `MAX_RUN_SECONDS` (240), `STALE_LOCK_SECONDS` (900), `RETRY_BACKOFF_MINUTES` ([5, 15, 60]) in `PagerDutySync.initialize()` |
-| Uninstall | Deactivate the two jobs and the six Business Rules; delete enrollment rows; delete the `[ServiceNow Sync v3]` schedules and policies in PagerDuty (the sync never deletes them) |
+| Change the escalation delay | Set or clear `x_pd_integration.sync_escalation_delay_override` (see [Escalation delay override](#escalation-delay-override)), then sync |
+| Change how often edits are synced | Edit the *Repeat interval* of the "Process Pending" job (every hour by default). Changing it needs no code change |
+| Tune timings | `QUIET_PERIOD_SECONDS` (120), `MAX_WAIT_SECONDS` (600), `MAX_RUN_SECONDS` (240), `STALE_LOCK_SECONDS` (900), `RETRY_BACKOFF_MINUTES` ([5, 15, 60]) in `PagerDutySync.initialize()`. With an hourly job these only decide whether a group is due when the job runs, so a pending group usually waits for the next hourly run, and a failed one waits for the first run after its backoff |
+| Uninstall | Deactivate the two jobs and the six Business Rules; delete enrollment rows; deactivate the Sync UI Actions; delete the `[ServiceNow Sync v3]` schedules and policies in PagerDuty (the sync never deletes them) |
 
 ### Things that grow
 
@@ -295,7 +322,7 @@ The top-level `.js` files are the **source of truth for every script**. `src/**/
 flowchart TB
   A["Edit top-level .js<br/>or src/**/*.yaml"] --> B["npm test<br/>(src in sync, packager checks)"]
   B --> C["npm run package<br/>sync-to-src + build"]
-  C --> D["update_set/<br/>PagerDuty Sync v24.1.xml"]
+  C --> D["update_set/<br/>PagerDuty Sync v24.2.xml"]
   D --> E["Import on a clean instance<br/>Preview, Commit, dry run, live sync"]
   E --> F["git commit + tag<br/>push to GitHub"]
   F --> G["GitHub release<br/>attach the XML"]
@@ -395,7 +422,7 @@ How it works:
    `markPendingForRecord(current, previous)`, which sets `u_last_change` (and
    `u_pending_since`, if empty) on the enrolled group's row. Records of groups that
    aren't enrolled are ignored.
-2. The every-minute job calls `processPending()`. A group is *due* once its last
+2. The hourly job calls `processPending()`. A group is *due* once its last
    change is `QUIET_PERIOD_SECONDS` (120) old, or `MAX_WAIT_SECONDS` (600) have
    passed since the first un-synced change (so continuous edits can't defer a sync
    forever), and it is not locked or backing off. Due groups are synced one at a time,
@@ -765,7 +792,9 @@ checkbox is on.
   (single-winner: `group_manager` over `individual`). `catch_all_wait_time`
   (30-minute default when blank) sets the rule's delay; across several
   catch-all rotas in one group the largest wins, since one PagerDuty rule has
-  one delay.
+  one delay. The `x_pd_integration.sync_escalation_delay_override` property, when
+  set, replaces this and every roster delay (see
+  [Escalation delay override](#escalation-delay-override)).
 - **`GlideScheduleDateTime` is undocumented** (absent from ServiceNow's official
   scoped `GlideDateTime` API reference) but is what `_localizedIso`/
   `_tzOffsetSecondsFromUtc` rely on for DST-aware local-to-UTC conversion, since
@@ -839,7 +868,7 @@ Scheduled Jobs (`sysauto_script`):
 
 | Name | Runs | Script | Created |
 |---|---|---|---|
-| PagerDuty Sync - Process Pending | every minute | `new global.PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
+| PagerDuty Sync - Process Pending | every hour | `new global.PagerDutySync().processPending();` | **Inactive** -- activating it is what lets edits reach PagerDuty |
 | PagerDuty Sync - Nightly Catch-All | daily at `NIGHTLY_RUN_TIME` (default `02:00:00`, in the job's time zone setting) | `new global.PagerDutySync().markAllPending();` | Active (only marks groups pending) |
 
 The scripts call `global.PagerDutySync` and the records are created explicitly in Global scope, so they work whatever application scope your session is in (a job created while the PagerDuty app's scope was selected fails with "PagerDutySync undefined, maybe missing global qualifier").

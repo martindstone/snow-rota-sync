@@ -155,7 +155,7 @@ PagerDutySync.prototype = {
         // Delay before retry after the 1st, 2nd, 3rd+ consecutive failure.
         this.RETRY_BACKOFF_MINUTES = [5, 15, 60];
         // processPending stops starting new groups after this long, leaving the rest
-        // for the next minute's run.
+        // for the next hourly run.
         this.MAX_RUN_SECONDS = 240;
         // Columns processPending/markPending need on SYNC_GROUP_TABLE.
         this.SYNC_STATE_FIELDS = ['u_pending_since', 'u_last_change', 'u_running_since', 'u_claim_token',
@@ -169,7 +169,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v24-2026-10-05-end-and-replace-events';
+        this.VERSION = 'v24.2-2026-10-13-delay-override-hourly-job';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -414,7 +414,7 @@ PagerDutySync.prototype = {
         return {ok: false, why: 'still changing'};
     },
 
-    // The scheduled job's entry point (every minute). Live only: a dry run has no
+    // The scheduled job's entry point (every hour). Live only: a dry run has no
     // business going through a queue. Returns a summary object.
     // `onlyGroups` (optional array of group names) restricts the run; the scheduled
     // job passes nothing. Exists so tests can drive the queue without touching real groups.
@@ -2166,6 +2166,26 @@ PagerDutySync.prototype = {
         return m ? (m[1] + ':' + m[2] + ':' + m[3]) : raw;
     },
 
+    // x_pd_integration.sync_escalation_delay_override (minutes). When it holds a whole number
+    // >= 1, every escalation delay the sync builds -- roster levels and catch-alls -- uses it
+    // instead of the delay configured on the ServiceNow rotas. Blank means "use the rotas".
+    // Anything else logs one warning and is ignored. Read once per PagerDutySync instance.
+    _delayOverrideMinutes: function() {
+        if (this._delayOverrideCache !== undefined) return this._delayOverrideCache;
+        var raw = String(gs.getProperty('x_pd_integration.sync_escalation_delay_override') || '').trim();
+        var result = null;
+        if (raw) {
+            if (/^\d+$/.test(raw) && parseInt(raw, 10) >= 1) {
+                result = parseInt(raw, 10);
+            } else {
+                gs.warn('PagerDutySync: x_pd_integration.sync_escalation_delay_override is "' + raw +
+                    '", not a whole number of minutes >= 1; ignoring it and using the rotas\' escalation delays');
+            }
+        }
+        this._delayOverrideCache = result;
+        return result;
+    },
+
     // time_before_escalation is a glide_duration field: getValue() returns a full
     // datetime string ("1970-01-01 00:15:00") whose HH:MM:SS is the actual duration,
     // not a plain seconds count. A bare parseInt() on that string reads only the
@@ -2174,6 +2194,8 @@ PagerDutySync.prototype = {
     // real cmn_rota_roster.time_before_escalation values; real values are 15/30 minutes
     // depending on role.
     _parseDelayMinutes: function(raw) {
+        var override = this._delayOverrideMinutes();
+        if (override !== null) return override;
         var m = /^\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})$/.exec(raw || '');
         if (!m) {
             gs.error('PagerDutySync: unrecognized time_before_escalation format "' + raw + '"; defaulting delay to 1 minute');
@@ -2340,6 +2362,8 @@ PagerDutySync.prototype = {
     // disagree -- same "don't escalate away from someone too early" reasoning
     // _buildRuleForLevel already applies to time_before_escalation.
     _catchAllDelayMinutes: function(rotaRows) {
+        var override = this._delayOverrideMinutes();
+        if (override !== null) return override;
         var minutes = null;
         for (var i = 0; i < rotaRows.length; i++) {
             var raw = rotaRows[i].catch_all_wait_time;

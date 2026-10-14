@@ -21,7 +21,7 @@ payload:
       client: "false"
       client_script_v2: ""
       comments: ""
-      condition: (new global.PagerDutySync()).isEnrolled(current.name.toString())
+      condition: gs.hasRole('x_pd_integration.admin') && (new global.PagerDutySync()).isEnrolled(current.name.toString())
       form_action: "true"
       form_button: "true"
       form_button_icon: ""

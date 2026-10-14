@@ -1,0 +1,57 @@
+$:
+  action: INSERT_OR_UPDATE
+action: INSERT_OR_UPDATE
+application:
+  _: global
+  $:
+    display_value: Global
+category: customer
+comments: ""
+name: sys_properties_09201daaf4e5c31d4b77b93c1e776db6
+payload:
+  record_update:
+    $:
+      table: sys_properties
+    sys_properties:
+      $:
+        action: INSERT_OR_UPDATE
+      choices: ""
+      description: "Minutes. When set to a whole number of 1 or more, the PagerDuty on-call sync ignores the escalation delays configured on the ServiceNow rotas and uses this value as the delay between every escalation level in every synced escalation policy. Leave blank to use each rota's own delay."
+      ignore_cache: "false"
+      is_private: "false"
+      name: x_pd_integration.sync_escalation_delay_override
+      read_roles: admin,x_pd_integration.admin
+      suffix: ""
+      sys_class_name: sys_properties
+      sys_created_by: admin
+      sys_created_on: 2026-10-13 20:00:00
+      sys_id: 09201daaf4e5c31d4b77b93c1e776db6
+      sys_mod_count: "0"
+      sys_name: x_pd_integration.sync_escalation_delay_override
+      sys_package:
+        _: global
+        $:
+          display_value: Global
+          source: global
+      sys_policy: ""
+      sys_scope:
+        _: global
+        $:
+          display_value: Global
+      sys_update_name: sys_properties_09201daaf4e5c31d4b77b93c1e776db6
+      sys_updated_by: admin
+      sys_updated_on: 2026-10-13 20:00:00
+      type: integer
+      value: ""
+      write_roles: admin,x_pd_integration.admin
+replace_on_upgrade: "false"
+sys_created_by: admin
+sys_mod_count: "0"
+sys_updated_by: admin
+table: sys_properties
+target_name: x_pd_integration.sync_escalation_delay_override
+type: System Property
+update_domain: global
+update_guid: ""
+update_guid_history: ""
+view: ""

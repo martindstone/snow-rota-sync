@@ -21,7 +21,7 @@ payload:
       client: "false"
       client_script_v2: ""
       comments: Queues a live PagerDuty sync for every enrolled group.
-      condition: gs.hasRole('admin')
+      condition: gs.hasRole('x_pd_integration.admin')
       form_action: "false"
       form_button: "false"
       form_button_icon: ""

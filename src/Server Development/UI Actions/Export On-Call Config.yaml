@@ -17,11 +17,11 @@ payload:
       $:
         action: INSERT_OR_UPDATE
       action_name: export_oncall_config_for_pd_review
-      active: "true"
+      active: "false"
       client: "false"
       client_script_v2: ""
       comments: ""
-      condition: ""
+      condition: gs.hasRole('x_pd_integration.admin')
       form_action: "true"
       form_button: "true"
       form_button_icon: ""

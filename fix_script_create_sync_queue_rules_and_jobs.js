@@ -2,7 +2,7 @@
     // Scripts - Background (Global scope). Creates the debounced-sync-queue plumbing:
     //   - five Business Rules that mark a group pending (RULE_SCRIPT / RULES below)
     //   - two Scheduled Jobs (JOBS below):
-    //       "PagerDuty Sync - Process Pending"   every minute, created INACTIVE (it is the
+    //       "PagerDuty Sync - Process Pending"   every hour, created INACTIVE  (it is the
     //                                             switch that lets edits reach PagerDuty)
     //       "PagerDuty Sync - Nightly Catch-All"  daily at NIGHTLY_RUN_TIME, active (it only
     //                                             marks groups pending)
@@ -35,7 +35,7 @@
     ];
 
     var JOBS = [
-        {name: 'PagerDuty Sync - Process Pending', active: false, runType: 'periodically', runPeriod: '1970-01-01 00:01:00',
+        {name: 'PagerDuty Sync - Process Pending', active: false, runType: 'periodically', runPeriod: '1970-01-01 01:00:00',
             script: 'new global.PagerDutySync().processPending();',
             description: 'Syncs enrolled groups whose on-call changes have gone quiet (see PagerDutySync README). INACTIVE until validated: activating it lets pending changes write to PagerDuty.'},
         {name: 'PagerDuty Sync - Nightly Catch-All', active: true, runType: 'daily', runTime: NIGHTLY_RUN_TIME,
