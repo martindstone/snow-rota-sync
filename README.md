@@ -234,6 +234,9 @@ version of `PagerDutySync` that actually ran and the server time, which tells yo
 - Each sync **ends** the live events on a schedule and creates replacements (see [Architecture notes](#architecture-notes)), so a
   PagerDuty schedule's history shows one ended event per sync.
 - Time off isn't synced; one-off "Provide coverage" shifts are.
+- An escalation level whose rosters have **no active members** (empty, all ended, or not yet started) gets no rule; PagerDuty's
+  escalation simply moves on to the next level. The log says which roster it was. A level where only some regions have coverage is
+  still built, and PagerDuty falls through it outside those regions' hours.
 
 ## Troubleshooting
 
@@ -256,6 +259,7 @@ Start with the enrollment row (*Last sync result* / *message*) and then System L
 | A coverage span isn't applied; log warns about it | Covering user has no PagerDuty match; or it is a repeating, group-wide, or time-off span | See [Coverage overrides](#coverage-overrides-provide-coverage) |
 | Group classified `needs_review` | Regions have different numbers of escalation levels, or a rota has no usable coverage window | Still synced best-effort, flagged "NEEDS REVIEW" in the policy description. Align the levels or give each rota a coverage span |
 | On-call order in PagerDuty differs from ServiceNow | Rotation alignment fell back to date math | Look for `ground-truth check` in the log; see [Rotation phase alignment](#rotation-phase-alignment) |
+| A level you expected is missing from the PagerDuty policy; log: `... has no active members; no escalation rule is built for it` | Every roster at that order level has no member in force today (none added, all ended, not yet started, or only placeholder-order members) | Add a member to the roster, or deactivate the roster if it is not used. A level where some regions have coverage and others don't is built normally |
 | Sync buttons are missing | You don't have role `x_pd_integration.admin`; or (Sync This) the group isn't enrolled | Grant the role (or change the UI Actions' Condition); enroll the group |
 | Sync buttons do nothing | Event or Script Action missing/inactive, or event queue latency (seconds) | Check Event Registry `pagerduty_sync.requested` and the Script Action; check System Logs > Events |
 | Escalation delays in PagerDuty are all the same, and not what the rotas say | `x_pd_integration.sync_escalation_delay_override` is set | Clear the property and sync again, or leave it if that is intended |
@@ -322,7 +326,7 @@ The top-level `.js` files are the **source of truth for every script**. `src/**/
 flowchart TB
   A["Edit top-level .js<br/>or src/**/*.yaml"] --> B["npm test<br/>(src in sync, packager checks)"]
   B --> C["npm run package<br/>sync-to-src + build"]
-  C --> D["update_set/<br/>PagerDuty Sync v24.2.xml"]
+  C --> D["update_set/<br/>PagerDuty Sync v24.3.xml"]
   D --> E["Import on a clean instance<br/>Preview, Commit, dry run, live sync"]
   E --> F["git commit + tag<br/>push to GitHub"]
   F --> G["GitHub release<br/>attach the XML"]

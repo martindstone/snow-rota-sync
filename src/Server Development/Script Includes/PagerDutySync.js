@@ -169,7 +169,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v24.2-2026-10-13-delay-override-hourly-job';
+        this.VERSION = 'v24.3-2026-10-23-skip-empty-levels';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -1337,6 +1337,29 @@ PagerDutySync.prototype = {
         var self = this;
         active.sort(function(a, b) { return self._parseOrder(a.order) - self._parseOrder(b.order); });
         return active;
+    },
+
+    // True if at least one of these roster rows has a member in force at asOf (see
+    // _activeMemberRows: not ended, already started, not a sentinel-order placeholder).
+    // A level whose rosters are ALL empty gets no escalation rule: _isSingleIncumbent
+    // treats zero members as "single incumbent" and _pickDirectUser then returns the
+    // fallback user, which put an always-on fallback-user rule into a real policy
+    // (an empty "Quinary" roster on one region of Global SQLDBA ADMIN did exactly that).
+    _anyRosterHasActiveMembers: function(rosterRows, snow, asOf) {
+        for (var i = 0; i < rosterRows.length; i++) {
+            var memberRows = snow.membersByRosterSysId[rosterRows[i].sys_id] || [];
+            if (this._activeMemberRows(memberRows, asOf).length > 0) return true;
+        }
+        return false;
+    },
+
+    _describeRosters: function(rosterRows, snow) {
+        var out = [];
+        for (var i = 0; i < rosterRows.length; i++) {
+            var rota = snow.rotaBySysId[rosterRows[i].rota_sys_id];
+            out.push((rota ? rota.name + ' / ' : '') + rosterRows[i].name);
+        }
+        return out.join(', ');
     },
 
     _pickDirectUser: function(memberRows, asOf, emailToId) {
@@ -3026,6 +3049,11 @@ PagerDutySync.prototype = {
 
     _buildEscalationRule: function(rosterRow, rotaRow, snow, asOf, emailToId, dryRun, collected) {
         var memberRows = snow.membersByRosterSysId[rosterRow.sys_id] || [];
+        if (!this._anyRosterHasActiveMembers([rosterRow], snow, asOf)) {
+            gs.warn('PagerDutySync: roster "' + rotaRow.name + ' / ' + rosterRow.name + '" (order ' + rosterRow.order +
+                ') has no active members; no escalation rule is built for it');
+            return null;
+        }
         var delayMinutes = this._parseDelayMinutes(rosterRow.time_before_escalation);
 
         if (this._isSingleIncumbent(memberRows)) {
@@ -3061,10 +3089,16 @@ PagerDutySync.prototype = {
 
             var rules = [];
             for (var r = 0; r < rosterRows.length; r++) {
-                rules.push(this._buildEscalationRule(rosterRows[r], rotaRow, snow, asOf, emailToId, dryRun, collected));
+                var rule = this._buildEscalationRule(rosterRows[r], rotaRow, snow, asOf, emailToId, dryRun, collected);
+                if (rule) rules.push(rule);
             }
             var catchAll = this._buildCatchAllRule([rotaRow], emailToId);
             if (catchAll) rules.push(catchAll);
+            if (rules.length === 0) {
+                gs.warn('PagerDutySync: ' + groupName + ' / ' + rotaRow.name + ' has no roster with active members and no ' +
+                    'catch-all, so there is nothing to build; leaving its PagerDuty policy untouched');
+                continue;
+            }
 
             var epName = (rotaRow.name.indexOf(groupName) === 0) ? rotaRow.name : (groupName + ' - ' + rotaRow.name);
             var epPayload = {
@@ -3117,6 +3151,13 @@ PagerDutySync.prototype = {
         for (var k = 0; k < orderKeys.length; k++) {
             var entries = levels[orderKeys[k]];
             var levelLabel = this._pickLevelLabel(entries);
+            var levelRosterRows = [];
+            for (var le = 0; le < entries.length; le++) levelRosterRows.push(entries[le].rosterRow);
+            if (!this._anyRosterHasActiveMembers(levelRosterRows, snow, asOf)) {
+                gs.warn('PagerDutySync: ' + groupName + ' level ' + orderKeys[k] + ' (' + levelLabel + ': ' +
+                    this._describeRosters(levelRosterRows, snow) + ') has no active members; no escalation rule is built for it');
+                continue;
+            }
             var targetTz = this._canonicalizeTimeZone(entries[0].rotaRow.schedule_time_zone);
             var events = [];
             var maxDelay = 1;
@@ -3145,6 +3186,11 @@ PagerDutySync.prototype = {
 
         var catchAll = this._buildScopedCatchAllRule(groupName, rotas, coverageWindows, emailToId, dryRun, collected);
         if (catchAll) rules.push(catchAll);
+        if (rules.length === 0) {
+            gs.warn('PagerDutySync: ' + groupName + ' has no level with active members and no catch-all; leaving its PagerDuty objects untouched');
+            collected.skipped = 'no escalation level has active members; PagerDuty objects left untouched';
+            return;
+        }
 
         var epPayload = {
             escalation_policy: {
@@ -3303,6 +3349,11 @@ PagerDutySync.prototype = {
 
         var catchAll = this._buildCatchAllRule(snow.rotasForGroup(), emailToId);
         if (catchAll) rules.push(catchAll);
+        if (rules.length === 0) {
+            gs.warn('PagerDutySync: ' + groupName + ' has no level with active members and no catch-all; leaving its PagerDuty objects untouched');
+            collected.skipped = 'no escalation level has active members; PagerDuty objects left untouched';
+            return null;
+        }
 
         var epPayload = {
             escalation_policy: {
@@ -3342,9 +3393,10 @@ PagerDutySync.prototype = {
 
         var rules = [];
         for (var k = 0; k < orderKeys.length; k++) {
-            rules.push(this._buildRuleForLevel(
+            var levelRule = this._buildRuleForLevel(
                 scheduleNamePrefix, orderKeys[k], byOrder[orderKeys[k]], snow, coverageWindows, asOf, emailToId, dryRun, collected
-            ));
+            );
+            if (levelRule) rules.push(levelRule);
         }
         return rules;
     },
@@ -3355,6 +3407,11 @@ PagerDutySync.prototype = {
     // exactly one event -- no more multi-schedule bucketing (see the class comment
     // above _buildBestEffortEscalationPolicy and ASSUMPTION 2 in the file header).
     _buildRuleForLevel: function(scheduleNamePrefix, orderValue, rowsAtLevel, snow, coverageWindows, asOf, emailToId, dryRun, collected) {
+        if (!this._anyRosterHasActiveMembers(rowsAtLevel, snow, asOf)) {
+            gs.warn('PagerDutySync: ' + scheduleNamePrefix + ' level ' + orderValue + ' (' + this._describeRosters(rowsAtLevel, snow) +
+                ') has no active members; no escalation rule is built for it');
+            return null;
+        }
         var allSingleIncumbent = true;
         for (var r = 0; r < rowsAtLevel.length; r++) {
             var memberRowsAtLevel = snow.membersByRosterSysId[rowsAtLevel[r].sys_id] || [];
