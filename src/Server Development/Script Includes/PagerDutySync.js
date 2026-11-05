@@ -1,6 +1,17 @@
 var PagerDutySync = Class.create();
 PagerDutySync.prototype = {
     initialize: function() {
+        // These two come first: the constructor itself logs (below), and every log line carries them.
+        this.LOG_SOURCE = 'PagerDutySync';
+        // Bumped by hand on every real change to this file (not tied to git or any
+        // other version control this port doesn't have visibility into on a
+        // customer's instance) -- exists purely so a run's own log output says,
+        // unambiguously, which exact version of this script actually executed.
+        // Confirmed live this matters: a stale/duplicate Script Include, or a
+        // fix script run before an update was actually saved, can otherwise look
+        // identical to a real fix failing -- see VERSION_LOGGED_AT below.
+        this.VERSION = 'v24.5-2026-11-04-ignore-empty-rosters-and-logging';
+
         // Which groups this port manages is data now, not code -- see isEnrolled()
         // and _enrolledGroupNames() below, which read the u_pagerduty_sync_group
         // table (Global scope, one row per enrolled sys_user_group). Presence = this
@@ -23,7 +34,7 @@ PagerDutySync.prototype = {
         // already configured on this instance, no second ID to keep in sync.
         this.FALLBACK_USER_ID = gs.getProperty('x_pd_integration.default_user');
         if (!this.FALLBACK_USER_ID) {
-            gs.warn('PagerDutySync: x_pd_integration.default_user is not set; events with no active or ' +
+            this._log('warn', 'PagerDutySync: x_pd_integration.default_user is not set; events with no active or ' +
                 'resolvable member will be built with a blank user id, which PagerDuty will reject');
         }
 
@@ -101,7 +112,6 @@ PagerDutySync.prototype = {
         // README), not a simple group-wide broadcast -- bigger than the one-field
         // lookup 'individual' needed, scoped separately.
         this.HANDLED_CATCH_ALL_TYPES = {'group_manager': true, 'individual': true};
-        this.ROTATION_ORDER_SENTINEL_THRESHOLD = 1000;
         // A sanity ceiling on a single cmn_schedule_span's computed duration, meant
         // to catch a genuine data problem (e.g. start/end misordered across days,
         // producing a nonsensical multi-day "duration"). Was 20 -- too strict:
@@ -162,14 +172,6 @@ PagerDutySync.prototype = {
             'u_retry_after', 'u_last_attempt', 'u_last_result', 'u_last_message', 'u_last_success',
             'u_consecutive_failures'];
 
-        // Bumped by hand on every real change to this file (not tied to git or any
-        // other version control this port doesn't have visibility into on a
-        // customer's instance) -- exists purely so a run's own log output says,
-        // unambiguously, which exact version of this script actually executed.
-        // Confirmed live this matters: a stale/duplicate Script Include, or a
-        // fix script run before an update was actually saved, can otherwise look
-        // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v24.3-2026-10-23-skip-empty-levels';
     },
 
     // Logs VERSION and the exact server date/time this call started, before
@@ -179,9 +181,78 @@ PagerDutySync.prototype = {
     // own sys_updated_on (which reflects when it was saved, not which copy of
     // it a given run actually executed -- the two can diverge if there's a
     // stale duplicate, or if a run was kicked off from cached/queued state).
+    // ------------------------------------------------------------------------------
+    // LOGGING
+    //
+    // Every line this port writes goes through _log/_logEvent, so one search finds all of it:
+    //   - Source is "PagerDutySync" (System Logs > System Log > All, or the PagerDuty Sync > Sync Log
+    //     module). gs.log/logWarning/logError take a source; gs.info/warn do not (their 2nd argument
+    //     is a message parameter). They exist in Global scope, which is where this runs.
+    //   - The message starts with "[PDSync <version> <run id> <group>] #<line> ", so a single sync can
+    //     be pulled out by its run id even when the log is exported without the Source column.
+    //   - Decisions are written as `event=<name> key=value ...` lines (classified, roster_ignored,
+    //     fallback_user, ...), easy to grep.
+    // ------------------------------------------------------------------------------
+
+    _log: function(level, message) {
+        var text = String(message).replace(/^PagerDutySync: /, '');
+        this._logLine = (this._logLine || 0) + 1;
+        var line = '[PDSync ' + this._shortVersion() + ' ' + (this._runId || '-') + (this._logGroup ? ' ' + this._logGroup : '') +
+            '] #' + ('000' + this._logLine).slice(-3) + ' ' + text;
+        // Logging must never break a sync: if a sourced method is missing or throws, fall back to
+        // gs.info/warn/error (Source then reads "*** Script" but the line is still found by its prefix),
+        // and if even that throws, drop the line.
+        try {
+            if (level === 'error' && typeof gs.logError === 'function') gs.logError(line, this.LOG_SOURCE);
+            else if (level === 'warn' && typeof gs.logWarning === 'function') gs.logWarning(line, this.LOG_SOURCE);
+            else if (level === 'info' && typeof gs.log === 'function') gs.log(line, this.LOG_SOURCE);
+            else gs[level](line);
+        } catch (e) {
+            try { gs[level](line); } catch (e2) { /* nothing left to try */ }
+        }
+    },
+
+    // _logEvent('warn', 'roster_ignored', {rota: 'Americas', roster: 'Quinary', order: 500}) writes
+    // `event=roster_ignored rota=Americas roster=Quinary order=500`. Values with spaces or quotes are quoted.
+    _logEvent: function(level, event, fields, text) {
+        var parts = ['event=' + event];
+        for (var k in fields) {
+            if (!fields.hasOwnProperty(k)) continue;
+            var v = String(fields[k]);
+            parts.push(k + '=' + (/^[A-Za-z0-9_.:@\/-]+$/.test(v) ? v : '"' + v.replace(/"/g, '\\"') + '"'));
+        }
+        this._log(level, parts.join(' ') + (text ? ' -- ' + text : ''));
+    },
+
+    // Every place the fallback user stands in for someone gets one `event=fallback_user` line per run
+    // (deduplicated by reason + context + email), saying why and where. Without this a sync that
+    // silently substituted the fallback user looked identical to a correct one.
+    _noteFallback: function(reason, context, email) {
+        var key = reason + '|' + context + '|' + (email || '');
+        this._fallbackSeen = this._fallbackSeen || {};
+        if (this._fallbackSeen.hasOwnProperty(key)) return;
+        this._fallbackSeen[key] = true;
+        this._logEvent('warn', 'fallback_user', {reason: reason, context: context, email: email || '', fallback_user: this.FALLBACK_USER_ID});
+    },
+
+    _rosterContext: function(rotaName, rosterName) {
+        return 'roster "' + (rotaName ? rotaName + ' / ' : '') + rosterName + '"';
+    },
+
+    _shortVersion: function() {
+        return String(this.VERSION).split('-')[0];
+    },
+
+    // One id per run of an entry point, shared by every line of it (a processPending run covers
+    // several groups; each line also names its group).
     _logVersionAndStart: function(entryPoint) {
-        gs.info('PagerDutySync ' + entryPoint + ' starting -- version ' + this.VERSION +
-            ', server time ' + new GlideDateTime().getValue() + ' UTC');
+        if (!this._runId) {
+            this._runId = Math.floor(Math.random() * 0x1000000).toString(16);
+            this._runId = ('000000' + this._runId).slice(-6);
+            this._logLine = 0;
+            this._fallbackSeen = {};
+        }
+        this._logEvent('info', 'run_start', {entry: entryPoint, version: this.VERSION, server_time_utc: new GlideDateTime().getValue()});
     },
 
     // ------------------------------------------------------------------------------
@@ -203,15 +274,15 @@ PagerDutySync.prototype = {
             try {
                 this._syncOneGroup(groupNames[i], asOf, dryRun, collected);
             } catch (groupError) {
-                gs.error('PagerDutySync.syncAll: "' + groupNames[i] + '" failed, continuing with the next group: ' + groupError);
+                this._log('error', 'PagerDutySync.syncAll: "' + groupNames[i] + '" failed, continuing with the next group: ' + groupError);
                 collected.errors.push({group: groupNames[i], error: String(groupError)});
             }
         }
-        gs.info('PagerDutySync.syncAll ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') +
+        this._log('info', 'PagerDutySync.syncAll ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') +
             'complete: ' + collected.schedules.length + ' schedule action(s), ' +
             collected.escalation_policies.length + ' escalation policy action(s), ' +
             collected.overrides.length + ' coverage override(s)');
-        gs.info(JSON.stringify(collected, null, 2));
+        this._log('info', 'event=payload scope=all ' + JSON.stringify(collected, null, 2));
         return collected;
     },
 
@@ -220,15 +291,16 @@ PagerDutySync.prototype = {
         this._logVersionAndStart('syncGroup(' + groupName + ')');
         dryRun = (dryRun === false) ? false : true;
         if (!this.isEnrolled(groupName)) {
-            gs.warn('PagerDutySync.syncGroup: ' + groupName + ' is not enrolled in ' +
+            this._log('warn', 'PagerDutySync.syncGroup: ' + groupName + ' is not enrolled in ' +
                 this.SYNC_GROUP_TABLE + '; nothing to do');
             return null;
         }
         var asOf = new GlideDateTime();
         var collected = {schedules: [], escalation_policies: [], overrides: []};
         this._syncOneGroup(groupName, asOf, dryRun, collected);
-        gs.info('PagerDutySync.syncGroup(' + groupName + ') ' + (dryRun ? '[DRY RUN] ' : '[LIVE] ') + 'complete');
-        gs.info(JSON.stringify(collected, null, 2));
+        this._logEvent('info', 'group_complete', {group: groupName, mode: dryRun ? 'dry_run' : 'live',
+            schedules: collected.schedules.length, escalation_policies: collected.escalation_policies.length, overrides: collected.overrides.length});
+        this._log('info', 'event=payload group="' + groupName + '" ' + JSON.stringify(collected, null, 2));
         return collected;
     },
 
@@ -274,11 +346,11 @@ PagerDutySync.prototype = {
                 groupName = groupGr.getValue('name');
             }
         } else {
-            gs.warn('PagerDutySync.syncForRecord: unsupported table ' + tableName);
+            this._log('warn', 'PagerDutySync.syncForRecord: unsupported table ' + tableName);
             return null;
         }
         if (!groupName) {
-            gs.warn('PagerDutySync.syncForRecord: could not resolve a group name from ' + tableName + ' ' + sysId);
+            this._log('warn', 'PagerDutySync.syncForRecord: could not resolve a group name from ' + tableName + ' ' + sysId);
             return null;
         }
         return this.syncGroup(groupName, dryRun);
@@ -308,7 +380,7 @@ PagerDutySync.prototype = {
             if (!gr.isValidField(this.SYNC_STATE_FIELDS[i])) missing.push(this.SYNC_STATE_FIELDS[i]);
         }
         if (missing.length) {
-            gs.error('PagerDutySync: ' + this.SYNC_GROUP_TABLE + ' is missing column(s) ' + missing.join(', ') +
+            this._log('error', 'PagerDutySync: ' + this.SYNC_GROUP_TABLE + ' is missing column(s) ' + missing.join(', ') +
                 ' -- add them (see README, "Debounced sync queue") before using the pending-sync queue');
         }
         this._stateReady = (missing.length === 0);
@@ -393,7 +465,7 @@ PagerDutySync.prototype = {
         for (var i = 0; i < names.length; i++) {
             if (this.markPending(names[i])) marked++;
         }
-        gs.info('PagerDutySync.markAllPending: marked ' + marked + ' of ' + names.length + ' enrolled group(s) pending');
+        this._log('info', 'PagerDutySync.markAllPending: marked ' + marked + ' of ' + names.length + ' enrolled group(s) pending');
         return marked;
     },
 
@@ -436,18 +508,18 @@ PagerDutySync.prototype = {
         }
         for (var i = 0; i < due.length; i++) {
             if (this._secondsSince(startedAt.getValue(), new GlideDateTime()) > this.MAX_RUN_SECONDS) {
-                gs.warn('PagerDutySync.processPending: run budget (' + this.MAX_RUN_SECONDS + 's) used up; ' +
+                this._log('warn', 'PagerDutySync.processPending: run budget (' + this.MAX_RUN_SECONDS + 's) used up; ' +
                     (due.length - i) + ' due group(s) left for the next run');
                 break;
             }
-            gs.info('PagerDutySync.processPending: syncing "' + due[i].name + '" (due: ' + due[i].why + ')');
+            this._log('info', 'PagerDutySync.processPending: syncing "' + due[i].name + '" (due: ' + due[i].why + ')');
             var outcome = this._runTracked(due[i].sysId, 'scheduled');
             if (outcome.status === 'success') summary.synced.push(due[i].name);
             else if (outcome.status === 'failed') summary.failed.push(due[i].name);
             else if (outcome.status === 'skipped') summary.skipped.push(due[i].name);
             else summary.busy.push(due[i].name);
         }
-        gs.info('PagerDutySync.processPending: ' + JSON.stringify(summary));
+        this._log('info', 'PagerDutySync.processPending: ' + JSON.stringify(summary));
         return summary;
     },
 
@@ -458,26 +530,26 @@ PagerDutySync.prototype = {
         this._logVersionAndStart('syncGroupTracked(' + groupName + ')');
         var row = this._syncRowForGroup(groupName);
         if (!row) {
-            gs.warn('PagerDutySync.syncGroupTracked: ' + groupName + ' is not enrolled in ' + this.SYNC_GROUP_TABLE + '; nothing to do');
+            this._log('warn', 'PagerDutySync.syncGroupTracked: ' + groupName + ' is not enrolled in ' + this.SYNC_GROUP_TABLE + '; nothing to do');
             return {status: 'skipped', message: 'not enrolled'};
         }
         if (!this._syncStateReady()) {
             // Sync-state columns not added yet: still sync (as before the queue existed),
             // just without a lock or history. _syncStateReady() already logged what's missing.
-            gs.warn('PagerDutySync.syncGroupTracked: running "' + groupName + '" UNTRACKED (no lock, no history) ' +
+            this._log('warn', 'PagerDutySync.syncGroupTracked: running "' + groupName + '" UNTRACKED (no lock, no history) ' +
                 'because ' + this.SYNC_GROUP_TABLE + ' is missing sync-state columns');
             try {
                 this.syncGroup(groupName, false);
                 return {status: 'success', message: 'ran untracked'};
             } catch (e) {
-                gs.error('PagerDutySync: sync of "' + groupName + '" failed: ' + e);
+                this._log('error', 'PagerDutySync: sync of "' + groupName + '" failed: ' + e);
                 return {status: 'failed', message: String(e && e.message ? e.message : e)};
             }
         }
         var outcome = this._runTracked(row.getUniqueValue(), 'manual');
         if (outcome.status === 'busy') {
             this.markPending(groupName);
-            gs.info('PagerDutySync.syncGroupTracked: "' + groupName + '" is already syncing; marked pending so it runs again after');
+            this._log('info', 'PagerDutySync.syncGroupTracked: "' + groupName + '" is already syncing; marked pending so it runs again after');
         }
         return outcome;
     },
@@ -529,7 +601,7 @@ PagerDutySync.prototype = {
         } catch (e) {
             status = 'failed';
             message = String(e && e.message ? e.message : e);
-            gs.error('PagerDutySync: sync of "' + groupName + '" failed: ' + message);
+            this._log('error', 'PagerDutySync: sync of "' + groupName + '" failed: ' + message);
         }
 
         var fin = new GlideRecord(T);
@@ -563,13 +635,24 @@ PagerDutySync.prototype = {
     },
 
     _syncOneGroup: function(groupName, asOf, dryRun, collected) {
+        var previousGroup = this._logGroup;
+        this._logGroup = groupName;
+        try {
+            this._syncOneGroupBody(groupName, asOf, dryRun, collected);
+        } finally {
+            this._logGroup = previousGroup;
+        }
+    },
+
+    _syncOneGroupBody: function(groupName, asOf, dryRun, collected) {
         var snow = this._loadSnowData(groupName);
         var expiredRotaIds = {};
         var coverageWindows = this._loadCoverageWindows(snow, asOf, expiredRotaIds);
         this._dropExpiredRotas(snow, expiredRotaIds);
+        this._dropEmptyRosters(snow, asOf, groupName);
         if (snow.rotasForGroup().length === 0) {
-            gs.warn('PagerDutySync: "' + groupName + '" has no rota left with current coverage (every rota ' +
-                'either was never loaded or has expired); leaving its PagerDuty objects untouched this run');
+            this._logEvent('warn', 'group_skipped', {group: groupName, reason: 'no_rota_with_current_coverage'},
+                'every rota was never loaded, has expired or has no staffed roster; PagerDuty objects left untouched');
             collected.skipped = 'no rota with current coverage; PagerDuty objects left untouched';
             return;
         }
@@ -577,8 +660,7 @@ PagerDutySync.prototype = {
         this._eventRosters = {};
         this._appliedOverrideRosters = {};
         var classification = this._classifyGroup(groupName, snow, coverageWindows);
-        gs.info('classified "' + groupName + '" as ' + classification.shape +
-            (classification.reason ? (' (' + classification.reason + ')') : ''));
+        this._logEvent('info', 'classified', {group: groupName, shape: classification.shape, reason: classification.reason || ''});
 
         if (classification.shape === 'single_region') {
             this._buildSingleRegionEscalationPolicies(groupName, snow, asOf, dryRun, collected);
@@ -588,6 +670,35 @@ PagerDutySync.prototype = {
             this._buildBestEffortEscalationPolicy(groupName, snow, coverageWindows, asOf, dryRun, collected);
         }
         this._warnUnappliedOverrides(groupName, snow);
+    },
+
+    // Ignores every roster that has no member in force at asOf, and any rota left with no roster
+    // at all, so the rest of the sync never sees them: they don't count towards classification,
+    // don't become escalation levels and don't get a fallback-user event. A level that only some
+    // regions staff is built from those regions' rosters; the others simply aren't on call at those
+    // hours (PagerDuty then falls through that level).
+    _dropEmptyRosters: function(snow, asOf, groupName) {
+        for (var rotaId in snow.rosterByRotaSysId) {
+            if (!snow.rosterByRotaSysId.hasOwnProperty(rotaId)) continue;
+            var rota = snow.rotaBySysId[rotaId];
+            var kept = [];
+            var rosters = snow.rosterByRotaSysId[rotaId];
+            for (var i = 0; i < rosters.length; i++) {
+                if (this._anyRosterHasActiveMembers([rosters[i]], snow, asOf)) {
+                    kept.push(rosters[i]);
+                } else {
+                    this._logEvent('warn', 'roster_ignored', {group: groupName, rota: rota ? rota.name : '', roster: rosters[i].name,
+                        order: rosters[i].order, reason: 'no_active_members'});
+                    delete snow.rosterBySysId[rosters[i].sys_id];
+                }
+            }
+            snow.rosterByRotaSysId[rotaId] = kept;
+            if (kept.length === 0 && rota) {
+                this._logEvent('warn', 'rota_ignored', {group: groupName, rota: rota.name, reason: 'no_staffed_roster'});
+                delete snow.rotaBySysId[rotaId];
+                delete snow.rosterByRotaSysId[rotaId];
+            }
+        }
     },
 
     _loadSnowData: function(groupName) {
@@ -715,9 +826,6 @@ PagerDutySync.prototype = {
     _isSingleIncumbent: function(memberRows) {
         var rows = [];
         for (var i = 0; i < memberRows.length; i++) {
-            // Sentinel-order rows are placeholders (see ROTATION_ORDER_SENTINEL_
-            // THRESHOLD / _activeMemberRows), not real concurrent membership.
-            if (this._parseOrder(memberRows[i].order) >= this.ROTATION_ORDER_SENTINEL_THRESHOLD) continue;
             rows.push(memberRows[i]);
         }
         for (var a = 0; a < rows.length; a++) {
@@ -818,7 +926,7 @@ PagerDutySync.prototype = {
     _dropExpiredRotas: function(snow, expiredRotaIds) {
         for (var rotaId in expiredRotaIds) {
             if (!expiredRotaIds.hasOwnProperty(rotaId) || !snow.rotaBySysId.hasOwnProperty(rotaId)) continue;
-            gs.info('skipping rota "' + snow.rotaBySysId[rotaId].name + '": every recurring span on its schedule has a ' +
+            this._log('info', 'skipping rota "' + snow.rotaBySysId[rotaId].name + '": every recurring span on its schedule has a ' +
                 'repeat_until in the past, so it has no current coverage (not falling back to an always-on window)');
             var rosters = snow.rosterByRotaSysId[rotaId] || [];
             for (var i = 0; i < rosters.length; i++) {
@@ -895,7 +1003,7 @@ PagerDutySync.prototype = {
             if (!this._isBlankRosterValue(repeatUntilRaw)) {
                 var repeatUntilGdt = new GlideDateTime(this._normalizeRosterDate(repeatUntilRaw) + ' 00:00:00');
                 if (repeatUntilGdt.compareTo(asOf) < 0) {
-                    gs.info('"' + rotaLabel + '": span ' + spanGr.getUniqueValue() + '\'s repeat_until (' +
+                    this._log('info', '"' + rotaLabel + '": span ' + spanGr.getUniqueValue() + '\'s repeat_until (' +
                         this._normalizeRosterDate(repeatUntilRaw) + ') is in the past; excluding it from this ' +
                         'rota\'s coverage window computation');
                     if (state) state.expiredSpans++;
@@ -936,7 +1044,7 @@ PagerDutySync.prototype = {
         var repeatCountValues = [];
         for (var rc in repeatCountsSeen) { if (repeatCountsSeen.hasOwnProperty(rc)) repeatCountValues.push(parseInt(rc, 10)); }
         if (repeatCountValues.length > 1) {
-            gs.warn('"' + rotaLabel + '" has cmn_schedule_span rows with different repeat_count values (' +
+            this._log('warn', '"' + rotaLabel + '" has cmn_schedule_span rows with different repeat_count values (' +
                 repeatCountValues.join(', ') + '); using the largest for alternating-cycle detection');
         }
         var repeatCount = repeatCountValues.length ? Math.max.apply(null, repeatCountValues) : 1;
@@ -968,7 +1076,7 @@ PagerDutySync.prototype = {
     _parseScheduleDateTime: function(raw) {
         var m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/.exec(raw || '');
         if (!m) {
-            gs.error('PagerDutySync: cmn_schedule_span date value "' + raw + '" did not match the expected ' +
+            this._log('error', 'PagerDutySync: cmn_schedule_span date value "' + raw + '" did not match the expected ' +
                 'compact ISO8601 format; treating as unparseable');
             return null;
         }
@@ -1029,7 +1137,7 @@ PagerDutySync.prototype = {
             }
             if (merged.length === 0) continue;
             if (merged.length > 1) {
-                gs.warn('"' + rotaLabel + '" has a non-contiguous coverage window on day ' + day + ' after ' +
+                this._log('warn', '"' + rotaLabel + '" has a non-contiguous coverage window on day ' + day + ' after ' +
                     'merging cmn_schedule_span rows; this shape can\'t be represented as a single RRULE-based ' +
                     'event -- skipping, treat as needs review');
                 return null;
@@ -1039,7 +1147,7 @@ PagerDutySync.prototype = {
                 commonStart = start;
                 commonDuration = duration;
             } else if (start !== commonStart || duration !== commonDuration) {
-                gs.warn('"' + rotaLabel + '" has a different time-of-day coverage window on different days ' +
+                this._log('warn', '"' + rotaLabel + '" has a different time-of-day coverage window on different days ' +
                     'after merging cmn_schedule_span rows; this shape can\'t be represented as a single ' +
                     'RRULE-based event -- skipping, treat as needs review');
                 return null;
@@ -1179,7 +1287,7 @@ PagerDutySync.prototype = {
     _defaultAlwaysOnWindow: function(tzName, memberRows) {
         var anchorUtcIso = this._earliestMemberFromAnchorIso(memberRows || [], tzName);
         if (!anchorUtcIso) {
-            gs.warn('PagerDutySync: no cmn_rota_member.from date available to anchor an always-on rotation\'s ' +
+            this._log('warn', 'PagerDutySync: no cmn_rota_member.from date available to anchor an always-on rotation\'s ' +
                 'handoff day; using a fixed fallback anchor instead of "now" so it at least stays stable across ' +
                 'syncs -- which day of the week handoffs land on is not derived from real ServiceNow data here');
             anchorUtcIso = this.FIXED_FALLBACK_ANCHOR_ISO;
@@ -1271,6 +1379,12 @@ PagerDutySync.prototype = {
     // SHAPE CLASSIFICATION
     // ------------------------------------------------------------------------------
 
+    // A rota whose only roster is named like an escalation contact ("Escalation only CAL"). Used by
+    // classification and by the best-effort builder, so both agree on what an escalation-only tier is.
+    _isEscalationOnlyRoster: function(rosterRow, rosterCountOnRota) {
+        return !!rosterRow && rosterCountOnRota === 1 && /escalation/i.test(rosterRow.name);
+    },
+
     _classifyGroup: function(groupName, snow, coverageWindows) {
         var rotas = snow.rotasForGroup();
         if (rotas.length < 2) {
@@ -1289,8 +1403,23 @@ PagerDutySync.prototype = {
             if (counts[c] === 0) anyZero = true;
             if (counts[c] !== counts[0]) allSame = false;
         }
-        if (!allSame || anyZero) {
-            return {shape: 'needs_review', reason: 'regions do not all have the same number of escalation levels'};
+        if (anyZero) {
+            return {shape: 'needs_review', reason: 'a region has no usable roster'};
+        }
+        if (!allSame) {
+            // Rotas with different numbers of levels are fine when they are all regions of the same
+            // tiers (a region that doesn't staff a level just has a gap there). They are not when a
+            // rota is an "escalation only" tier (a single roster named like an escalation contact):
+            // that is a later step, not another region of the first level.
+            var escalationOnly = [];
+            for (var eo = 0; eo < rotas.length; eo++) {
+                var onlyRosters = snow.rosterByRotaSysId[rotas[eo].sys_id] || [];
+                if (this._isEscalationOnlyRoster(onlyRosters[0], onlyRosters.length)) escalationOnly.push(rotas[eo].name);
+            }
+            if (escalationOnly.length > 0) {
+                return {shape: 'needs_review', reason: 'regions do not all have the same number of escalation levels, and ' +
+                    'these rotas look like an escalation-only tier: ' + escalationOnly.join(', ')};
+            }
         }
 
         var missing = [];
@@ -1307,17 +1436,18 @@ PagerDutySync.prototype = {
     // MEMBER RESOLUTION
     // ------------------------------------------------------------------------------
 
-    _resolveUser: function(email, emailToId) {
+    _resolveUser: function(email, emailToId, context) {
         email = (email || '').replace(/^\s+|\s+$/g, '').toLowerCase();
         if (email && emailToId.hasOwnProperty(email)) {
             return {id: emailToId[email], matched: true};
         }
+        if (context) this._noteFallback(email ? 'no_pagerduty_user_with_this_email' : 'member_has_no_email', context, email);
         return {id: this.FALLBACK_USER_ID, matched: false};
     },
 
     _activeMemberRows: function(memberRows, asOf) {
         var active = [];
-        var droppedSentinels = 0, droppedFuture = 0;
+        var droppedFuture = 0;
         for (var i = 0; i < memberRows.length; i++) {
             var row = memberRows[i];
             if (row.to) {
@@ -1328,19 +1458,19 @@ PagerDutySync.prototype = {
                 var fromGdt = new GlideDateTime(row.from + ' 00:00:00');
                 if (fromGdt.compareTo(asOf) > 0) { droppedFuture++; continue; }
             }
-            var orderNum = this._parseOrder(row.order);
-            if (orderNum >= this.ROTATION_ORDER_SENTINEL_THRESHOLD) { droppedSentinels++; continue; }
+            // No upper bound on `order`: Chubb's rosters add each later generation of members
+            // 1000 higher (1,2,3 ... then 1001,1002 ... with from/to dates that don't overlap),
+            // and those are real people. Only from/to decide who is active; `order` just sorts.
             active.push(row);
         }
-        if (droppedSentinels) gs.info('  note: dropped ' + droppedSentinels + ' sentinel-order member row(s)');
-        if (droppedFuture) gs.info('  note: dropped ' + droppedFuture + ' member row(s) not yet started');
+        if (droppedFuture) this._log('info', '  note: dropped ' + droppedFuture + ' member row(s) not yet started');
         var self = this;
         active.sort(function(a, b) { return self._parseOrder(a.order) - self._parseOrder(b.order); });
         return active;
     },
 
     // True if at least one of these roster rows has a member in force at asOf (see
-    // _activeMemberRows: not ended, already started, not a sentinel-order placeholder).
+    // _activeMemberRows: not ended and already started).
     // A level whose rosters are ALL empty gets no escalation rule: _isSingleIncumbent
     // treats zero members as "single incumbent" and _pickDirectUser then returns the
     // fallback user, which put an always-on fallback-user rule into a real policy
@@ -1362,13 +1492,16 @@ PagerDutySync.prototype = {
         return out.join(', ');
     },
 
-    _pickDirectUser: function(memberRows, asOf, emailToId) {
+    _pickDirectUser: function(memberRows, asOf, emailToId, context) {
         var active = this._activeMemberRows(memberRows, asOf);
-        if (active.length === 0) return this.FALLBACK_USER_ID;
-        if (active.length > 1) {
-            gs.warn('single-incumbent role has ' + active.length + ' active members; using the lowest rotation-order one');
+        if (active.length === 0) {
+            this._noteFallback('no_active_members', context || 'single-person level', '');
+            return this.FALLBACK_USER_ID;
         }
-        return this._resolveUser(active[0].member_email, emailToId).id;
+        if (active.length > 1) {
+            this._log('warn', 'single-incumbent role has ' + active.length + ' active members; using the lowest rotation-order one');
+        }
+        return this._resolveUser(active[0].member_email, emailToId, context || 'single-person level').id;
     },
 
     // ------------------------------------------------------------------------------
@@ -1389,7 +1522,7 @@ PagerDutySync.prototype = {
         var intervalCount = parseInt(rosterRow.rotation_interval_count, 10);
         if (isNaN(intervalCount) || intervalCount < 1) intervalCount = 1;
         if (intervalType !== 'daily' && intervalType !== 'weekly') {
-            gs.warn('unrecognized rotation_interval_type "' + rosterRow.rotation_interval_type + '" on roster ' +
+            this._log('warn', 'unrecognized rotation_interval_type "' + rosterRow.rotation_interval_type + '" on roster ' +
                 rosterRow.sys_id + '; treating as weekly anyway');
             intervalType = 'weekly';
         }
@@ -1408,18 +1541,17 @@ PagerDutySync.prototype = {
         var members = [];
         var fallbackCount = 0;
         for (var i = 0; i < active.length; i++) {
-            var resolved = this._resolveUser(active[i].member_email, emailToId);
+            var resolved = this._resolveUser(active[i].member_email, emailToId, this._rosterContext(rotaRow.name, rosterRow.name));
             if (!resolved.matched) fallbackCount++;
             members.push({type: 'user_member', user_id: resolved.id});
         }
         if (members.length === 0) {
-            gs.warn('roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no currently-active ' +
-                'members (no member rows at all, or none currently active); using fallback user for the whole event');
+            this._noteFallback('no_active_members_event_filled_with_fallback_user', this._rosterContext(rotaRow.name, rosterRow.name), '');
             members = [{type: 'user_member', user_id: this.FALLBACK_USER_ID}];
             fallbackCount = 1;
         }
         if (fallbackCount) {
-            gs.info('  note: ' + fallbackCount + '/' + members.length + ' slot(s) in "' + rosterRow.name +
+            this._log('info', '  note: ' + fallbackCount + '/' + members.length + ' slot(s) in "' + rosterRow.name +
                 '" (' + rotaRow.name + ') filled with the fallback user');
         }
 
@@ -1428,16 +1560,16 @@ PagerDutySync.prototype = {
         var rotationOffset = alignment.offset;
         var eventAnchorUtcIso = alignment.anchorUtcIso;
         if (eventAnchorUtcIso !== window.anchorUtcIso) {
-            gs.info('  note: moved "' + rosterRow.name + '" (' + rotaRow.name + ')\'s start_time from ' + window.anchorUtcIso +
+            this._log('info', '  note: moved "' + rosterRow.name + '" (' + rotaRow.name + ')\'s start_time from ' + window.anchorUtcIso +
                 ' to ' + eventAnchorUtcIso + ' so its handoffs land on the roster\'s rotate-on weekday (dow_for_rotate / ' +
                 'rotation_start_date) instead of the coverage window\'s anchor weekday');
         }
         if (rotationOffset && alignment.groundTruth) {
-            gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
+            this._log('info', '  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
                 rotationOffset + '/' + members.length + ' to match who ServiceNow\'s own rotation_schedule has on ' +
                 'call right now (ground truth -- see _groundTruthMemberIndex)');
         } else if (rotationOffset) {
-            gs.info('  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
+            this._log('info', '  note: rotating "' + rosterRow.name + '" (' + rotaRow.name + ')\'s member order by ' +
                 rotationOffset + '/' + members.length + ' to align with rotation_start_date (' +
                 rosterRow.rotation_start_date + ') -- its coverage window\'s own anchor date disagrees with ' +
                 'that by enough whole shift-blocks to otherwise put the wrong member first');
@@ -1488,9 +1620,14 @@ PagerDutySync.prototype = {
             var active = this._activeMemberRows(memberRows, asOf);
             var sideIds = [];
             for (var a = 0; a < active.length; a++) {
-                sideIds.push(this._resolveUser(active[a].member_email, emailToId).id);
+                sideIds.push(this._resolveUser(active[a].member_email, emailToId,
+                    this._rosterContext((snow.rotaBySysId[row.rota_sys_id] || {}).name, row.name)).id);
             }
-            if (sideIds.length === 0) sideIds = [this.FALLBACK_USER_ID];
+            if (sideIds.length === 0) {
+                this._noteFallback('no_active_members_event_filled_with_fallback_user',
+                    this._rosterContext((snow.rotaBySysId[row.rota_sys_id] || {}).name, row.name), '');
+                sideIds = [this.FALLBACK_USER_ID];
+            }
             sideUserIdLists.push(sideIds);
             names.push(row.name);
         }
@@ -1556,11 +1693,13 @@ PagerDutySync.prototype = {
         for (var i = 0; i < rows.length; i++) {
             var memberRows = snow.membersByRosterSysId[rows[i].sys_id] || [];
             var active = this._activeMemberRows(memberRows, asOf);
+            var rowContext = this._rosterContext((snow.rotaBySysId[rows[i].rota_sys_id] || {}).name, rows[i].name);
             if (active.length === 0) {
+                this._noteFallback('no_active_members_event_filled_with_fallback_user', rowContext, '');
                 members.push({type: 'user_member', user_id: this.FALLBACK_USER_ID});
             } else {
                 for (var a = 0; a < active.length; a++) {
-                    members.push({type: 'user_member', user_id: this._resolveUser(active[a].member_email, emailToId).id});
+                    members.push({type: 'user_member', user_id: this._resolveUser(active[a].member_email, emailToId, rowContext).id});
                 }
             }
             names.push(rows[i].name);
@@ -1627,10 +1766,10 @@ PagerDutySync.prototype = {
             if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(utcValue)) {
                 return utcValue.replace(' ', 'T') + 'Z';
             }
-            gs.warn('PagerDutySync: GlideScheduleDateTime("TZID=' + canonicalTz + ';' + normalizedValue + '") ' +
+            this._log('warn', 'PagerDutySync: GlideScheduleDateTime("TZID=' + canonicalTz + ';' + normalizedValue + '") ' +
                 'produced an unexpected value ("' + utcValue + '"); falling back to the standard-time-only offset table');
         } catch (e) {
-            gs.warn('PagerDutySync: GlideScheduleDateTime threw for "' + canonicalTz + '" (' + e +
+            this._log('warn', 'PagerDutySync: GlideScheduleDateTime threw for "' + canonicalTz + '" (' + e +
                 '); falling back to the standard-time-only offset table');
         }
         return this._localizedIsoViaOffsetTable(normalizedValue, canonicalTz, dateStr, timeStr);
@@ -1642,7 +1781,7 @@ PagerDutySync.prototype = {
         var offsetSeconds = this.STANDARD_UTC_OFFSET_SECONDS.hasOwnProperty(canonicalTz)
             ? this.STANDARD_UTC_OFFSET_SECONDS[canonicalTz] : null;
         if (offsetSeconds === null) {
-            gs.warn('PagerDutySync: no known UTC offset for "' + canonicalTz + '" either; treating ' + dateStr + ' ' +
+            this._log('warn', 'PagerDutySync: no known UTC offset for "' + canonicalTz + '" either; treating ' + dateStr + ' ' +
                 timeStr + ' as literal UTC (no conversion applied) -- add it to STANDARD_UTC_OFFSET_SECONDS ' +
                 'if this zone is really in use');
         } else {
@@ -1664,7 +1803,7 @@ PagerDutySync.prototype = {
         if (this._hasRotationStart(rosterRow)) {
             return this._localizedIso(rosterRow.rotation_start_date, this._rotationStartTime(rosterRow), tzName);
         }
-        gs.warn('PagerDutySync: roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no ' +
+        this._log('warn', 'PagerDutySync: roster ' + rosterRow.sys_id + ' (' + rosterRow.name + ') has no ' +
             'rotation_start_date; using a fallback anchor for its rotation phase instead ' +
             '-- which member appears "current" here is not derived from real ServiceNow data');
         return fallbackAnchorUtcIso || this.FIXED_FALLBACK_ANCHOR_ISO;
@@ -1778,7 +1917,7 @@ PagerDutySync.prototype = {
             // a one-off investigation probe) since "did this actually find an
             // answer, right now, for this roster" is worth being able to check
             // on any future run without a separate script.
-            gs.info('  ground-truth check (' + rosterRow.name + '): live on-call lookup -> ' +
+            this._log('info', '  ground-truth check (' + rosterRow.name + '): live on-call lookup -> ' +
                 (groundTruth.index >= 0 ? ('found via ' + groundTruth.source + ', index ' + groundTruth.index) :
                     'not found (checked exact instant and nearest future occurrence)'));
 
@@ -1786,7 +1925,7 @@ PagerDutySync.prototype = {
                 var groundTruthOffset = this._offsetForGroundTruth(anchorUtcIso, window, tzName, shiftsPerMember, memberCount, groundTruth.checkInstant, groundTruth.index);
                 if (groundTruthOffset !== null) {
                     if (groundTruthOffset !== dateMathOffset) {
-                        gs.info('  note: ground-truth on-call lookup (' + rosterRow.name +
+                        this._log('info', '  note: ground-truth on-call lookup (' + rosterRow.name +
                             ') disagrees with the rotation_start_date estimate (offset ' + groundTruthOffset + ' vs ' + dateMathOffset +
                             ') -- likely roster membership has changed since rotation_start_date; using the ground-truth value');
                     }
@@ -1914,7 +2053,7 @@ PagerDutySync.prototype = {
                 }
             }
         } catch (e) {
-            gs.warn('PagerDutySync: OCRotationV2.getSpans() failed for rota ' + rotaSysId + ': ' + e);
+            this._log('warn', 'PagerDutySync: OCRotationV2.getSpans() failed for rota ' + rotaSysId + ': ' + e);
         }
         this._rotaSpansCache[cacheKey] = result;
         return result;
@@ -1972,7 +2111,7 @@ PagerDutySync.prototype = {
                 }
             }
         } catch (e) {
-            gs.warn('PagerDutySync: OCRotationV2.getSpans() (forward fallback) failed for rota ' + rotaSysId + ': ' + e);
+            this._log('warn', 'PagerDutySync: OCRotationV2.getSpans() (forward fallback) failed for rota ' + rotaSysId + ': ' + e);
         }
         this._rotaSpansForwardCache[cacheKey] = result;
         return result;
@@ -2085,7 +2224,7 @@ PagerDutySync.prototype = {
             var dayEndUtc = this._localizedIso(candidates[i], '23:59:59', tzName);
             if (anchorUtcIso >= dayStartUtc && anchorUtcIso <= dayEndUtc) return candidates[i];
         }
-        gs.warn('PagerDutySync: could not resolve the local calendar date for anchor "' + anchorUtcIso +
+        this._log('warn', 'PagerDutySync: could not resolve the local calendar date for anchor "' + anchorUtcIso +
             '" in zone "' + tzName + '" (tried ' + candidates.join(', ') + '); leaving this event\'s member ' +
             'order unrotated rather than guessing at rotation-phase alignment');
         return null;
@@ -2201,7 +2340,7 @@ PagerDutySync.prototype = {
             if (/^\d+$/.test(raw) && parseInt(raw, 10) >= 1) {
                 result = parseInt(raw, 10);
             } else {
-                gs.warn('PagerDutySync: x_pd_integration.sync_escalation_delay_override is "' + raw +
+                this._log('warn', 'PagerDutySync: x_pd_integration.sync_escalation_delay_override is "' + raw +
                     '", not a whole number of minutes >= 1; ignoring it and using the rotas\' escalation delays');
             }
         }
@@ -2221,7 +2360,7 @@ PagerDutySync.prototype = {
         if (override !== null) return override;
         var m = /^\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})$/.exec(raw || '');
         if (!m) {
-            gs.error('PagerDutySync: unrecognized time_before_escalation format "' + raw + '"; defaulting delay to 1 minute');
+            this._log('error', 'PagerDutySync: unrecognized time_before_escalation format "' + raw + '"; defaulting delay to 1 minute');
             return 1;
         }
         var totalMinutes = (parseInt(m[1], 10) * 60) + parseInt(m[2], 10) + (parseInt(m[3], 10) / 60);
@@ -2268,7 +2407,7 @@ PagerDutySync.prototype = {
             if (catchAllTypes.hasOwnProperty(t2) && !this.HANDLED_CATCH_ALL_TYPES.hasOwnProperty(t2)) unhandled.push(t2);
         }
         if (unhandled.length > 0) {
-            gs.warn('catch_all type(s) [' + unhandled.join(', ') + '] found but not handled; no rule added for these');
+            this._log('warn', 'catch_all type(s) [' + unhandled.join(', ') + '] found but not handled; no rule added for these');
         }
 
         // group_manager takes priority over individual if a group's rotas somehow
@@ -2289,13 +2428,13 @@ PagerDutySync.prototype = {
             emailList.sort();
 
             if (emailList.length === 0) {
-                gs.warn("catch_all is 'group_manager' but group.manager.email is blank on every rota; using the fallback user");
+                this._noteFallback('catch_all_group_manager_has_no_email', 'catch-all (group manager)', '');
                 userId = this.FALLBACK_USER_ID;
             } else {
                 if (emailList.length > 1) {
-                    gs.warn('this group\'s rotas disagree on group.manager.email [' + emailList.join(', ') + ']; using the first');
+                    this._log('warn', 'this group\'s rotas disagree on group.manager.email [' + emailList.join(', ') + ']; using the first');
                 }
-                userId = this._resolveUser(emailList[0], emailToId).id;
+                userId = this._resolveUser(emailList[0], emailToId, 'catch-all (group manager)').id;
             }
         } else if (catchAllTypes.hasOwnProperty('individual')) {
             sourceRows = rowsByType.individual;
@@ -2309,13 +2448,13 @@ PagerDutySync.prototype = {
             memberEmailList.sort();
 
             if (memberEmailList.length === 0) {
-                gs.warn("catch_all is 'individual' but catch_all_member.email is blank on every rota; using the fallback user");
+                this._noteFallback('catch_all_individual_has_no_email', 'catch-all (individual)', '');
                 userId = this.FALLBACK_USER_ID;
             } else {
                 if (memberEmailList.length > 1) {
-                    gs.warn('this group\'s rotas disagree on catch_all_member.email [' + memberEmailList.join(', ') + ']; using the first');
+                    this._log('warn', 'this group\'s rotas disagree on catch_all_member.email [' + memberEmailList.join(', ') + ']; using the first');
                 }
-                userId = this._resolveUser(memberEmailList[0], emailToId).id;
+                userId = this._resolveUser(memberEmailList[0], emailToId, 'catch-all (individual)').id;
             }
         } else {
             return null; // only 'all' (or something newer/unrecognized) present -- logged above, not built
@@ -2352,7 +2491,7 @@ PagerDutySync.prototype = {
             if (tzName === null) tzName = rotaTz;
             var window = coverageWindows[rotaRow.sys_id];
             if (!window) {
-                gs.warn('no coverage window for "' + rotaRow.name + '" (' + groupName + ') while building its catch-all; ' +
+                this._log('warn', 'no coverage window for "' + rotaRow.name + '" (' + groupName + ') while building its catch-all; ' +
                     'building the catch-all as always-on for this rota');
                 window = this._defaultAlwaysOnWindow(tzName, []);
             }
@@ -2445,14 +2584,14 @@ PagerDutySync.prototype = {
             if (found[i].name === name) matches.push(found[i]);
         }
         if (matches.length > 1) {
-            gs.warn('found ' + matches.length + ' existing ' + endpoint + ' named "' + name + '"; using the first (' +
+            this._log('warn', 'found ' + matches.length + ' existing ' + endpoint + ' named "' + name + '"; using the first (' +
                 matches[0].id + ') and leaving the others as-is');
         }
         if (matches.length) {
             for (var a0 = 0; alternateNames && a0 < alternateNames.length; a0++) {
                 for (var f0 = 0; f0 < found.length; f0++) {
                     if (found[f0].name === alternateNames[a0]) {
-                        gs.info('note: ' + endpoint + ' "' + alternateNames[a0] + '" (' + found[f0].id + ') also exists alongside "' +
+                        this._log('info', 'note: ' + endpoint + ' "' + alternateNames[a0] + '" (' + found[f0].id + ') also exists alongside "' +
                             name + '" (' + matches[0].id + ') and is being left untouched -- it looks like a stale duplicate');
                     }
                 }
@@ -2516,7 +2655,7 @@ PagerDutySync.prototype = {
             if (found[i].summary === name) matches.push(found[i]);
         }
         if (matches.length > 1) {
-            gs.warn('found ' + matches.length + ' existing v3 schedules named "' + name + '"; using the first (' +
+            this._log('warn', 'found ' + matches.length + ' existing v3 schedules named "' + name + '"; using the first (' +
                 matches[0].id + ') and leaving the others as-is');
         }
         return matches.length ? matches[0] : null;
@@ -2563,11 +2702,11 @@ PagerDutySync.prototype = {
                     end_time: desiredOverrides[dov].endIso, user_id: desiredOverrides[dov].userId, snow_span: desiredOverrides[dov].spanSysId});
             }
             if (existing) {
-                gs.info('  [dry run] would UPDATE v3 schedule "' + name + '" (' + existing.id + ') with ' + events.length + ' event(s)' +
+                this._log('info', '  [dry run] would UPDATE v3 schedule "' + name + '" (' + existing.id + ') with ' + events.length + ' event(s)' +
                     (desiredOverrides.length ? ' and ' + desiredOverrides.length + ' coverage override(s)' : ''));
                 return existing.id;
             }
-            gs.info('  [dry run] would CREATE v3 schedule "' + name + '" with ' + events.length + ' event(s)' +
+            this._log('info', '  [dry run] would CREATE v3 schedule "' + name + '" with ' + events.length + ' event(s)' +
                 (desiredOverrides.length ? ' and ' + desiredOverrides.length + ' coverage override(s)' : ''));
             return this._nextPlaceholderId('schedule');
         }
@@ -2576,13 +2715,13 @@ PagerDutySync.prototype = {
         var scheduleId;
         if (existing) {
             scheduleId = existing.id;
-            gs.info('updating v3 schedule "' + name + '" -> ' + scheduleId);
+            this._log('info', 'updating v3 schedule "' + name + '" -> ' + scheduleId);
         } else {
             var createResult = this._v3WriteOrThrow(rest, 'post', 'v3/schedules', {
                 schedule: {name: name, time_zone: tzName, description: description}
             }).data;
             scheduleId = createResult.schedule.id;
-            gs.info('created v3 schedule "' + name + '" -> ' + scheduleId);
+            this._log('info', 'created v3 schedule "' + name + '" -> ' + scheduleId);
         }
 
         // v3 rotations are the analog of v2 schedule LAYERS, not a container that
@@ -2665,7 +2804,7 @@ PagerDutySync.prototype = {
         }
 
         if (existing) {
-            gs.info('  "' + name + '": found ' + existingRotations.length + ' existing rotation(s) (' + emptyRotationCount +
+            this._log('info', '  "' + name + '": found ' + existingRotations.length + ' existing rotation(s) (' + emptyRotationCount +
                 ' empty) with ' + eventsToEnd.length + ' active event(s); ending them and creating ' + events.length + ' event(s)');
         }
 
@@ -2676,7 +2815,7 @@ PagerDutySync.prototype = {
             if (this._v3EndEvent(rest, scheduleId, eventsToEnd[te].rotationId, eventsToEnd[te].event, nowIso)) {
                 endedCount++;
             } else {
-                gs.warn('PagerDutySync: could not end event "' + eventsToEnd[te].event.name + '" (' + eventsToEnd[te].event.id +
+                this._log('warn', 'PagerDutySync: could not end event "' + eventsToEnd[te].event.name + '" (' + eventsToEnd[te].event.id +
                     ') on "' + name + '"; deleting it instead (its past shifts are lost)');
                 this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/rotations/' + eventsToEnd[te].rotationId + '/events/' + eventsToEnd[te].event.id);
                 endFallbackDeletes++;
@@ -2694,7 +2833,7 @@ PagerDutySync.prototype = {
             for (var sd = 0; sd < surplusEmptyIds.length; sd++) {
                 this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/rotations/' + surplusEmptyIds[sd]);
             }
-            gs.info('  removed ' + surplusEmptyIds.length + ' surplus empty rotation(s) from "' + name + '"');
+            this._log('info', '  removed ' + surplusEmptyIds.length + ' surplus empty rotation(s) from "' + name + '"');
         }
 
         var rotationIdByEventName = {};
@@ -2711,9 +2850,9 @@ PagerDutySync.prototype = {
             }
             this._v3WriteOrThrow(rest, 'post', 'v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events', {event: desiredEvent});
             rotationIdByEventName[desiredEvent.name] = rotationId;
-            gs.info('  created event "' + desiredEvent.name + '" on schedule "' + name + '"');
+            this._log('info', '  created event "' + desiredEvent.name + '" on schedule "' + name + '"');
         }
-        gs.info('  "' + name + '": ended ' + endedCount + ' event(s)' + (endFallbackDeletes ? ' (' + endFallbackDeletes + ' deleted instead)' : '') +
+        this._log('info', '  "' + name + '": ended ' + endedCount + ' event(s)' + (endFallbackDeletes ? ' (' + endFallbackDeletes + ' deleted instead)' : '') +
             ', created ' + events.length + ' event(s) (' + reusedCount + ' in reused rotation(s), ' + newRotationCount + ' in new rotation(s))');
 
         // Coverage overrides go on last: they hang off a rotation id, and the delete/
@@ -2723,7 +2862,7 @@ PagerDutySync.prototype = {
         try {
             this._reconcileOverrides(rest, scheduleId, name, desiredOverrides, rotationIdByEventName, now);
         } catch (overrideError) {
-            gs.error('PagerDutySync: could not reconcile coverage overrides on "' + name + '" (' + scheduleId + '): ' + overrideError);
+            this._log('error', 'PagerDutySync: could not reconcile coverage overrides on "' + name + '" (' + scheduleId + '): ' + overrideError);
         }
 
         return scheduleId;
@@ -2778,19 +2917,19 @@ PagerDutySync.prototype = {
                 });
             }
         } catch (loadError) {
-            gs.warn('PagerDutySync: could not read roster_schedule_span for "' + groupName + '" (' + loadError +
+            this._log('warn', 'PagerDutySync: could not read roster_schedule_span for "' + groupName + '" (' + loadError +
                 '); coverage shifts will not be synced this run');
             return {};
         }
         var loadedRosters = 0, loadedSpans = 0;
         for (var lr in byRoster) { if (byRoster.hasOwnProperty(lr)) { loadedRosters++; loadedSpans += byRoster[lr].length; } }
-        gs.info('PagerDutySync: "' + groupName + '": ' + loadedSpans + ' current/future one-off coverage span(s) on ' + loadedRosters +
+        this._log('info', 'PagerDutySync: "' + groupName + '": ' + loadedSpans + ' current/future one-off coverage span(s) on ' + loadedRosters +
             ' roster(s) will be synced as PagerDuty overrides');
-        if (groupWideCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + groupWideCount + ' current/future coverage span(s) ' +
+        if (groupWideCount) this._log('warn', 'PagerDutySync: "' + groupName + '" has ' + groupWideCount + ' current/future coverage span(s) ' +
             'with no roster (group-wide); not synced to PagerDuty');
-        if (repeatingCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + repeatingCount + ' current/future REPEATING coverage ' +
+        if (repeatingCount) this._log('warn', 'PagerDutySync: "' + groupName + '" has ' + repeatingCount + ' current/future REPEATING coverage ' +
             'span(s); only one-off coverage is synced, these are not');
-        if (noUserCount) gs.warn('PagerDutySync: "' + groupName + '" has ' + noUserCount + ' current/future coverage span(s) with no ' +
+        if (noUserCount) this._log('warn', 'PagerDutySync: "' + groupName + '" has ' + noUserCount + ' current/future coverage span(s) with no ' +
             'resolvable user; not synced to PagerDuty');
         return byRoster;
     },
@@ -2817,7 +2956,7 @@ PagerDutySync.prototype = {
                 for (var s = 0; s < spans.length; s++) {
                     var resolved = this._resolveUser(spans[s].userEmail, emailToId);
                     if (!resolved.matched) {
-                        gs.warn('PagerDutySync: coverage span ' + spans[s].sys_id + ' (' + spans[s].userName + ', ' + spans[s].startIso +
+                        this._log('warn', 'PagerDutySync: coverage span ' + spans[s].sys_id + ' (' + spans[s].userName + ', ' + spans[s].startIso +
                             ' to ' + spans[s].endIso + ') on "' + scheduleName + '" skipped: no PagerDuty user with email ' + spans[s].userEmail);
                         continue;
                     }
@@ -2834,7 +2973,7 @@ PagerDutySync.prototype = {
         for (var rosterSysId in byRoster) {
             if (!byRoster.hasOwnProperty(rosterSysId) || this._appliedOverrideRosters[rosterSysId]) continue;
             var rosterRow = snow.rosterBySysId[rosterSysId];
-            gs.warn('PagerDutySync: ' + byRoster[rosterSysId].length + ' coverage span(s) on "' + groupName + '" roster "' +
+            this._log('warn', 'PagerDutySync: ' + byRoster[rosterSysId].length + ' coverage span(s) on "' + groupName + '" roster "' +
                 (rosterRow ? rosterRow.name : rosterSysId) + '" were not synced -- that roster has no rotation of its own in ' +
                 'PagerDuty (single named person, or folded into a simultaneous multi-roster event)');
         }
@@ -2884,7 +3023,7 @@ PagerDutySync.prototype = {
         for (var c = 0; c < toCreate.length; c++) {
             if (have.hasOwnProperty(toCreate[c].key)) continue;
             bodies.push(toCreate[c].body);
-            gs.info('  coverage override on "' + scheduleName + '": ' + toCreate[c].info.userName + ' covers "' +
+            this._log('info', '  coverage override on "' + scheduleName + '": ' + toCreate[c].info.userName + ' covers "' +
                 toCreate[c].info.eventName + '" ' + toCreate[c].info.startIso + ' to ' + toCreate[c].info.endIso +
                 ' (ServiceNow span ' + toCreate[c].info.spanSysId + ')');
         }
@@ -2893,7 +3032,7 @@ PagerDutySync.prototype = {
             created = bodies.length;
         }
         if (deleted || created) {
-            gs.info('  coverage overrides on "' + scheduleName + '": ' + created + ' created, ' + deleted + ' removed');
+            this._log('info', '  coverage overrides on "' + scheduleName + '": ' + created + ' created, ' + deleted + ' removed');
         }
     },
 
@@ -2904,7 +3043,7 @@ PagerDutySync.prototype = {
         var response = rest.deleteREST(endpoint);
         if (!response.haveError()) return true;
         if (response.getStatusCode() === 404) return false;
-        gs.error('PagerDutySync: v3 DELETE ' + endpoint + ' failed -- status ' + response.getStatusCode() +
+        this._log('error', 'PagerDutySync: v3 DELETE ' + endpoint + ' failed -- status ' + response.getStatusCode() +
             ', body: ' + response.getBody());
         throw new Error('v3 DELETE ' + endpoint + ' failed (status ' + response.getStatusCode() + '): ' + response.getBody());
     },
@@ -2928,7 +3067,7 @@ PagerDutySync.prototype = {
         body.effective_until = untilIso;
         var response = rest.putREST('v3/schedules/' + scheduleId + '/rotations/' + rotationId + '/events/' + event.id, {event: body});
         if (!response.haveError()) return true;
-        gs.warn('PagerDutySync: v3 PUT to end event ' + event.id + ' failed -- status ' + response.getStatusCode() + ', body: ' + response.getBody());
+        this._log('warn', 'PagerDutySync: v3 PUT to end event ' + event.id + ' failed -- status ' + response.getStatusCode() + ', body: ' + response.getBody());
         return false;
     },
 
@@ -2947,7 +3086,7 @@ PagerDutySync.prototype = {
             if (this._v3DeleteIfPresent(rest, 'v3/schedules/' + scheduleId + '/overrides/' + existingOverrides[x].id)) deleted++;
         }
         if (deleted) {
-            gs.info('  removed ' + deleted + ' override(s) on "' + scheduleName + '" ahead of deleting their rotation(s)');
+            this._log('info', '  removed ' + deleted + ' override(s) on "' + scheduleName + '" ahead of deleting their rotation(s)');
         }
     },
 
@@ -2983,12 +3122,12 @@ PagerDutySync.prototype = {
             // doesn't have), so the pause is a bounded busy-wait instead (see
             // _busyWaitMs).
             if (response.getStatusCode() === 404 && attempt < 5) {
-                gs.warn('PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' got 404 (attempt ' +
+                this._log('warn', 'PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' got 404 (attempt ' +
                     attempt + '/5) -- likely a just-created resource not visible yet; retrying shortly');
                 this._busyWaitMs(400);
                 return this._v3WriteOrThrow(rest, verb, endpoint, body, attempt + 1);
             }
-            gs.error('PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed -- status ' +
+            this._log('error', 'PagerDutySync: v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed -- status ' +
                 response.getStatusCode() + ', body: ' + response.getBody());
             throw new Error('v3 ' + verb.toUpperCase() + ' ' + endpoint + ' failed (status ' +
                 response.getStatusCode() + '): ' + response.getBody());
@@ -3017,17 +3156,17 @@ PagerDutySync.prototype = {
         var legacyName = name + ' (NEEDS REVIEW)';
         var existing = this._findByName('escalation_policies', name, [legacyName]);
         if (existing && existing.name === legacyName) {
-            gs.info('adopting existing policy "' + legacyName + '" (' + existing.id + ') as "' + name + '" -- renaming it in place');
+            this._log('info', 'adopting existing policy "' + legacyName + '" (' + existing.id + ') as "' + name + '" -- renaming it in place');
         }
         var action = existing ? 'update' : 'create';
         collected.escalation_policies.push({action: action, id: existing ? existing.id : null, payload: payload});
 
         if (dryRun) {
             if (existing) {
-                gs.info('[dry run] would UPDATE escalation policy "' + name + '" (' + existing.id + ')');
+                this._log('info', '[dry run] would UPDATE escalation policy "' + name + '" (' + existing.id + ')');
                 return existing.id;
             }
-            gs.info('[dry run] would CREATE escalation policy "' + name + '"');
+            this._log('info', '[dry run] would CREATE escalation policy "' + name + '"');
             return this._nextPlaceholderId('escalation_policy');
         }
 
@@ -3035,10 +3174,10 @@ PagerDutySync.prototype = {
         var result;
         if (existing) {
             result = rest.putRESTThrowable('escalation_policies/' + existing.id, payload).data;
-            gs.info('updated escalation policy "' + name + '" -> ' + result.escalation_policy.id);
+            this._log('info', 'updated escalation policy "' + name + '" -> ' + result.escalation_policy.id);
         } else {
             result = rest.postRESTThrowable('escalation_policies', payload).data;
-            gs.info('created escalation policy "' + name + '" -> ' + result.escalation_policy.id);
+            this._log('info', 'created escalation policy "' + name + '" -> ' + result.escalation_policy.id);
         }
         return result.escalation_policy.id;
     },
@@ -3050,14 +3189,13 @@ PagerDutySync.prototype = {
     _buildEscalationRule: function(rosterRow, rotaRow, snow, asOf, emailToId, dryRun, collected) {
         var memberRows = snow.membersByRosterSysId[rosterRow.sys_id] || [];
         if (!this._anyRosterHasActiveMembers([rosterRow], snow, asOf)) {
-            gs.warn('PagerDutySync: roster "' + rotaRow.name + ' / ' + rosterRow.name + '" (order ' + rosterRow.order +
-                ') has no active members; no escalation rule is built for it');
+            this._logEvent('warn', 'level_skipped', {rota: rotaRow.name, roster: rosterRow.name, order: rosterRow.order, reason: 'no_active_members'});
             return null;
         }
         var delayMinutes = this._parseDelayMinutes(rosterRow.time_before_escalation);
 
         if (this._isSingleIncumbent(memberRows)) {
-            var userId = this._pickDirectUser(memberRows, asOf, emailToId);
+            var userId = this._pickDirectUser(memberRows, asOf, emailToId, this._rosterContext(rotaRow.name, rosterRow.name));
             return {escalation_delay_in_minutes: delayMinutes, targets: [{id: userId, type: 'user_reference'}]};
         }
 
@@ -3081,7 +3219,7 @@ PagerDutySync.prototype = {
             var rotaRow = rotas[i];
             var rosterRows = (snow.rosterByRotaSysId[rotaRow.sys_id] || []).slice();
             if (rosterRows.length === 0) {
-                gs.warn(groupName + ' / ' + rotaRow.name + ' has no roster rows at all; skipping');
+                this._log('warn', groupName + ' / ' + rotaRow.name + ' has no roster rows at all; skipping');
                 continue;
             }
             var self = this;
@@ -3095,8 +3233,8 @@ PagerDutySync.prototype = {
             var catchAll = this._buildCatchAllRule([rotaRow], emailToId);
             if (catchAll) rules.push(catchAll);
             if (rules.length === 0) {
-                gs.warn('PagerDutySync: ' + groupName + ' / ' + rotaRow.name + ' has no roster with active members and no ' +
-                    'catch-all, so there is nothing to build; leaving its PagerDuty policy untouched');
+                this._logEvent('warn', 'policy_skipped', {group: groupName, rota: rotaRow.name, reason: 'no_staffed_roster_and_no_catch_all'},
+                    'nothing to build; its PagerDuty policy is left untouched');
                 continue;
             }
 
@@ -3154,8 +3292,8 @@ PagerDutySync.prototype = {
             var levelRosterRows = [];
             for (var le = 0; le < entries.length; le++) levelRosterRows.push(entries[le].rosterRow);
             if (!this._anyRosterHasActiveMembers(levelRosterRows, snow, asOf)) {
-                gs.warn('PagerDutySync: ' + groupName + ' level ' + orderKeys[k] + ' (' + levelLabel + ': ' +
-                    this._describeRosters(levelRosterRows, snow) + ') has no active members; no escalation rule is built for it');
+                this._logEvent('warn', 'level_skipped', {group: groupName, order: orderKeys[k], level: levelLabel,
+                    rosters: this._describeRosters(levelRosterRows, snow), reason: 'no_active_members'});
                 continue;
             }
             var targetTz = this._canonicalizeTimeZone(entries[0].rotaRow.schedule_time_zone);
@@ -3168,7 +3306,7 @@ PagerDutySync.prototype = {
 
                 var window = coverageWindows[rotaRow2.sys_id];
                 if (!window) {
-                    gs.warn('no coverage window for "' + rotaRow2.name + '" (' + groupName + ' / ' + levelLabel +
+                    this._log('warn', 'no coverage window for "' + rotaRow2.name + '" (' + groupName + ' / ' + levelLabel +
                         ') despite this group being classified follow_the_sun; building this event as always-on -- treat as a bug');
                     window = this._defaultAlwaysOnWindow(targetTz, memberRows);
                 }
@@ -3187,7 +3325,8 @@ PagerDutySync.prototype = {
         var catchAll = this._buildScopedCatchAllRule(groupName, rotas, coverageWindows, emailToId, dryRun, collected);
         if (catchAll) rules.push(catchAll);
         if (rules.length === 0) {
-            gs.warn('PagerDutySync: ' + groupName + ' has no level with active members and no catch-all; leaving its PagerDuty objects untouched');
+            this._logEvent('warn', 'group_skipped', {group: groupName, reason: 'no_level_with_active_members_and_no_catch_all'},
+                'PagerDuty objects left untouched');
             collected.skipped = 'no escalation level has active members; PagerDuty objects left untouched';
             return;
         }
@@ -3254,7 +3393,7 @@ PagerDutySync.prototype = {
             var distinctNames = [];
             for (var n in namesSeen) { if (namesSeen.hasOwnProperty(n)) distinctNames.push(n); }
             if (distinctNames.length > 1) {
-                gs.warn('"' + groupName + '" order=' + order + ' groups regions with different role names [' +
+                this._log('warn', '"' + groupName + '" order=' + order + ' groups regions with different role names [' +
                     distinctNames.join(', ') + '] into the same escalation rule/schedule because they share ' +
                     'this order value. If that\'s not intended, fix the order value on the mismatched roster ' +
                     'row(s) in cmn_rota_roster.');
@@ -3275,13 +3414,13 @@ PagerDutySync.prototype = {
             }
         }
         if (partialWeekRotas.length > 0) {
-            gs.info('NOTE: ' + groupName + ' has rota(s) with a partial-week coverage window [' +
+            this._log('info', 'NOTE: ' + groupName + ' has rota(s) with a partial-week coverage window [' +
                 partialWeekRotas.join(', ') + ']; excluded from the tiling check below.');
         }
         var totalHours = everyDaySeconds / 3600;
         if (Math.abs(totalHours - 24) <= 0.05) return;
         var detail = totalHours > 24 ? 'some regions likely overlap' : 'there is likely a gap';
-        gs.info('NOTE: ' + groupName + '\'s every-day rotas\' coverage windows sum to ' + totalHours.toFixed(1) +
+        this._log('info', 'NOTE: ' + groupName + '\'s every-day rotas\' coverage windows sum to ' + totalHours.toFixed(1) +
             'h, not a clean 24h -- ' + detail + '. Included as-is; worth confirming with whoever owns this rotation.');
     },
 
@@ -3311,11 +3450,11 @@ PagerDutySync.prototype = {
     //    in the same schedule.
     _buildBestEffortEscalationPolicy: function(groupName, snow, coverageWindows, asOf, dryRun, collected) {
         var emailToId = this._emailToIdCache || (this._emailToIdCache = this._pdGetAllUsers());
-        gs.info('NOTE: "' + groupName + '" classified needs_review -- this escalation policy is a best-effort approximation.');
+        this._log('info', 'NOTE: "' + groupName + '" classified needs_review -- this escalation policy is a best-effort approximation.');
 
         var rosterRows = snow.rostersForGroup();
         if (rosterRows.length === 0) {
-            gs.warn('no roster rows found for ' + groupName + '; nothing to build');
+            this._log('warn', 'no roster rows found for ' + groupName + '; nothing to build');
             return null;
         }
 
@@ -3327,7 +3466,7 @@ PagerDutySync.prototype = {
         var escalationOnlyRows = [];
         for (var i = 0; i < rosterRows.length; i++) {
             var row = rosterRows[i];
-            var isEscalationOnly = rotaRosterCounts[row.rota_sys_id] === 1 && /escalation/i.test(row.name);
+            var isEscalationOnly = this._isEscalationOnlyRoster(row, rotaRosterCounts[row.rota_sys_id]);
             if (isEscalationOnly) {
                 escalationOnlyRows.push(row);
             } else {
@@ -3337,7 +3476,7 @@ PagerDutySync.prototype = {
         if (escalationOnlyRows.length > 0) {
             var escalationOnlyNames = [];
             for (var n = 0; n < escalationOnlyRows.length; n++) escalationOnlyNames.push(escalationOnlyRows[n].name);
-            gs.info('NOTE: ' + groupName + ': treating single-tier roster(s) named like an escalation contact as a ' +
+            this._log('info', 'NOTE: ' + groupName + ': treating single-tier roster(s) named like an escalation contact as a ' +
                 'later escalation rule, not the same tier as multi-tier "on shift" rosters: [' +
                 escalationOnlyNames.join(', ') + ']');
         }
@@ -3350,7 +3489,8 @@ PagerDutySync.prototype = {
         var catchAll = this._buildCatchAllRule(snow.rotasForGroup(), emailToId);
         if (catchAll) rules.push(catchAll);
         if (rules.length === 0) {
-            gs.warn('PagerDutySync: ' + groupName + ' has no level with active members and no catch-all; leaving its PagerDuty objects untouched');
+            this._logEvent('warn', 'group_skipped', {group: groupName, reason: 'no_level_with_active_members_and_no_catch_all'},
+                'PagerDuty objects left untouched');
             collected.skipped = 'no escalation level has active members; PagerDuty objects left untouched';
             return null;
         }
@@ -3408,8 +3548,8 @@ PagerDutySync.prototype = {
     // above _buildBestEffortEscalationPolicy and ASSUMPTION 2 in the file header).
     _buildRuleForLevel: function(scheduleNamePrefix, orderValue, rowsAtLevel, snow, coverageWindows, asOf, emailToId, dryRun, collected) {
         if (!this._anyRosterHasActiveMembers(rowsAtLevel, snow, asOf)) {
-            gs.warn('PagerDutySync: ' + scheduleNamePrefix + ' level ' + orderValue + ' (' + this._describeRosters(rowsAtLevel, snow) +
-                ') has no active members; no escalation rule is built for it');
+            this._logEvent('warn', 'level_skipped', {prefix: scheduleNamePrefix, order: orderValue,
+                rosters: this._describeRosters(rowsAtLevel, snow), reason: 'no_active_members'});
             return null;
         }
         var allSingleIncumbent = true;
@@ -3421,6 +3561,19 @@ PagerDutySync.prototype = {
         var delayMinutes = 1;
         for (var d = 0; d < rowsAtLevel.length; d++) {
             delayMinutes = Math.max(delayMinutes, this._parseDelayMinutes(rowsAtLevel[d].time_before_escalation));
+        }
+
+        if (allSingleIncumbent) {
+            // A direct user target is on call around the clock. That is only right when the roster's
+            // coverage is round-the-clock too; a region that covers only its own hours must stay a
+            // windowed schedule, otherwise every region's named person is paged at all hours.
+            for (var w = 0; w < rowsAtLevel.length; w++) {
+                var rowWindow = coverageWindows[rowsAtLevel[w].rota_sys_id];
+                if (rowWindow && !(rowWindow.days.length === 7 && rowWindow.durationSeconds >= 86399)) {
+                    allSingleIncumbent = false;
+                    break;
+                }
+            }
         }
 
         if (allSingleIncumbent) {
@@ -3439,14 +3592,18 @@ PagerDutySync.prototype = {
             var seenUserIds = {};
             for (var s = 0; s < rowsAtLevel.length; s++) {
                 var memberRows = snow.membersByRosterSysId[rowsAtLevel[s].sys_id] || [];
-                var candidate = this._pickDirectUser(memberRows, asOf, emailToId);
+                var candidate = this._pickDirectUser(memberRows, asOf, emailToId,
+                    this._rosterContext((snow.rotaBySysId[rowsAtLevel[s].rota_sys_id] || {}).name, rowsAtLevel[s].name));
                 if (candidate === this.FALLBACK_USER_ID || seenUserIds.hasOwnProperty(candidate)) continue;
                 seenUserIds[candidate] = true;
                 targets.push({id: candidate, type: 'user_reference'});
             }
-            if (targets.length === 0) targets = [{id: this.FALLBACK_USER_ID, type: 'user_reference'}];
+            if (targets.length === 0) {
+                this._noteFallback('no_one_at_this_level_resolved', 'level ' + orderValue + ' of ' + scheduleNamePrefix, '');
+                targets = [{id: this.FALLBACK_USER_ID, type: 'user_reference'}];
+            }
             if (targets.length > 10) {
-                gs.warn('PagerDutySync: ' + scheduleNamePrefix + ' order=' + orderValue + ' has ' + targets.length +
+                this._log('warn', 'PagerDutySync: ' + scheduleNamePrefix + ' order=' + orderValue + ' has ' + targets.length +
                     ' distinct single-incumbent people -- PagerDuty escalation rules cap targets at 10; keeping ' +
                     'the first 10 and dropping the rest (' + (targets.length - 10) + ' person(s) not represented)');
                 targets = targets.slice(0, 10);
@@ -3464,7 +3621,7 @@ PagerDutySync.prototype = {
             var sharedWindow = coverageWindows[group[0].rota_sys_id];
             var groupNames = [];
             for (var gi = 0; gi < group.length; gi++) groupNames.push(group[gi].name);
-            gs.info('NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': detected an alternating group ' +
+            this._log('info', 'NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': detected an alternating group ' +
                 '(repeat_count=' + sharedWindow.repeatCount + ') -- built as one rotating v3 event: [' +
                 groupNames.join(', ') + ']');
             events.push(this._buildAlternatingEvent(group, sharedWindow, snow, asOf, emailToId, targetTz));
@@ -3476,7 +3633,7 @@ PagerDutySync.prototype = {
             var identWindow = coverageWindows[identGroup[0].rota_sys_id];
             var identNames = [];
             for (var ii = 0; ii < identGroup.length; ii++) identNames.push(identGroup[ii].name);
-            gs.info('NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': rows share an identical coverage ' +
+            this._log('info', 'NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': rows share an identical coverage ' +
                 'window and anchor -- built as one simultaneous (every_member) v3 event: [' + identNames.join(', ') + ']');
             events.push(this._buildEveryMemberEvent(identGroup, identWindow, snow, asOf, emailToId, targetTz, identNames.join(' + ')));
         }

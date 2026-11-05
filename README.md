@@ -153,6 +153,7 @@ Install from a **built update set** (published in this repo under [`update_set/`
    | 6 Business Rules: five "PagerDuty Sync Pending - *" and "PagerDuty Sync Group - Unique Group" | System Definition > Business Rules | active |
    | Scheduled Jobs: "PagerDuty Sync - Process Pending" and "PagerDuty Sync - Nightly Catch-All" | System Definition > Scheduled Jobs | Process Pending **Inactive** (every hour), Nightly Active (daily at 02:00) |
    | Application menu "PagerDuty Sync" > "PagerDuty Sync Groups" | left navigator | opens the enrollment list |
+   | Module "PagerDuty Sync" > "PagerDuty Sync Log" | left navigator (role `admin`) | opens System Logs filtered to the sync's lines, newest first |
 
    If the Scheduled Jobs are missing, run `fix_script_create_sync_queue_rules_and_jobs.js` (see [Fix scripts](#fix-scripts)).
 7. **Enroll one pilot group** (see [Enrolling groups](#enrolling-groups)).
@@ -224,8 +225,33 @@ Each enrollment row records the outcome of its last sync:
 | Running since | A sync is in progress (a lock older than 15 minutes is treated as stale) |
 | Retry after / Consecutive failures | Backoff after failures: 5, then 15, then 60 minutes |
 
-Detail is in **System Logs** (filter *Message* starting with `PagerDutySync`). Every run begins with a line giving the
-version of `PagerDutySync` that actually ran and the server time, which tells you unambiguously which copy executed.
+Detail is in the log; see [Finding a sync's log lines](#finding-a-syncs-log-lines) below.
+
+### Finding a sync's log lines
+
+Every line the sync writes has the same shape, so one search finds all of it:
+
+- **Source is `PagerDutySync`.** Open **PagerDuty Sync > PagerDuty Sync Log** (or System Logs > System Log > All and filter on
+  *Source*). To export, right-click a column header and choose *Export > XML* (or CSV); add a *Created* range to keep it small.
+- **Every message starts with `[PDSync <version> <run id> <group>] #<line> `**, for example
+  `[PDSync v24.5 3fa91c Global SQLDBA ADMIN] #014 event=classified ...`. The *run id* is the same on every line of one run, so
+  filtering *Message starts with* `[PDSync v24.5 3fa91c` pulls out exactly that sync even from an export without the Source column.
+  The `#` number keeps the lines in order. A run of the scheduled job covers several groups under one run id; each line names its group.
+- **The first line of a run is `event=run_start`**, with the exact version of `PagerDutySync` that ran and the server time. It tells you
+  unambiguously which copy of the script executed.
+- **Decisions are `event=<name> key=value ...` lines**, so they are easy to search for:
+
+  | `event=` | Means |
+  |---|---|
+  | `run_start` | A sync began: entry point, version, server time |
+  | `classified` | The group's shape (`single_region`, `follow_the_sun`, `needs_review`) and why |
+  | `roster_ignored`, `rota_ignored` | A roster (or rota) with no active members was left out |
+  | `level_skipped`, `policy_skipped`, `group_skipped` | An escalation level, a policy or the whole group was not built, and why |
+  | `fallback_user` | The fallback user stood in for someone. Says why (`member_has_no_email`, `no_pagerduty_user_with_this_email`, `no_active_members`, a catch-all with no email), where (the roster or step), and the email. Once per run per case |
+  | `group_complete` | A group's sync finished: mode (`dry_run` or `live`) and how many schedules, policies and overrides |
+  | `payload` | The full JSON of what was (or would be) written. One very long line |
+
+- Other lines are plain text after the `#` number (what was created or updated, notes on rotation alignment, warnings).
 
 ### Rules of the road
 
@@ -234,13 +260,21 @@ version of `PagerDutySync` that actually ran and the server time, which tells yo
 - Each sync **ends** the live events on a schedule and creates replacements (see [Architecture notes](#architecture-notes)), so a
   PagerDuty schedule's history shows one ended event per sync.
 - Time off isn't synced; one-off "Provide coverage" shifts are.
-- An escalation level whose rosters have **no active members** (empty, all ended, or not yet started) gets no rule; PagerDuty's
-  escalation simply moves on to the next level. The log says which roster it was. A level where only some regions have coverage is
-  still built, and PagerDuty falls through it outside those regions' hours.
+- A roster with **no active members** (none added, all ended, or none started yet) is **ignored**: it doesn't count towards how
+  the group is classified, doesn't make an escalation level, and never gets a fallback-user stand-in. The log says
+  `event=roster_ignored group=<group> rota=<rota> roster=<roster> order=N reason=no_active_members`. A rota left with no staffed roster is ignored the same
+  way. If every roster of a group is empty, the sync is skipped and PagerDuty is left as it was.
+- A level that only some regions staff is built from those regions' rosters. In the other regions' hours nobody is on call at that
+  level, and PagerDuty moves on to the next one.
+- Which members are active depends only on their *From* / *To* dates. A member's *Order* only sets rotation position, and any value
+  is valid: rosters that start a new group of members on a later date commonly number them 1001, 1002 ... so they don't clash with the
+  earlier ones.
 
 ## Troubleshooting
 
-Start with the enrollment row (*Last sync result* / *message*) and then System Logs, filtered on `PagerDutySync`.
+Start with the enrollment row (*Last sync result* / *message*) and then the log: **PagerDuty Sync > PagerDuty Sync Log**, or System
+Logs with *Source* is `PagerDutySync` (see [Finding a sync's log lines](#finding-a-syncs-log-lines)). Search for `event=fallback_user`,
+`event=classified` and `event=...ignored` / `...skipped` first: they explain most surprises.
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
@@ -257,9 +291,10 @@ Start with the enrollment row (*Last sync result* / *message*) and then System L
 | Log: `x_pd_integration.default_user is not set` | Fallback user missing | Set the property to a PagerDuty user id |
 | Someone shows as the fallback user in PagerDuty | No PagerDuty user with that email | Create or fix the PagerDuty user's email (case-insensitive match) |
 | A coverage span isn't applied; log warns about it | Covering user has no PagerDuty match; or it is a repeating, group-wide, or time-off span | See [Coverage overrides](#coverage-overrides-provide-coverage) |
-| Group classified `needs_review` | Regions have different numbers of escalation levels, or a rota has no usable coverage window | Still synced best-effort, flagged "NEEDS REVIEW" in the policy description. Align the levels or give each rota a coverage span |
+| Group classified `needs_review` | A rota looks like an escalation-only tier (a single roster named like "Escalation only ...") next to rotas with more levels, or a rota has no usable coverage window | Still synced best-effort, flagged "NEEDS REVIEW" in the policy description. Align the levels or give each rota a coverage span |
 | On-call order in PagerDuty differs from ServiceNow | Rotation alignment fell back to date math | Look for `ground-truth check` in the log; see [Rotation phase alignment](#rotation-phase-alignment) |
-| A level you expected is missing from the PagerDuty policy; log: `... has no active members; no escalation rule is built for it` | Every roster at that order level has no member in force today (none added, all ended, not yet started, or only placeholder-order members) | Add a member to the roster, or deactivate the roster if it is not used. A level where some regions have coverage and others don't is built normally |
+| A roster or level you expected is missing from the PagerDuty policy; log: `event=roster_ignored ... reason=no_active_members` | The roster has no member whose From/To dates cover today | Add a member (or fix their From/To dates), or deactivate the roster if it is not used |
+| Several people are paged at once at a level that should follow the sun | The group is `needs_review` and the level's rosters each name one person but cover only part of the day | Update to 24.4+: such levels are built as a windowed schedule. Otherwise check why the group is `needs_review` |
 | Sync buttons are missing | You don't have role `x_pd_integration.admin`; or (Sync This) the group isn't enrolled | Grant the role (or change the UI Actions' Condition); enroll the group |
 | Sync buttons do nothing | Event or Script Action missing/inactive, or event queue latency (seconds) | Check Event Registry `pagerduty_sync.requested` and the Script Action; check System Logs > Events |
 | Escalation delays in PagerDuty are all the same, and not what the rotas say | `x_pd_integration.sync_escalation_delay_override` is set | Clear the property and sync again, or leave it if that is intended |
@@ -326,7 +361,7 @@ The top-level `.js` files are the **source of truth for every script**. `src/**/
 flowchart TB
   A["Edit top-level .js<br/>or src/**/*.yaml"] --> B["npm test<br/>(src in sync, packager checks)"]
   B --> C["npm run package<br/>sync-to-src + build"]
-  C --> D["update_set/<br/>PagerDuty Sync v24.3.xml"]
+  C --> D["update_set/<br/>PagerDuty Sync v24.5.xml"]
   D --> E["Import on a clean instance<br/>Preview, Commit, dry run, live sync"]
   E --> F["git commit + tag<br/>push to GitHub"]
   F --> G["GitHub release<br/>attach the XML"]
