@@ -10,9 +10,17 @@ const vm = require('vm');
 const SOURCE = fs.readFileSync(path.join(__dirname, '..', '..', 'PagerDutySync.js'), 'utf8');
 
 class GlideDateTime {
-  constructor(s) { this.s = s; }
-  compareTo(o) { return this.s < o.s ? -1 : this.s > o.s ? 1 : 0; }
-  getValue() { return this.s || '2026-11-04 12:00:00'; }
+  constructor(v) {
+    if (v instanceof GlideDateTime) { this.ms = v.ms; return; }
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?/.exec(String(v || '2026-11-04 12:00:00'));
+    this.ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  }
+  compareTo(o) { return this.ms < o.ms ? -1 : this.ms > o.ms ? 1 : 0; }
+  addSeconds(n) { this.ms += n * 1000; }
+  getValue() {
+    const d = new Date(this.ms), p = (n) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+  }
 }
 const AS_OF = new GlideDateTime('2026-11-04 12:00:00');
 const ALWAYS = { days: [1, 2, 3, 4, 5, 6, 7], durationSeconds: 86400, anchorUtcIso: 'x', repeatCount: 1 };
@@ -42,7 +50,7 @@ function build(rotas, groupName) {
   const rotaBySysId = {}, rosterBySysId = {}, rosterByRotaSysId = {}, membersByRosterSysId = {}, windows = {}, emails = {};
   rotas.forEach((r, ri) => {
     const id = 'rota' + ri;
-    rotaBySysId[id] = { sys_id: id, name: r.name, group: groupName, schedule_time_zone: 'UTC', catch_all: '',
+    rotaBySysId[id] = { sys_id: id, name: r.name, group: groupName, schedule_sys_id: 'sched' + ri, schedule_time_zone: r.tz || 'UTC', catch_all: '',
       catch_all_wait_time: '', catch_all_member_email: '', use_custom_escalation: false, group_manager_email: '' };
     windows[id] = r.window || ALWAYS;
     rosterByRotaSysId[id] = [];
@@ -65,17 +73,21 @@ function build(rotas, groupName) {
 }
 
 // Runs the real _syncOneGroup with data loading, event building and PagerDuty calls stubbed.
-function sync(rotas) {
+function sync(rotas, opts) {
+  opts = opts || {};
   const { sync: s, logs } = load();
   const { snow, windows, emails } = build(rotas, 'G');
+  const windowForSchedule = {};
+  Object.keys(snow.rotaBySysId).forEach((id) => { windowForSchedule[snow.rotaBySysId[id].schedule_sys_id] = windows[id]; });
   const out = { schedules: [], escalation_policies: [], overrides: [] };
   s._loadSnowData = () => snow;
-  s._loadCoverageWindows = () => windows;
+  s._computeCoverageWindow = (scheduleSysId) => Object.assign({}, windowForSchedule[scheduleSysId]); // real _loadCoverageWindows adds .tz
   s._dropExpiredRotas = () => {}; s._loadRosterOverrides = () => ({}); s._warnUnappliedOverrides = () => {};
   s._pdGetAllUsers = () => emails; s._emailToIdCache = emails;
-  s._buildEvent = (row, rota) => ({ rota: rota.name, roster: row.name });
+  s._buildEvent = (row, rota, members, window, asOf, emails2, tz) => ({ rota: rota.name, roster: row.name, tz });
+  s._buildEveryMemberEvent = (rows, window, snow2, asOf, emails2, tz, name) => ({ rota: name, roster: 'every_member', tz });
   s._detectAlternatingGroups = (rows) => ({ alternatingGroups: [], remainingRows: rows });
-  s._detectIdenticalGroups = (rows) => ({ identicalGroups: [], remaining: rows });
+  if (!opts.realIdenticalDetection) s._detectIdenticalGroups = (rows) => ({ identicalGroups: [], remaining: rows });
   s._upsertScheduleV3 = (name, tz, d, events) => { out.schedules.push({ name, events }); return 'SCHED:' + name.replace(/^\[.*?\] /, ''); };
   s._buildScopedCatchAllRule = () => null;
   s._upsertEscalationPolicy = (p) => { out.escalation_policies.push(p); };
@@ -246,5 +258,64 @@ describe('PagerDutySync: logging', () => {
     s._logVersionAndStart('x');
     assert.strictEqual(s._pickDirectUser([], AS_OF, {}, 'roster "EMEA / Escalation"'), 'FALLBACK');
     assert.ok(logs.some((l) => /event=fallback_user reason=no_active_members context="roster \\"EMEA \/ Escalation\\""/.test(l)), logs.join('\n'));
+  });
+});
+
+describe('PagerDutySync: each event is built in its own rota\'s time zone', () => {
+  const esc = (name, tz, window) => ({ name, tz, window: window || EIGHT_HOURS,
+    rosters: [{ name: 'Escalation only CAL', order: 100, members: [person(name.replace(/\W+/g, ''))] }] });
+  const tzOf = (r, rota) => {
+    const all = [].concat.apply([], r.out.schedules.map((sc) => plain(sc.events)));
+    return all.filter((e) => e.rota === rota).map((e) => e.tz);
+  };
+
+  it('Wintel escalation tier: every rota keeps its own zone (PagerDuty rejects Asia/Manila, so it is mapped to Singapore)', () => {
+    const r = sync([
+      region('Shift 1', [100, 200], EIGHT_HOURS), region('Shift 2', [100, 200], EIGHT_HOURS),
+      esc('Escalation CECM LATAM', 'Mexico/General'), esc('Escalation CECP Manila', 'Asia/Manila'),
+      esc('Management Escalation EMEA', 'Europe/London'), esc('Management Escalation NA', 'US/Eastern'),
+    ]);
+    assert.match(r.classified, /needs_review/);
+    assert.deepStrictEqual(tzOf(r, 'Escalation CECM LATAM'), ['America/Mexico_City']);
+    assert.deepStrictEqual(tzOf(r, 'Escalation CECP Manila'), ['Asia/Singapore']);
+    assert.deepStrictEqual(tzOf(r, 'Management Escalation EMEA'), ['Europe/London']);
+    assert.deepStrictEqual(tzOf(r, 'Management Escalation NA'), ['America/New_York']);
+  });
+
+  it('follow-the-sun levels: each region\'s event uses that region\'s zone', () => {
+    const regionIn = (name, tz) => Object.assign(region(name, [100, 200], EIGHT_HOURS), { tz });
+    const r = sync([regionIn('Americas', 'US/Eastern'), regionIn('EMEA', 'Europe/London'), regionIn('APAC', 'Asia/Manila')]);
+    assert.match(r.classified, /follow_the_sun/);
+    assert.deepStrictEqual(tzOf(r, 'Americas'), ['America/New_York', 'America/New_York']);
+    assert.deepStrictEqual(tzOf(r, 'EMEA'), ['Europe/London', 'Europe/London']);
+    assert.deepStrictEqual(tzOf(r, 'APAC'), ['Asia/Singapore', 'Asia/Singapore']);
+  });
+
+  it('rotas with identical windows share one simultaneous event only when they share a zone', () => {
+    const same = sync([region('Shift', [100, 200], EIGHT_HOURS), esc('Escalation A', 'Asia/Manila'), esc('Escalation B', 'Asia/Singapore')], { realIdenticalDetection: true });
+    const merged = [].concat.apply([], same.out.schedules.map((sc) => plain(sc.events))).filter((e) => e.roster === 'every_member');
+    assert.strictEqual(merged.length, 1, 'Manila and Singapore are the same zone, so they merge');
+    assert.strictEqual(merged[0].tz, 'Asia/Singapore');
+
+    const differ = sync([region('Shift', [100, 200], EIGHT_HOURS), esc('Escalation A', 'Europe/London'), esc('Escalation B', 'America/New_York')], { realIdenticalDetection: true });
+    const none = [].concat.apply([], differ.out.schedules.map((sc) => plain(sc.events))).filter((e) => e.roster === 'every_member');
+    assert.strictEqual(none.length, 0, 'identical UTC windows in zones with different daylight saving must stay separate events');
+    assert.deepStrictEqual(tzOf(differ, 'Escalation A'), ['Europe/London']);
+    assert.deepStrictEqual(tzOf(differ, 'Escalation B'), ['America/New_York']);
+  });
+
+  it('the scoped catch-all schedule builds each rota\'s event in that rota\'s zone', () => {
+    const { sync: s } = load();
+    const emails = { 'm@x.com': 'MGR' };
+    const rotas = [
+      { sys_id: 'r1', name: 'NA', schedule_time_zone: 'US/Eastern', catch_all: 'group_manager', group_manager_email: 'm@x.com' },
+      { sys_id: 'r2', name: 'EMEA', schedule_time_zone: 'Europe/London', catch_all: 'group_manager', group_manager_email: 'm@x.com' },
+    ];
+    const windows = { r1: Object.assign({}, EIGHT_HOURS, { anchorUtcIso: '2025-04-02T13:00:00Z', startTimeOfDay: '13:00:00' }),
+      r2: Object.assign({}, EIGHT_HOURS, { anchorUtcIso: '2025-03-31T08:00:00Z', startTimeOfDay: '08:00:00' }) };
+    let built;
+    s._upsertScheduleV3 = (name, tz, d, events) => { built = plain(events); return 'S'; };
+    s._buildScopedCatchAllRule('G', rotas, windows, emails, true, {});
+    assert.deepStrictEqual(built.map((e) => e.start_time.time_zone), ['America/New_York', 'Europe/London']);
   });
 });

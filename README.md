@@ -361,7 +361,7 @@ The top-level `.js` files are the **source of truth for every script**. `src/**/
 flowchart TB
   A["Edit top-level .js<br/>or src/**/*.yaml"] --> B["npm test<br/>(src in sync, packager checks)"]
   B --> C["npm run package<br/>sync-to-src + build"]
-  C --> D["update_set/<br/>PagerDuty Sync v24.5.xml"]
+  C --> D["update_set/<br/>PagerDuty Sync v24.6.xml"]
   D --> E["Import on a clean instance<br/>Preview, Commit, dry run, live sync"]
   E --> F["git commit + tag<br/>push to GitHub"]
   F --> G["GitHub release<br/>attach the XML"]
@@ -703,6 +703,13 @@ sync (it survives the event delete/recreate), and removed when the span was dele
   day/time patterns actually conflict, checking only the effective_since/
   effective_until window. So each distinct shift pattern this port needs to express
   gets its own rotation inside the schedule, not its own schedule.
+- **Every event is built in its own rota's time zone.** PagerDuty evaluates an event's recurrence, weekdays and daylight saving, in
+  the event's own `time_zone`, not in the schedule's. A schedule that covers several regions (an escalation tier of regional
+  managers, a follow-the-sun level) therefore gets each event in the zone of the rota it came from (confirmed against
+  PagerDuty: with one shared zone, a 09:00-17:00 London window stayed 08:00-16:00 UTC through the winter, and a Manila window fell
+  on Tue-Sat). Zone names PagerDuty rejects are mapped first (`Asia/Manila` becomes `Asia/Singapore`, `US/Eastern` becomes
+  `America/New_York`; see `TZ_CANONICAL_ALIASES`). Rotas are only merged into one event (alternating pairs, simultaneous
+  windows) when they also share a zone. The schedule's own zone is the first rota's and is cosmetic.
 - **`assignment_strategy` replaces two v2-model workarounds natively**:
   `rotating_member_assignment_strategy` (with `shifts_per_member`) expresses
   alternating-team rotations (e.g. week-on/week-off pairs), and

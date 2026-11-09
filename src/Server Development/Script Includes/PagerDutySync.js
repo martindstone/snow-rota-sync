@@ -10,7 +10,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v24.5-2026-11-04-ignore-empty-rosters-and-logging';
+        this.VERSION = 'v24.6-2026-11-09-events-in-their-own-time-zone';
 
         // Which groups this port manages is data now, not code -- see isEnrolled()
         // and _enrolledGroupNames() below, which read the u_pagerduty_sync_group
@@ -902,6 +902,10 @@ PagerDutySync.prototype = {
             var state = {expiredSpans: 0};
             var window = this._computeCoverageWindow(rota.schedule_sys_id, rota.name, asOf, state);
             if (window) {
+                // The zone this rota's own times and weekdays are in. Events built from this window use it, not
+                // some other rota's: PagerDuty evaluates an event's recurrence (weekdays and daylight saving) in the
+                // event's own time_zone.
+                window.tz = this._canonicalizeTimeZone(rota.schedule_time_zone);
                 ownWindow[rota.sys_id] = window;
             } else if (state.expiredSpans > 0 && expiredRotaIds) {
                 expiredRotaIds[rota.sys_id] = true;
@@ -2493,12 +2497,12 @@ PagerDutySync.prototype = {
             if (!window) {
                 this._log('warn', 'no coverage window for "' + rotaRow.name + '" (' + groupName + ') while building its catch-all; ' +
                     'building the catch-all as always-on for this rota');
-                window = this._defaultAlwaysOnWindow(tzName, []);
+                window = this._defaultAlwaysOnWindow(rotaTz, []);
             }
             events.push({
                 name: rotaRow.name + ' - catch-all',
-                start_time: this._zonedDateTime(window.anchorUtcIso, tzName),
-                end_time: this._zonedDateTime(this._addSecondsToUtcIso(window.anchorUtcIso, window.durationSeconds), tzName),
+                start_time: this._zonedDateTime(window.anchorUtcIso, rotaTz),
+                end_time: this._zonedDateTime(this._addSecondsToUtcIso(window.anchorUtcIso, window.durationSeconds), rotaTz),
                 effective_since: window.anchorUtcIso,
                 recurrence: [this._rruleForWindow(window)],
                 assignment_strategy: {
@@ -3308,9 +3312,10 @@ PagerDutySync.prototype = {
                 if (!window) {
                     this._log('warn', 'no coverage window for "' + rotaRow2.name + '" (' + groupName + ' / ' + levelLabel +
                         ') despite this group being classified follow_the_sun; building this event as always-on -- treat as a bug');
-                    window = this._defaultAlwaysOnWindow(targetTz, memberRows);
+                    window = this._defaultAlwaysOnWindow(this._canonicalizeTimeZone(rotaRow2.schedule_time_zone), memberRows);
+                    window.tz = this._canonicalizeTimeZone(rotaRow2.schedule_time_zone);
                 }
-                events.push(this._buildEvent(rosterRow, rotaRow2, memberRows, window, asOf, emailToId, targetTz));
+                events.push(this._buildEvent(rosterRow, rotaRow2, memberRows, window, asOf, emailToId, window.tz || targetTz));
                 maxDelay = Math.max(maxDelay, this._parseDelayMinutes(rosterRow.time_before_escalation));
             }
 
@@ -3624,7 +3629,7 @@ PagerDutySync.prototype = {
             this._log('info', 'NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': detected an alternating group ' +
                 '(repeat_count=' + sharedWindow.repeatCount + ') -- built as one rotating v3 event: [' +
                 groupNames.join(', ') + ']');
-            events.push(this._buildAlternatingEvent(group, sharedWindow, snow, asOf, emailToId, targetTz));
+            events.push(this._buildAlternatingEvent(group, sharedWindow, snow, asOf, emailToId, sharedWindow.tz || targetTz));
         }
 
         var ident = this._detectIdenticalGroups(alt.remainingRows, coverageWindows);
@@ -3635,15 +3640,20 @@ PagerDutySync.prototype = {
             for (var ii = 0; ii < identGroup.length; ii++) identNames.push(identGroup[ii].name);
             this._log('info', 'NOTE: ' + scheduleNamePrefix + ' order=' + orderValue + ': rows share an identical coverage ' +
                 'window and anchor -- built as one simultaneous (every_member) v3 event: [' + identNames.join(', ') + ']');
-            events.push(this._buildEveryMemberEvent(identGroup, identWindow, snow, asOf, emailToId, targetTz, identNames.join(' + ')));
+            events.push(this._buildEveryMemberEvent(identGroup, identWindow, snow, asOf, emailToId, identWindow.tz || targetTz, identNames.join(' + ')));
         }
 
         for (var rr = 0; rr < ident.remaining.length; rr++) {
             var row = ident.remaining[rr];
             var rotaRow = snow.rotaBySysId[row.rota_sys_id];
             var memberRows2 = snow.membersByRosterSysId[row.sys_id] || [];
-            var window = coverageWindows[row.rota_sys_id] || this._defaultAlwaysOnWindow(targetTz, memberRows2);
-            events.push(this._buildEvent(row, rotaRow, memberRows2, window, asOf, emailToId, targetTz));
+            var rowTz = this._canonicalizeTimeZone(rotaRow.schedule_time_zone);
+            var window = coverageWindows[row.rota_sys_id];
+            if (!window) {
+                window = this._defaultAlwaysOnWindow(rowTz, memberRows2);
+                window.tz = rowTz;
+            }
+            events.push(this._buildEvent(row, rotaRow, memberRows2, window, asOf, emailToId, window.tz || targetTz));
         }
 
         var scheduleName = this._syncedName(scheduleNamePrefix + ' - level ' + orderValue);
@@ -3654,7 +3664,7 @@ PagerDutySync.prototype = {
 
     _shapeKey: function(window) {
         if (!window) return null;
-        return window.days.join(',') + '|' + window.startTimeOfDay + '|' + window.durationSeconds;
+        return window.days.join(',') + '|' + window.startTimeOfDay + '|' + window.durationSeconds + '|' + (window.tz || '');
     },
 
     // Groups same-order-level roster rows by their rota's coverage SHAPE (days +
