@@ -10,7 +10,7 @@ PagerDutySync.prototype = {
         // Confirmed live this matters: a stale/duplicate Script Include, or a
         // fix script run before an update was actually saved, can otherwise look
         // identical to a real fix failing -- see VERSION_LOGGED_AT below.
-        this.VERSION = 'v24.6-2026-11-09-events-in-their-own-time-zone';
+        this.VERSION = 'v24.7-2026-11-18-ist-time-zone';
 
         // Which groups this port manages is data now, not code -- see isEnrolled()
         // and _enrolledGroupNames() below, which read the u_pagerduty_sync_group
@@ -64,7 +64,10 @@ PagerDutySync.prototype = {
             'US/Hawaii': 'Pacific/Honolulu',
             'Mexico/General': 'America/Mexico_City',
             'Canada/Eastern': 'America/Toronto',
-            'Asia/Manila': 'Asia/Singapore'
+            'Asia/Manila': 'Asia/Singapore',
+            // ServiceNow's 'IST' is the legacy Java short ID for India Standard
+            // Time; it is not an IANA zone, so PagerDuty won't accept it as-is.
+            'IST': 'Asia/Kolkata'
         };
 
         // Standard-time (non-DST) UTC offsets, in seconds, for the canonical zones
@@ -80,6 +83,7 @@ PagerDutySync.prototype = {
             'America/Mexico_City': -6 * 3600,
             'America/Toronto': -5 * 3600,
             'Asia/Singapore': 8 * 3600,     // no DST
+            'Asia/Kolkata': 5.5 * 3600,     // no DST
             'UTC': 0
         };
 

@@ -282,6 +282,15 @@ describe('PagerDutySync: each event is built in its own rota\'s time zone', () =
     assert.deepStrictEqual(tzOf(r, 'Management Escalation NA'), ['America/New_York']);
   });
 
+  it('ServiceNow\'s legacy "IST" zone is sent to PagerDuty as Asia/Kolkata', () => {
+    const r = sync([
+      region('Shift 1', [100, 200], EIGHT_HOURS), region('Shift 2', [100, 200], EIGHT_HOURS),
+      esc('Escalation India', 'IST'), esc('Management Escalation NA', 'US/Eastern'),
+    ]);
+    assert.deepStrictEqual(tzOf(r, 'Escalation India'), ['Asia/Kolkata']);
+    assert.deepStrictEqual(tzOf(r, 'Management Escalation NA'), ['America/New_York']);
+  });
+
   it('follow-the-sun levels: each region\'s event uses that region\'s zone', () => {
     const regionIn = (name, tz) => Object.assign(region(name, [100, 200], EIGHT_HOURS), { tz });
     const r = sync([regionIn('Americas', 'US/Eastern'), regionIn('EMEA', 'Europe/London'), regionIn('APAC', 'Asia/Manila')]);
